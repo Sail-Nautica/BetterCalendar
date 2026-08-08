@@ -131,6 +131,45 @@ final class CalendarEngineTests: XCTestCase {
         XCTAssertEqual(day(for: fireDate, timeZoneIdentifier: "America/Detroit"), 12)
     }
 
+    // BC-NOT-001
+    func testNotificationPlannerProducesDistinctIdentifiersForEventWithThreeReminders() {
+        let reminders = [
+            EventReminder(id: UUID(), offset: .atStart),
+            EventReminder(id: UUID(), offset: .minutesBefore(10)),
+            EventReminder(id: UUID(), offset: .daysBefore(1))
+        ]
+        let start = TestData.date("2026-09-02T14:00:00Z")
+        var timedEvent = event(startDate: start, endDate: TestData.date("2026-09-02T15:00:00Z"))
+        timedEvent.reminders = reminders
+
+        let plan = LocalNotificationPlanner().plan(
+            events: [timedEvent],
+            calendars: [TestData.calendar()],
+            pendingIdentifiers: [],
+            now: TestData.date("2026-09-01T00:00:00Z"),
+            horizonEnd: TestData.date("2026-09-10T00:00:00Z")
+        )
+
+        XCTAssertEqual(plan.requestsToSchedule.count, 3)
+        XCTAssertEqual(Set(plan.requestsToSchedule.map(\.identifier)).count, 3)
+    }
+
+    // BC-NOT-001
+    func testNotificationPlannerSchedulesNoNotificationsForEventWithZeroReminders() {
+        let start = TestData.date("2026-09-02T14:00:00Z")
+        let timedEvent = event(startDate: start, endDate: TestData.date("2026-09-02T15:00:00Z"))
+
+        let plan = LocalNotificationPlanner().plan(
+            events: [timedEvent],
+            calendars: [TestData.calendar()],
+            pendingIdentifiers: [],
+            now: TestData.date("2026-09-01T00:00:00Z"),
+            horizonEnd: TestData.date("2026-09-10T00:00:00Z")
+        )
+
+        XCTAssertTrue(plan.requestsToSchedule.isEmpty)
+    }
+
     private func event(
         startDate: Date,
         endDate: Date,

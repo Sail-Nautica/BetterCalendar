@@ -108,6 +108,76 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(try repository.load(), database)
     }
 
+    // BC-NOT-001
+    func testSavingEventWithDuplicateReminderOffsetsPersistsOnlyDistinctReminders() {
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        var draft = EventDraft(calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T14:00:00Z"))
+        draft.title = "Lab"
+        draft.reminderOffsets = [.minutesBefore(10), .minutesBefore(10), .atStart]
+
+        XCTAssertTrue(store.saveEvent(from: draft))
+
+        let savedOffsets = store.events.first?.reminders.map(\.offset) ?? []
+        XCTAssertEqual(savedOffsets, [.minutesBefore(10), .atStart])
+    }
+
+    // BC-NOT-001
+    func testReminderOffsetNoneIsDroppedAmongOtherOffsetsAndNeverPersisted() {
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        var draft = EventDraft(calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T14:00:00Z"))
+        draft.title = "Office Hours"
+        draft.reminderOffsets = [.none, .minutesBefore(30), .none]
+
+        XCTAssertTrue(store.saveEvent(from: draft))
+
+        let savedOffsets = store.events.first?.reminders.map(\.offset) ?? []
+        XCTAssertEqual(savedOffsets, [.minutesBefore(30)])
+    }
+
+    // BC-NOT-001
+    func testSavingEventWithOnlyNoneReminderOffsetPersistsNoReminders() {
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        var draft = EventDraft(calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T14:00:00Z"))
+        draft.title = "Office Hours"
+        draft.reminderOffsets = [.none]
+
+        XCTAssertTrue(store.saveEvent(from: draft))
+        XCTAssertTrue(store.events.first?.reminders.isEmpty ?? false)
+    }
+
+    // BC-NOT-001
+    func testEditingEventPreservesReminderIDForUnchangedOffsetAndAssignsNewIDOnlyToAddedReminder() throws {
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        var draft = EventDraft(calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T14:00:00Z"))
+        draft.title = "Lab"
+        draft.reminderOffsets = [.minutesBefore(10)]
+        XCTAssertTrue(store.saveEvent(from: draft))
+
+        let firstSavedEvent = try XCTUnwrap(store.events.first)
+        let originalReminderID = try XCTUnwrap(firstSavedEvent.reminders.first?.id)
+
+        var editDraft = EventDraft(event: firstSavedEvent)
+        editDraft.reminderOffsets = [.minutesBefore(10), .daysBefore(1)]
+        XCTAssertTrue(store.saveEvent(from: editDraft))
+
+        let updatedEvent = try XCTUnwrap(store.events.first)
+        XCTAssertEqual(updatedEvent.reminders.count, 2)
+
+        let preservedReminder = try XCTUnwrap(updatedEvent.reminders.first { $0.offset == .minutesBefore(10) })
+        XCTAssertEqual(preservedReminder.id, originalReminderID)
+
+        let newReminder = try XCTUnwrap(updatedEvent.reminders.first { $0.offset == .daysBefore(1) })
+        XCTAssertNotEqual(newReminder.id, originalReminderID)
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("BetterCalendarTests-\(UUID().uuidString)", isDirectory: true)

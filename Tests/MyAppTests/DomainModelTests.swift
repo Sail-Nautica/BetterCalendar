@@ -24,6 +24,36 @@ final class DomainModelTests: XCTestCase {
         XCTAssertEqual(Calendar.current.component(.minute, from: draft.startDate), 0)
     }
 
+    // BC-NOT-001
+    func testNewEventDraftDefaultsToNoReminderOffsets() {
+        let draft = EventDraft(calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T14:15:00Z"))
+
+        XCTAssertTrue(draft.reminderOffsets.isEmpty)
+    }
+
+    // BC-NOT-001
+    func testEventDraftInitializedFromEventMapsAllReminderOffsetsInOrder() {
+        var event = TestData.event()
+        event.reminders = [
+            EventReminder(id: UUID(), offset: .atStart),
+            EventReminder(id: UUID(), offset: .minutesBefore(10)),
+            EventReminder(id: UUID(), offset: .daysBefore(1))
+        ]
+
+        let draft = EventDraft(event: event)
+
+        XCTAssertEqual(draft.reminderOffsets, [.atStart, .minutesBefore(10), .daysBefore(1)])
+    }
+
+    // BC-NOT-001
+    func testReminderOffsetPresetsIncludeHourAndTwoHourOptionsWithHumanReadableLabels() {
+        XCTAssertTrue(ReminderOffset.allCases.contains(.minutesBefore(60)))
+        XCTAssertTrue(ReminderOffset.allCases.contains(.minutesBefore(120)))
+        XCTAssertEqual(ReminderOffset.minutesBefore(60).label, "1 hour before")
+        XCTAssertEqual(ReminderOffset.minutesBefore(120).label, "2 hours before")
+        XCTAssertEqual(ReminderOffset.daysBefore(7).label, "1 week before")
+    }
+
     func testCalendarDatabaseCodableRoundTrips() throws {
         let database = TestData.database(
             events: [

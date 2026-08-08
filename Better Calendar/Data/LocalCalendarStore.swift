@@ -50,7 +50,7 @@ final class BetterCalendarStore {
         guard draft.validationError == nil else { return false }
 
         let now = Date.now
-        let reminder = reminderRecords(for: draft)
+        let reminders = reminderRecords(for: draft)
         let recurrence = draft.recurrence.frequency == .never ? nil : draft.recurrence
         let trimmedTitle = draft.title.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -65,7 +65,7 @@ final class BetterCalendarStore {
                 events[index].location = draft.location.nilIfBlank
                 events[index].urlString = draft.urlString.nilIfBlank
                 events[index].notes = draft.notes.nilIfBlank
-                events[index].reminders = reminder
+                events[index].reminders = reminders
                 events[index].recurrence = recurrence
                 events[index].providerMetadata.syncStatus = .pendingUpdate
                 events[index].updatedAt = now
@@ -84,7 +84,7 @@ final class BetterCalendarStore {
                         location: draft.location.nilIfBlank,
                         urlString: draft.urlString.nilIfBlank,
                         notes: draft.notes.nilIfBlank,
-                        reminders: reminder,
+                        reminders: reminders,
                         recurrence: recurrence,
                         providerMetadata: ProviderMetadata.local,
                         createdAt: now,
@@ -97,7 +97,7 @@ final class BetterCalendarStore {
             sortEvents()
         }
 
-        if didSave && draft.reminderOffset != .none {
+        if didSave && !reminders.isEmpty {
             reconcileNotifications(authorizationRequestPolicy: .ifNeeded)
         }
 
@@ -414,15 +414,28 @@ final class BetterCalendarStore {
     }
 
     private func reminderRecords(for draft: EventDraft) -> [EventReminder] {
-        guard draft.reminderOffset != .none else { return [] }
+        // `.none` is a UI sentinel for "no reminder selected" and must never be persisted.
+        // Dedupe is order-preserving so the reminder list round-trips predictably.
+        let requestedOffsets = draft.reminderOffsets
+            .filter { $0 != .none }
+            .orderPreservingUniqued()
 
-        if let eventID = draft.id,
-           let existingReminder = events.first(where: { $0.id == eventID })?.reminders.first,
-           existingReminder.offset == draft.reminderOffset {
-            return [existingReminder]
+        guard !requestedOffsets.isEmpty else { return [] }
+
+        // Reuse existing reminders' stable IDs when the offset is unchanged, so editing an
+        // event that keeps the same reminders doesn't force every notification to be
+        // cancelled and rescheduled. Each existing reminder can satisfy at most one
+        // requested offset.
+        var availableExistingReminders = draft.id.flatMap { eventID in
+            events.first(where: { $0.id == eventID })?.reminders
+        } ?? []
+
+        return requestedOffsets.map { offset in
+            if let matchIndex = availableExistingReminders.firstIndex(where: { $0.offset == offset }) {
+                return availableExistingReminders.remove(at: matchIndex)
+            }
+            return EventReminder(id: UUID(), offset: offset)
         }
-
-        return [EventReminder(id: UUID(), offset: draft.reminderOffset)]
     }
 
     private func sortEvents() {

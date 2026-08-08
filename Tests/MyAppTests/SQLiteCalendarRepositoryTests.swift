@@ -129,6 +129,29 @@ final class SQLiteCalendarRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded.events.map(\.calendarID), original.events.map(\.calendarID))
     }
 
+    // BC-NOT-001
+    func testEventWithThreeRemindersRoundTripsThroughSQLiteWithAllOffsetsPreserved() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let reminders = [
+            EventReminder(id: UUID(), offset: .atStart),
+            EventReminder(id: UUID(), offset: .minutesBefore(10)),
+            EventReminder(id: UUID(), offset: .daysBefore(1))
+        ]
+        var event = TestData.event()
+        event.reminders = reminders
+
+        try repository.save(TestData.database(events: [event]))
+        let loaded = try repository.load()
+
+        let loadedEvent = try XCTUnwrap(loaded.events.first)
+        XCTAssertEqual(loadedEvent.reminders.count, 3)
+        XCTAssertEqual(Set(loadedEvent.reminders.map(\.id)), Set(reminders.map(\.id)))
+        XCTAssertEqual(Set(loadedEvent.reminders.map(\.offset)), Set(reminders.map(\.offset)))
+    }
+
     private func makeTemporaryDatabaseURL() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("BetterCalendarSQLiteTests-\(UUID().uuidString)", isDirectory: true)

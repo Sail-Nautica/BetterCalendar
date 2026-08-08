@@ -119,15 +119,24 @@ enum ReminderOffset: Codable, Hashable, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .none: "None"
-        case .atStart: "At time of event"
-        case .minutesBefore(let minutes): "\(minutes) minutes before"
-        case .daysBefore(let days): "\(days) days before"
+        case .none:
+            "None"
+        case .atStart:
+            "At time of event"
+        case .minutesBefore(let minutes) where minutes % 60 == 0:
+            minutes / 60 == 1 ? "1 hour before" : "\(minutes / 60) hours before"
+        case .minutesBefore(let minutes):
+            "\(minutes) minutes before"
+        case .daysBefore(let days) where days % 7 == 0:
+            days / 7 == 1 ? "1 week before" : "\(days / 7) weeks before"
+        case .daysBefore(let days):
+            days == 1 ? "1 day before" : "\(days) days before"
         }
     }
 
+    /// Preset offsets per spec 1.12, in ascending "how soon before the event" order.
     static var allCases: [ReminderOffset] {
-        [.none, .atStart, .minutesBefore(5), .minutesBefore(10), .minutesBefore(15), .minutesBefore(30), .daysBefore(1), .daysBefore(7)]
+        [.none, .atStart, .minutesBefore(5), .minutesBefore(10), .minutesBefore(15), .minutesBefore(30), .minutesBefore(60), .minutesBefore(120), .daysBefore(1), .daysBefore(7)]
     }
 }
 
@@ -257,7 +266,7 @@ struct EventDraft: Equatable {
     var location: String
     var urlString: String
     var notes: String
-    var reminderOffset: ReminderOffset
+    var reminderOffsets: [ReminderOffset]
     var recurrence: RecurrenceRule
 
     nonisolated init(event: CalendarEvent) {
@@ -271,7 +280,7 @@ struct EventDraft: Equatable {
         location = event.location ?? ""
         urlString = event.urlString ?? ""
         notes = event.notes ?? ""
-        reminderOffset = event.reminders.first?.offset ?? .none
+        reminderOffsets = event.reminders.map(\.offset).orderPreservingUniqued()
         recurrence = event.recurrence ?? .never
     }
 
@@ -287,7 +296,7 @@ struct EventDraft: Equatable {
         location = ""
         urlString = ""
         notes = ""
-        reminderOffset = .none
+        reminderOffsets = []
         recurrence = .never
     }
 
@@ -301,5 +310,13 @@ struct EventDraft: Equatable {
         }
 
         return nil
+    }
+}
+
+extension Array where Element: Hashable {
+    /// Removes duplicate elements while preserving first-seen order.
+    func orderPreservingUniqued() -> [Element] {
+        var seen = Set<Element>()
+        return filter { seen.insert($0).inserted }
     }
 }

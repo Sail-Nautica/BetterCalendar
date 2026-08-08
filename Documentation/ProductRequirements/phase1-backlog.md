@@ -25,6 +25,32 @@ ID per spec 0.3 — use these IDs in commits, tests, and PR descriptions.
 
 ---
 
+## Status
+
+Work happens on branch `phase1-completion`. Status is updated as each item lands
+green; an item is only `Done` once the full suite passes and it has its own commit.
+
+| ID | Item | Status |
+| --- | --- | --- |
+| BC-NOT-001 | Multiple reminders per event | In progress |
+| BC-EVT-010 | Field limit validation | Not started |
+| BC-EVT-011 | Floating event model | Not started |
+| BC-SET-001 | Settings persistence layer | Not started |
+| BC-SET-002 | Settings screen | Not started |
+| BC-VIEW-010 | Persist view state | Not started |
+| BC-ONB-001 | First-launch onboarding | Not started |
+| Milestone B–D | Recurrence, search, interchange | Not started |
+
+### Known gaps against the spec (deliberate, not defects)
+
+- **Custom reminder durations (spec 1.12)** — the preset list is implemented in full,
+  but arbitrary user-entered durations ("Custom": minutes/hours/days/weeks) are not.
+  Deferred out of BC-NOT-001; no backlog item currently owns this.
+- **Configurable all-day alert time** — hard-coded to 09:00 local in
+  `LocalNotificationPlanner.allDayAlertHour`. Becomes user-configurable in BC-SET-001.
+
+---
+
 ## Milestone A — Data & preference foundations
 
 ### BC-NOT-001 — Multiple reminders per event

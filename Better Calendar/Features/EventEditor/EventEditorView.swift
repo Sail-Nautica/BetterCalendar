@@ -92,10 +92,23 @@ struct EventEditorView: View {
                     }
                 }
 
-                Section("Reminder") {
-                    Picker("Reminder", selection: $draft.reminderOffset) {
-                        ForEach(ReminderOffset.allCases) { offset in
-                            Text(offset.label).tag(offset)
+                Section("Reminders") {
+                    ForEach(draft.reminderOffsets, id: \.self) { offset in
+                        Text(offset.label)
+                    }
+                    .onDelete { offsets in
+                        draft.reminderOffsets.remove(atOffsets: offsets)
+                    }
+
+                    if !availableReminderOffsets.isEmpty {
+                        Menu {
+                            ForEach(availableReminderOffsets) { offset in
+                                Button(offset.label) {
+                                    draft.reminderOffsets.append(offset)
+                                }
+                            }
+                        } label: {
+                            Label("Add Reminder", systemImage: "plus.circle")
                         }
                     }
                 }
@@ -165,6 +178,10 @@ struct EventEditorView: View {
         } else {
             validationError = "Event could not be saved. Check the fields and try again."
         }
+    }
+
+    private var availableReminderOffsets: [ReminderOffset] {
+        ReminderOffset.allCases.filter { $0 != .none && !draft.reminderOffsets.contains($0) }
     }
 
     private var timeZoneOptions: [String] {
