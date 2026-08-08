@@ -54,6 +54,65 @@ final class DomainModelTests: XCTestCase {
         XCTAssertEqual(ReminderOffset.daysBefore(7).label, "1 week before")
     }
 
+    // BC-EVT-010
+    func testTitleAcceptsExactlyMaximumLengthAndRejectsOneCharacterMore() {
+        var draft = validDraft()
+
+        draft.title = String(repeating: "a", count: EventFieldLimits.titleCharacters)
+        XCTAssertNil(draft.validationError)
+
+        draft.title = String(repeating: "a", count: EventFieldLimits.titleCharacters + 1)
+        XCTAssertEqual(draft.validationError, "Title must be 500 characters or fewer.")
+    }
+
+    // BC-EVT-010
+    func testLocationAcceptsExactlyMaximumLengthAndRejectsOneCharacterMore() {
+        var draft = validDraft()
+
+        draft.location = String(repeating: "b", count: EventFieldLimits.locationCharacters)
+        XCTAssertNil(draft.validationError)
+
+        draft.location = String(repeating: "b", count: EventFieldLimits.locationCharacters + 1)
+        XCTAssertEqual(draft.validationError, "Location must be 1000 characters or fewer.")
+    }
+
+    // BC-EVT-010
+    func testNotesAcceptExactlyMaximumLengthAndRejectOneCharacterMore() {
+        var draft = validDraft()
+
+        draft.notes = String(repeating: "c", count: EventFieldLimits.notesCharacters)
+        XCTAssertNil(draft.validationError)
+
+        draft.notes = String(repeating: "c", count: EventFieldLimits.notesCharacters + 1)
+        XCTAssertEqual(draft.validationError, "Notes must be 50000 characters or fewer.")
+    }
+
+    // BC-EVT-010
+    func testOverLongFieldIsRejectedWithoutTruncatingTheUsersText() {
+        var draft = validDraft()
+        let overLongNotes = String(repeating: "c", count: EventFieldLimits.notesCharacters + 25)
+
+        draft.notes = overLongNotes
+
+        XCTAssertNotNil(draft.validationError)
+        XCTAssertEqual(draft.notes.count, EventFieldLimits.notesCharacters + 25, "Validation must never silently truncate what the user typed.")
+        XCTAssertEqual(draft.notes, overLongNotes)
+    }
+
+    // BC-EVT-010
+    func testEmptyTitleIsReportedBeforeTitleLengthSoTheClearestErrorWins() {
+        var draft = validDraft()
+        draft.title = "   "
+
+        XCTAssertEqual(draft.validationError, "Enter a title before saving.")
+    }
+
+    private func validDraft() -> EventDraft {
+        var draft = EventDraft(calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T14:15:00Z"))
+        draft.title = "Office Hours"
+        return draft
+    }
+
     func testCalendarDatabaseCodableRoundTrips() throws {
         let database = TestData.database(
             events: [

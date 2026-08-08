@@ -305,12 +305,33 @@ struct EventDraft: Equatable {
             return "Enter a title before saving."
         }
 
+        if title.count > EventFieldLimits.titleCharacters {
+            return "Title must be \(EventFieldLimits.titleCharacters) characters or fewer."
+        }
+
         if !isAllDay && endDate <= startDate {
             return "End time must be after start time."
         }
 
+        if location.count > EventFieldLimits.locationCharacters {
+            return "Location must be \(EventFieldLimits.locationCharacters) characters or fewer."
+        }
+
+        if notes.count > EventFieldLimits.notesCharacters {
+            return "Notes must be \(EventFieldLimits.notesCharacters) characters or fewer."
+        }
+
         return nil
     }
+}
+
+/// Field length ceilings from specification 0.8. Over-long input is rejected with an
+/// inline error rather than silently truncated, so the user never loses text they typed.
+/// Counts are grapheme clusters (`String.count`), matching what a user perceives as a character.
+enum EventFieldLimits {
+    static let titleCharacters = 500
+    static let locationCharacters = 1_000
+    static let notesCharacters = 50_000
 }
 
 extension Array where Element: Hashable {
