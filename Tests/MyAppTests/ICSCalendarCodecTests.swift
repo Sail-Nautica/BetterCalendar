@@ -1,5 +1,5 @@
 import XCTest
-@testable import MyApp
+@testable import Better_Calendar
 
 final class ICSCalendarCodecTests: XCTestCase {
     func testExportEscapesTextAndIncludesWeeklyRecurrenceRule() {

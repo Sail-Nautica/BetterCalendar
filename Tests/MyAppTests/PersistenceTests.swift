@@ -1,5 +1,5 @@
 import XCTest
-@testable import MyApp
+@testable import Better_Calendar
 
 @MainActor
 final class PersistenceTests: XCTestCase {

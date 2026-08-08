@@ -1,5 +1,5 @@
 import Foundation
-@testable import MyApp
+@testable import Better_Calendar
 
 enum TestData {
     static let calendarID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!

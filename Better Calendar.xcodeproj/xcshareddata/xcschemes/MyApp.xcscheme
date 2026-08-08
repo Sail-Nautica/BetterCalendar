@@ -16,9 +16,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "000000000000000100000000"
-               BuildableName = "MyApp.app"
+               BuildableName = "Better Calendar.app"
                BlueprintName = "MyApp"
-               ReferencedContainer = "container:Untitled Project.xcodeproj">
+               ReferencedContainer = "container:Better Calendar.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
          <BuildActionEntry
@@ -32,7 +32,7 @@
                BlueprintIdentifier = "000000000000000200000000"
                BuildableName = "MyAppTests.xctest"
                BlueprintName = "MyAppTests"
-               ReferencedContainer = "container:Untitled Project.xcodeproj">
+               ReferencedContainer = "container:Better Calendar.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -52,7 +52,7 @@
                BlueprintIdentifier = "000000000000000200000000"
                BuildableName = "MyAppTests.xctest"
                BlueprintName = "MyAppTests"
-               ReferencedContainer = "container:Untitled Project.xcodeproj">
+               ReferencedContainer = "container:Better Calendar.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -72,9 +72,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "000000000000000100000000"
-            BuildableName = "MyApp.app"
+            BuildableName = "Better Calendar.app"
             BlueprintName = "MyApp"
-            ReferencedContainer = "container:Untitled Project.xcodeproj">
+            ReferencedContainer = "container:Better Calendar.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -89,9 +89,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "000000000000000100000000"
-            BuildableName = "MyApp.app"
+            BuildableName = "Better Calendar.app"
             BlueprintName = "MyApp"
-            ReferencedContainer = "container:Untitled Project.xcodeproj">
+            ReferencedContainer = "container:Better Calendar.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

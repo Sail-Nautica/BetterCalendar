@@ -1,5 +1,5 @@
 import XCTest
-@testable import MyApp
+@testable import Better_Calendar
 
 final class CalendarEngineTests: XCTestCase {
     func testWeeklyRecurrenceExpandsSelectedWeekdaysWithinRange() {
