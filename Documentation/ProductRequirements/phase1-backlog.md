@@ -34,8 +34,8 @@ green; an item is only `Done` once the full suite passes and it has its own comm
 | --- | --- | --- | --- |
 | — | Test-target repair + backlog + ADR 0001 | Done — 28 tests green | `26de8db` |
 | BC-NOT-001 | Multiple reminders per event | Done — 38 tests green | `aa83f18` |
-| BC-EVT-010 | Field limit validation | In progress | — |
-| BC-EVT-011 | Floating event model | In progress | — |
+| BC-EVT-010 | Field limit validation | Done — 43 tests green | `95c5f88` |
+| BC-EVT-011 | Floating event model | Done — 50 tests green | `37b29ce` |
 | BC-SET-001 | Settings persistence layer | Not started | — |
 | BC-SET-002 | Settings screen | Not started | — |
 | BC-VIEW-010 | Persist view state | Not started | — |
