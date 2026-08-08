@@ -43,13 +43,27 @@ enum CalendarColorName: String, CaseIterable, Identifiable, Codable {
     var id: String { rawValue }
 }
 
+/// How an event's stored dates should be interpreted (specification 0.9).
+///
+/// - `timed`: real instants. The clock time shifts when the viewing time zone changes.
+/// - `allDay`: calendar dates. The date never shifts when the viewing time zone changes.
+/// - `floating`: the same wall-clock time everywhere ("take medication at 8:00 PM wherever
+///   I am"). The clock time is preserved and re-anchored into whatever zone is displaying it.
+enum EventTimeType: String, Codable, CaseIterable, Identifiable, Hashable {
+    case timed
+    case allDay
+    case floating
+
+    var id: String { rawValue }
+}
+
 struct CalendarEvent: Identifiable, Codable, Hashable {
     var id: UUID
     var calendarID: BetterCalendar.ID
     var title: String
     var startDate: Date
     var endDate: Date
-    var isAllDay: Bool
+    var timeType: EventTimeType
     var timeZoneIdentifier: String
     var location: String?
     var urlString: String?
@@ -60,8 +74,132 @@ struct CalendarEvent: Identifiable, Codable, Hashable {
     var createdAt: Date
     var updatedAt: Date
 
+    /// Compatibility accessor over `timeType`, so the many existing call sites that think in
+    /// terms of a boolean keep working.
+    ///
+    /// The setter deliberately does **not** collapse to `newValue ? .allDay : .timed`: that
+    /// would silently destroy `.floating` on any code path that assigns `false`, converting a
+    /// floating event into a timed one without anyone asking. Assigning `false` to an event
+    /// that is already floating leaves it floating.
+    var isAllDay: Bool {
+        get { timeType == .allDay }
+        set {
+            if newValue {
+                timeType = .allDay
+            } else if timeType == .allDay {
+                timeType = .timed
+            }
+        }
+    }
+
+    var isFloating: Bool {
+        timeType == .floating
+    }
+
     var duration: TimeInterval {
         endDate.timeIntervalSince(startDate)
+    }
+}
+
+extension CalendarEvent {
+    private enum CodingKeys: String, CodingKey {
+        case id, calendarID, title, startDate, endDate, timeType, isAllDay
+        case timeZoneIdentifier, location, urlString, notes, reminders
+        case recurrence, providerMetadata, createdAt, updatedAt
+    }
+
+    /// Decodes tolerantly so databases written before `timeType` existed still load.
+    ///
+    /// Legacy payloads carry `isAllDay` and no `timeType`. Without this fallback the decode
+    /// throws, `JSONCalendarRepository.load()` fails, and the store quietly falls back to seed
+    /// data — presenting sample events as if the user's calendar were empty. That is a silent
+    /// data-loss path, so the legacy key is honoured rather than merely tolerated.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        id = try container.decode(UUID.self, forKey: .id)
+        calendarID = try container.decode(BetterCalendar.ID.self, forKey: .calendarID)
+        title = try container.decode(String.self, forKey: .title)
+        startDate = try container.decode(Date.self, forKey: .startDate)
+        endDate = try container.decode(Date.self, forKey: .endDate)
+        timeZoneIdentifier = try container.decode(String.self, forKey: .timeZoneIdentifier)
+        location = try container.decodeIfPresent(String.self, forKey: .location)
+        urlString = try container.decodeIfPresent(String.self, forKey: .urlString)
+        notes = try container.decodeIfPresent(String.self, forKey: .notes)
+        reminders = try container.decode([EventReminder].self, forKey: .reminders)
+        recurrence = try container.decodeIfPresent(RecurrenceRule.self, forKey: .recurrence)
+        providerMetadata = try container.decode(ProviderMetadata.self, forKey: .providerMetadata)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+
+        if let decodedTimeType = try container.decodeIfPresent(EventTimeType.self, forKey: .timeType) {
+            timeType = decodedTimeType
+        } else if try container.decodeIfPresent(Bool.self, forKey: .isAllDay) == true {
+            timeType = .allDay
+        } else {
+            timeType = .timed
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+
+        try container.encode(id, forKey: .id)
+        try container.encode(calendarID, forKey: .calendarID)
+        try container.encode(title, forKey: .title)
+        try container.encode(startDate, forKey: .startDate)
+        try container.encode(endDate, forKey: .endDate)
+        try container.encode(timeType, forKey: .timeType)
+        try container.encode(timeZoneIdentifier, forKey: .timeZoneIdentifier)
+        try container.encodeIfPresent(location, forKey: .location)
+        try container.encodeIfPresent(urlString, forKey: .urlString)
+        try container.encodeIfPresent(notes, forKey: .notes)
+        try container.encode(reminders, forKey: .reminders)
+        try container.encodeIfPresent(recurrence, forKey: .recurrence)
+        try container.encode(providerMetadata, forKey: .providerMetadata)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
+    }
+
+    /// Boolean-shaped initializer preserving the pre-`timeType` signature.
+    ///
+    /// Declared in an extension on purpose: adding an initializer to the struct body would
+    /// suppress the synthesized memberwise initializer, and every construction site that now
+    /// passes `timeType:` would stop compiling.
+    init(
+        id: UUID,
+        calendarID: BetterCalendar.ID,
+        title: String,
+        startDate: Date,
+        endDate: Date,
+        isAllDay: Bool,
+        timeZoneIdentifier: String,
+        location: String?,
+        urlString: String?,
+        notes: String?,
+        reminders: [EventReminder],
+        recurrence: RecurrenceRule?,
+        providerMetadata: ProviderMetadata,
+        createdAt: Date,
+        updatedAt: Date
+    ) {
+        self.init(
+            id: id,
+            calendarID: calendarID,
+            title: title,
+            startDate: startDate,
+            endDate: endDate,
+            timeType: isAllDay ? .allDay : .timed,
+            timeZoneIdentifier: timeZoneIdentifier,
+            location: location,
+            urlString: urlString,
+            notes: notes,
+            reminders: reminders,
+            recurrence: recurrence,
+            providerMetadata: providerMetadata,
+            createdAt: createdAt,
+            updatedAt: updatedAt
+        )
     }
 }
 

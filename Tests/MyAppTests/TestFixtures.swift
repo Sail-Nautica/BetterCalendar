@@ -38,6 +38,8 @@ enum TestData {
         startDate: Date = date("2026-09-02T14:00:00Z"),
         endDate: Date = date("2026-09-02T15:00:00Z"),
         isAllDay: Bool = false,
+        timeType: EventTimeType? = nil,
+        timeZoneIdentifier: String = "UTC",
         location: String? = nil,
         notes: String? = nil,
         recurrence: RecurrenceRule? = nil
@@ -48,8 +50,10 @@ enum TestData {
             title: title,
             startDate: startDate,
             endDate: endDate,
-            isAllDay: isAllDay,
-            timeZoneIdentifier: "UTC",
+            // `timeType` wins when supplied; otherwise fall back to the boolean so every
+            // existing call site keeps its previous meaning.
+            timeType: timeType ?? (isAllDay ? .allDay : .timed),
+            timeZoneIdentifier: timeZoneIdentifier,
             location: location,
             urlString: nil,
             notes: notes,

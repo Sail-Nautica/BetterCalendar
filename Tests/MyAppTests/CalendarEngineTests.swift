@@ -2,6 +2,44 @@ import XCTest
 @testable import Better_Calendar
 
 final class CalendarEngineTests: XCTestCase {
+    // BC-EVT-011
+    func testFloatingEventKeepsItsWallClockTimeWhenViewedFromAnotherTimeZone() throws {
+        // 8:00 PM on 2026-09-03 in Detroit (EDT, UTC-4) is 2026-09-04T00:00:00Z.
+        let event = TestData.event(
+            startDate: TestData.date("2026-09-04T00:00:00Z"),
+            endDate: TestData.date("2026-09-04T01:00:00Z"),
+            timeType: .floating,
+            timeZoneIdentifier: "America/Detroit"
+        )
+
+        var losAngeles = Calendar(identifier: .gregorian)
+        losAngeles.timeZone = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+
+        let displayed = losAngeles.dateComponents(
+            [.year, .month, .day, .hour, .minute],
+            from: event.displayStartDate(in: losAngeles)
+        )
+
+        XCTAssertEqual(displayed.hour, 20, "A floating event must still read 8:00 PM after the device changes zone.")
+        XCTAssertEqual(displayed.minute, 0)
+        XCTAssertEqual(displayed.day, 3)
+        XCTAssertEqual(displayed.month, 9)
+    }
+
+    // BC-EVT-011
+    func testTimedAndAllDayEventsReturnStoredDatesUnchangedWhenDisplayed() throws {
+        var losAngeles = Calendar(identifier: .gregorian)
+        losAngeles.timeZone = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+
+        let timed = TestData.event()
+        XCTAssertEqual(timed.displayStartDate(in: losAngeles), timed.startDate)
+        XCTAssertEqual(timed.displayEndDate(in: losAngeles), timed.endDate)
+
+        let allDay = TestData.event(isAllDay: true)
+        XCTAssertEqual(allDay.displayStartDate(in: losAngeles), allDay.startDate)
+        XCTAssertEqual(allDay.displayEndDate(in: losAngeles), allDay.endDate)
+    }
+
     func testWeeklyRecurrenceExpandsSelectedWeekdaysWithinRange() {
         let start = date(year: 2026, month: 9, day: 7, hour: 9, timeZoneIdentifier: "America/Detroit")
         let event = event(

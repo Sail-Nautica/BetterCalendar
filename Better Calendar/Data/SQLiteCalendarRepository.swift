@@ -351,7 +351,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
     private func insert(event: CalendarEvent, in db: Database) throws {
         let isAllDay = event.isAllDay
-        let eventType = isAllDay ? "allDay" : "timed"
+        // Floating events persist instants exactly like timed events; the schema's compound
+        // CHECK places no column requirements on the floating branch, so no migration is needed.
+        let eventType = event.timeType.rawValue
         let startInstant = isAllDay ? nil : encodeInstant(event.startDate)
         let endInstant = isAllDay ? nil : encodeInstant(event.endDate)
         let startLocalDate = isAllDay ? localDateString(for: event.startDate, timeZoneIdentifier: event.timeZoneIdentifier) : nil
@@ -517,7 +519,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         }
 
         let eventType: String = row["event_type"]
-        let isAllDay = eventType == "allDay"
+        let timeType = EventTimeType(rawValue: eventType) ?? .timed
+        let isAllDay = timeType == .allDay
         let timeZoneIdentifier: String = row["original_timezone_id"] ?? TimeZone.current.identifier
         let startDate: Date
         let endDate: Date
@@ -549,7 +552,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             title: row["title"],
             startDate: startDate,
             endDate: endDate,
-            isAllDay: isAllDay,
+            // Constructed with `timeType` rather than the boolean shim: routing through
+            // `isAllDay:` would collapse a stored floating event into a timed one on load.
+            timeType: timeType,
             timeZoneIdentifier: timeZoneIdentifier,
             location: row["location_name"],
             urlString: row["url"],

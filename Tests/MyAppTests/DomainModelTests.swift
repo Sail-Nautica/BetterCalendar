@@ -107,6 +107,61 @@ final class DomainModelTests: XCTestCase {
         XCTAssertEqual(draft.validationError, "Enter a title before saving.")
     }
 
+    // BC-EVT-011
+    func testAssigningIsAllDayFalseDoesNotSilentlyDestroyFloatingTimeType() {
+        var event = TestData.event(timeType: .floating)
+
+        event.isAllDay = false
+
+        XCTAssertEqual(event.timeType, .floating, "Assigning false must not convert a floating event into a timed one.")
+        XCTAssertFalse(event.isAllDay)
+    }
+
+    // BC-EVT-011
+    func testIsAllDayShimStillTogglesBetweenTimedAndAllDay() {
+        var event = TestData.event()
+        XCTAssertEqual(event.timeType, .timed)
+
+        event.isAllDay = true
+        XCTAssertEqual(event.timeType, .allDay)
+
+        event.isAllDay = false
+        XCTAssertEqual(event.timeType, .timed)
+    }
+
+    // BC-EVT-011
+    func testLegacyEventJSONCarryingIsAllDayAndNoTimeTypeStillDecodes() throws {
+        let allDayEvent = TestData.event(isAllDay: true)
+        let encoded = try JSONEncoder().encode(allDayEvent)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+
+        // Reshape into the pre-timeType payload written by earlier builds.
+        object.removeValue(forKey: "timeType")
+        object["isAllDay"] = true
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(CalendarEvent.self, from: legacyData)
+
+        XCTAssertEqual(decoded.timeType, .allDay, "A legacy all-day event must survive the move to timeType.")
+        XCTAssertEqual(decoded.id, allDayEvent.id)
+        XCTAssertEqual(decoded.title, allDayEvent.title)
+    }
+
+    // BC-EVT-011
+    func testLegacyEventJSONWithNeitherTimeTypeNorIsAllDayDefaultsToTimed() throws {
+        let event = TestData.event()
+        let encoded = try JSONEncoder().encode(event)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+
+        object.removeValue(forKey: "timeType")
+        object.removeValue(forKey: "isAllDay")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(CalendarEvent.self, from: legacyData)
+
+        XCTAssertEqual(decoded.timeType, .timed)
+    }
+
     private func validDraft() -> EventDraft {
         var draft = EventDraft(calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T14:15:00Z"))
         draft.title = "Office Hours"

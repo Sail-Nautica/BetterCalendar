@@ -324,6 +324,28 @@ extension CalendarEvent {
         return parts.joined(separator: ", ")
     }
 
+    /// Start date as it should be displayed in `displayCalendar`'s time zone.
+    ///
+    /// Floating events re-anchor their stored wall-clock components into the viewing zone, so
+    /// "8:00 PM" stays 8:00 PM after travelling (specification 0.9). Timed and all-day events
+    /// return their stored date completely unchanged, so existing behaviour is byte-identical.
+    func displayStartDate(in displayCalendar: Calendar = .current) -> Date {
+        floatingAnchoredDate(startDate, in: displayCalendar)
+    }
+
+    /// End date as it should be displayed in `displayCalendar`'s time zone. See `displayStartDate`.
+    func displayEndDate(in displayCalendar: Calendar = .current) -> Date {
+        floatingAnchoredDate(endDate, in: displayCalendar)
+    }
+
+    private func floatingAnchoredDate(_ date: Date, in displayCalendar: Calendar) -> Date {
+        guard timeType == .floating else { return date }
+
+        let storedComponents = calendarInOriginalTimeZone
+            .dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        return displayCalendar.date(from: storedComponents) ?? date
+    }
+
     func intersects(_ interval: DateInterval) -> Bool {
         startDate < interval.end && endDate > interval.start
     }

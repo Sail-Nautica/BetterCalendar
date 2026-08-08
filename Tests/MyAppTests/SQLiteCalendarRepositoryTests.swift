@@ -108,6 +108,38 @@ final class SQLiteCalendarRepositoryTests: XCTestCase {
         }
     }
 
+    // BC-EVT-011
+    func testFloatingEventPersistsAsFloatingAndReloadsWithoutCollapsingToTimed() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let event = TestData.event(
+            startDate: TestData.date("2026-09-04T00:00:00Z"),
+            endDate: TestData.date("2026-09-04T01:00:00Z"),
+            timeType: .floating,
+            timeZoneIdentifier: "America/Detroit"
+        )
+
+        try repository.save(TestData.database(events: [event]))
+
+        let databaseQueue = try DatabaseQueue(path: databaseURL.path)
+        try databaseQueue.read { db in
+            let row = try XCTUnwrap(Row.fetchOne(db, sql: "SELECT * FROM events WHERE id = ?", arguments: [event.id.uuidString]))
+            let eventType: String = row["event_type"]
+            let startInstant: String? = row["start_instant"]
+            let startLocalDate: String? = row["start_local_date"]
+
+            XCTAssertEqual(eventType, "floating")
+            XCTAssertNotNil(startInstant, "Floating events store instants, exactly like timed events.")
+            XCTAssertNil(startLocalDate)
+        }
+
+        let reloaded = try XCTUnwrap(try repository.load().events.first)
+        XCTAssertEqual(reloaded.timeType, .floating, "Loading must not downgrade a stored floating event to timed.")
+        XCTAssertFalse(reloaded.isAllDay)
+    }
+
     func testSnapshotReplacementRollsBackWhenTransactionFails() throws {
         let databaseURL = try makeTemporaryDatabaseURL()
         defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
