@@ -2,18 +2,18 @@ import Foundation
 import UserNotifications
 
 protocol LocalNotificationScheduling {
-    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy, allDayAlertHour: Int)
+    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy, allDayAlertHour: Int, recurrenceExceptions: [RecurrenceException])
     func cancelNotifications(for eventIDs: Set<UUID>)
     func pendingRequestCount() async -> Int
 }
 
 extension LocalNotificationScheduling {
     func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date) {
-        reconcile(events: events, calendars: calendars, now: now, authorizationRequestPolicy: .never, allDayAlertHour: 9)
+        reconcile(events: events, calendars: calendars, now: now, authorizationRequestPolicy: .never, allDayAlertHour: 9, recurrenceExceptions: [])
     }
 
     func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy) {
-        reconcile(events: events, calendars: calendars, now: now, authorizationRequestPolicy: authorizationRequestPolicy, allDayAlertHour: 9)
+        reconcile(events: events, calendars: calendars, now: now, authorizationRequestPolicy: authorizationRequestPolicy, allDayAlertHour: 9, recurrenceExceptions: [])
     }
 }
 
@@ -47,14 +47,19 @@ struct LocalNotificationPlanner {
         calendars: [BetterCalendar],
         pendingIdentifiers: Set<String>,
         now: Date,
-        horizonEnd: Date = Date().addingTimeInterval(defaultSchedulingWindow)
+        horizonEnd: Date = Date().addingTimeInterval(defaultSchedulingWindow),
+        recurrenceExceptions: [RecurrenceException] = []
     ) -> LocalNotificationReconciliationPlan {
         let visibleCalendarIDs = Set(calendars.filter(\.isVisible).map(\.id))
         let range = DateInterval(start: now, end: horizonEnd)
         var requests: [LocalNotificationRequest] = []
 
         for event in events where visibleCalendarIDs.contains(event.calendarID) && !event.reminders.isEmpty {
-            let occurrences = expander.occurrences(of: event, in: range)
+            // Cancelled occurrences stop firing automatically; modified ones use the
+            // replacement event's own reminders, scheduled via that event's own loop iteration
+            // (spec 0.11, BC-REC-010).
+            let eventExceptions = recurrenceExceptions.filter { $0.masterEventID == event.id }
+            let occurrences = expander.occurrences(of: event, in: range, exceptions: eventExceptions)
 
             for occurrence in occurrences {
                 for reminder in event.reminders {
@@ -117,7 +122,7 @@ struct LocalNotificationPlanner {
 }
 
 struct UserNotificationScheduler: LocalNotificationScheduling {
-    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date = .now, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy = .never, allDayAlertHour: Int = 9) {
+    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date = .now, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy = .never, allDayAlertHour: Int = 9, recurrenceExceptions: [RecurrenceException] = []) {
         Task {
             let center = UNUserNotificationCenter.current()
             let settings = await center.notificationSettings()
@@ -148,7 +153,8 @@ struct UserNotificationScheduler: LocalNotificationScheduling {
                 calendars: calendars,
                 pendingIdentifiers: pendingIdentifiers,
                 now: now,
-                horizonEnd: now.addingTimeInterval(LocalNotificationPlanner.defaultSchedulingWindow)
+                horizonEnd: now.addingTimeInterval(LocalNotificationPlanner.defaultSchedulingWindow),
+                recurrenceExceptions: recurrenceExceptions
             )
 
             if !plan.identifiersToCancel.isEmpty {
@@ -196,7 +202,7 @@ struct UserNotificationScheduler: LocalNotificationScheduling {
 }
 
 struct NoopNotificationScheduler: LocalNotificationScheduling {
-    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy, allDayAlertHour: Int) { }
+    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy, allDayAlertHour: Int, recurrenceExceptions: [RecurrenceException]) { }
     func cancelNotifications(for eventIDs: Set<UUID>) { }
     func pendingRequestCount() async -> Int { 0 }
 }

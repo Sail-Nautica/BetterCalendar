@@ -8,6 +8,7 @@ final class BetterCalendarStore {
     private(set) var pendingMutations: [PendingMutation] = []
     private(set) var deletedEventTombstones: [DeletedEventTombstone] = []
     private(set) var settings: AppSettings = .defaultSettings
+    private(set) var recurrenceExceptions: [RecurrenceException] = []
     private(set) var lastError: String?
     private(set) var environmentRevision = 0
     var undoAction: UndoAction?
@@ -73,7 +74,11 @@ final class BetterCalendarStore {
                 events[index].updatedAt = now
                 recordMutation(objectID: eventID, objectType: .event, operation: .update)
             } else {
-                let eventID = UUID()
+                // A non-nil `draft.id` here means this is a "This Event" occurrence seed
+                // (BC-REC-010) whose id was pre-minted by `seedForOccurrenceEdit` but doesn't
+                // exist in `events` yet — honour it so the new replacement gets a stable id
+                // rather than a second, throwaway one.
+                let eventID = draft.id ?? UUID()
                 events.append(
                     CalendarEvent(
                         id: eventID,
@@ -90,10 +95,26 @@ final class BetterCalendarStore {
                         recurrence: recurrence,
                         providerMetadata: ProviderMetadata.local,
                         createdAt: now,
-                        updatedAt: now
+                        updatedAt: now,
+                        recurrenceMasterID: draft.recurrenceMasterID,
+                        recurrenceOriginalStart: draft.recurrenceOriginalStart
                     )
                 )
                 recordMutation(objectID: eventID, objectType: .event, operation: .create)
+
+                if let masterID = draft.recurrenceMasterID, let originalStart = draft.recurrenceOriginalStart,
+                   let masterEvent = events.first(where: { $0.id == masterID }) {
+                    recurrenceExceptions.append(
+                        RecurrenceException(
+                            id: UUID(),
+                            masterEventID: masterID,
+                            originalOccurrenceStart: masterEvent.isAllDay ? nil : originalStart,
+                            originalOccurrenceLocalDate: masterEvent.isAllDay ? masterEvent.localDateString(for: originalStart) : nil,
+                            exceptionType: .modified,
+                            replacementEventID: eventID
+                        )
+                    )
+                }
             }
 
             sortEvents()
@@ -131,6 +152,73 @@ final class BetterCalendarStore {
         if didDelete {
             notificationScheduler.cancelNotifications(for: [event.id])
         }
+    }
+
+    /// "This Event" delete scope for a recurring occurrence (BC-REC-010, spec 1.11): records a
+    /// `.cancelled` exception so the expander skips just this slot, leaving sibling occurrences
+    /// and the master event untouched. If this occurrence was already individually modified,
+    /// that replacement is removed too — deleting a modified occurrence deletes it outright,
+    /// it doesn't fall back to showing the master's original content.
+    func deleteOccurrence(_ occurrence: CalendarOccurrence) {
+        guard occurrence.isRecurringOccurrence else {
+            deleteEvent(occurrence.event)
+            return
+        }
+
+        let masterEvent = occurrence.event
+        let existingReplacement = existingReplacementEvent(forOccurrenceOf: masterEvent.id, occurrenceStartDate: occurrence.occurrenceStartDate)
+        let exception = RecurrenceException(
+            id: UUID(),
+            masterEventID: masterEvent.id,
+            originalOccurrenceStart: masterEvent.isAllDay ? nil : occurrence.occurrenceStartDate,
+            originalOccurrenceLocalDate: masterEvent.isAllDay ? masterEvent.localDateString(for: occurrence.occurrenceStartDate) : nil,
+            exceptionType: .cancelled,
+            replacementEventID: nil
+        )
+
+        let didDelete = withPersistedMutation {
+            if let existingReplacement {
+                events.removeAll { $0.id == existingReplacement.id }
+            }
+            recurrenceExceptions.append(exception)
+            recordMutation(objectID: masterEvent.id, objectType: .event, operation: .update)
+            undoAction = UndoAction(message: "Deleted this occurrence of \"\(masterEvent.title)\"", actionTitle: "Undo") { [weak self] in
+                self?.withPersistedMutation {
+                    self?.recurrenceExceptions.removeAll { $0.id == exception.id }
+                    if let existingReplacement {
+                        self?.events.append(existingReplacement)
+                        self?.sortEvents()
+                    }
+                }
+            }
+        }
+        if didDelete, let existingReplacement {
+            notificationScheduler.cancelNotifications(for: [existingReplacement.id])
+        }
+    }
+
+    /// The standalone replacement event already recorded for this specific occurrence, if the
+    /// user has previously chosen "This Event" to edit it (BC-REC-010).
+    func existingReplacementEvent(forOccurrenceOf masterID: UUID, occurrenceStartDate: Date) -> CalendarEvent? {
+        events.first { $0.recurrenceMasterID == masterID && $0.recurrenceOriginalStart == occurrenceStartDate }
+    }
+
+    /// Resolves which event a "This Event" edit should open (BC-REC-010, spec 1.11): the
+    /// existing replacement if this occurrence has already been individually modified,
+    /// otherwise a fresh seed built from the occurrence itself. Saving the result through the
+    /// normal `saveEvent(from:)` path either updates that replacement or creates it for the
+    /// first time — see `seedForOccurrenceEdit`.
+    ///
+    /// If `occurrence` isn't part of a live recurring series at all — e.g. it's already a
+    /// standalone replacement event, encountered when re-editing an already-modified
+    /// occurrence via a fresh `visibleOccurrences` lookup — this just returns its own event
+    /// unchanged, so the normal update path in `saveEvent(from:)` applies instead of
+    /// mistakenly seeding a second replacement chained off the first.
+    func eventForEditingOccurrence(_ occurrence: CalendarOccurrence) -> CalendarEvent {
+        guard occurrence.isRecurringOccurrence else { return occurrence.event }
+
+        return existingReplacementEvent(forOccurrenceOf: occurrence.event.id, occurrenceStartDate: occurrence.occurrenceStartDate)
+            ?? occurrence.event.seedForOccurrenceEdit(occurrenceStartDate: occurrence.occurrenceStartDate, occurrenceEndDate: occurrence.occurrenceEndDate)
     }
 
     /// Reconstructs a soft-deleted event from its tombstone's durable snapshot (spec 0.12).
@@ -444,7 +532,9 @@ final class BetterCalendarStore {
         let expander = RecurrenceExpander()
 
         return visibleEvents
-            .flatMap { expander.occurrences(of: $0, in: paddedRange) }
+            .flatMap { event in
+                expander.occurrences(of: event, in: paddedRange, exceptions: recurrenceExceptions.filter { $0.masterEventID == event.id })
+            }
             .filter { occurrence in
                 if occurrence.event.isAllDay {
                     return true
@@ -608,7 +698,8 @@ final class BetterCalendarStore {
             events: events,
             pendingMutations: pendingMutations,
             deletedEventTombstones: deletedEventTombstones,
-            settings: settings
+            settings: settings,
+            recurrenceExceptions: recurrenceExceptions
         )
     }
 
@@ -618,6 +709,7 @@ final class BetterCalendarStore {
         pendingMutations = database.pendingMutations
         deletedEventTombstones = database.deletedEventTombstones
         settings = database.settings
+        recurrenceExceptions = database.recurrenceExceptions
     }
 
     private func persist() -> Bool {
@@ -633,7 +725,7 @@ final class BetterCalendarStore {
     }
 
     private func reconcileNotifications(authorizationRequestPolicy: NotificationAuthorizationRequestPolicy = .never) {
-        notificationScheduler.reconcile(events: events, calendars: calendars, now: .now, authorizationRequestPolicy: authorizationRequestPolicy, allDayAlertHour: settings.allDayReminderHour)
+        notificationScheduler.reconcile(events: events, calendars: calendars, now: .now, authorizationRequestPolicy: authorizationRequestPolicy, allDayAlertHour: settings.allDayReminderHour, recurrenceExceptions: recurrenceExceptions)
     }
 }
 
@@ -708,7 +800,8 @@ struct JSONCalendarRepository: LocalCalendarRepository {
             events: database.events,
             pendingMutations: database.pendingMutations,
             deletedEventTombstones: database.deletedEventTombstones,
-            settings: database.settings
+            settings: database.settings,
+            recurrenceExceptions: database.recurrenceExceptions
         )
     }
 

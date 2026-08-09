@@ -235,6 +235,86 @@ final class SQLiteCalendarRepositoryTests: XCTestCase {
         XCTAssertNil(loaded.settings.lastSelectedDate)
     }
 
+    // BC-REC-011
+    func testDaysOfMonthAndSetPositionsRoundTripThroughSQLite() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let event = TestData.event(
+            recurrence: RecurrenceRule(frequency: .monthly, interval: 1, weekdays: [.friday], setPositions: [-1], end: .never)
+        )
+
+        try repository.save(TestData.database(events: [event]))
+        let loaded = try repository.load()
+
+        let loadedRecurrence = try XCTUnwrap(loaded.events.first?.recurrence)
+        XCTAssertEqual(loadedRecurrence.setPositions, [-1])
+        XCTAssertEqual(loadedRecurrence.weekdays, [.friday])
+        XCTAssertEqual(loadedRecurrence.daysOfMonth, [])
+    }
+
+    // BC-REC-010
+    func testRecurrenceExceptionRoundTripsThroughSQLite() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let master = TestData.event(
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .never)
+        )
+        let replacement = TestData.event(
+            id: UUID(),
+            title: "Standup (moved room)",
+            startDate: TestData.date("2026-09-14T14:00:00Z"),
+            endDate: TestData.date("2026-09-14T14:30:00Z")
+        )
+        let exception = RecurrenceException(
+            id: UUID(),
+            masterEventID: master.id,
+            originalOccurrenceStart: TestData.date("2026-09-14T14:00:00Z"),
+            originalOccurrenceLocalDate: nil,
+            exceptionType: .modified,
+            replacementEventID: replacement.id
+        )
+
+        var database = TestData.database(events: [master, replacement])
+        database.recurrenceExceptions = [exception]
+        try repository.save(database)
+
+        let loaded = try repository.load()
+
+        let loadedException = try XCTUnwrap(loaded.recurrenceExceptions.first)
+        XCTAssertEqual(loadedException.masterEventID, master.id)
+        XCTAssertEqual(loadedException.exceptionType, .modified)
+        XCTAssertEqual(loadedException.replacementEventID, replacement.id)
+        XCTAssertEqual(loadedException.originalOccurrenceStart, TestData.date("2026-09-14T14:00:00Z"))
+    }
+
+    // BC-REC-010
+    func testReplacementEventRecurrenceMasterIDAndOriginalStartRoundTrip() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        // recurrence_master_id is a foreign key onto events(id), so the master must actually
+        // exist in the same save.
+        let master = TestData.event(
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .never)
+        )
+        let originalStart = TestData.date("2026-09-14T14:00:00Z")
+        var replacement = TestData.event(id: UUID(), title: "Standup (moved room)")
+        replacement.recurrenceMasterID = master.id
+        replacement.recurrenceOriginalStart = originalStart
+
+        try repository.save(TestData.database(events: [master, replacement]))
+        let loaded = try repository.load()
+
+        let loadedReplacement = try XCTUnwrap(loaded.events.first { $0.id == replacement.id })
+        XCTAssertEqual(loadedReplacement.recurrenceMasterID, master.id)
+        XCTAssertEqual(loadedReplacement.recurrenceOriginalStart, originalStart)
+    }
+
     // BC-CAL-001
     func testCalendarSortOrderRoundTripsAndReorderPersists() throws {
         let databaseURL = try makeTemporaryDatabaseURL()

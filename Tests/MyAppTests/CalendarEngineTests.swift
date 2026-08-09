@@ -104,6 +104,115 @@ final class CalendarEngineTests: XCTestCase {
         XCTAssertEqual(monthDays, ["02-29", "02-28", "02-28"])
     }
 
+    // BC-REC-011
+    func testMonthlyRecurrenceOnLastFridayOfMonth() {
+        // Last Fridays of Sept/Oct/Nov 2026: 25th, 30th, 27th.
+        let start = date(year: 2026, month: 9, day: 4, hour: 9, timeZoneIdentifier: "UTC")
+        let event = event(
+            startDate: start,
+            endDate: start.addingTimeInterval(60 * 60),
+            recurrence: RecurrenceRule(frequency: .monthly, interval: 1, weekdays: [.friday], setPositions: [-1], end: .afterOccurrences(3))
+        )
+        let range = DateInterval(start: TestData.date("2026-09-01T00:00:00Z"), end: TestData.date("2026-12-31T00:00:00Z"))
+
+        let monthDays = RecurrenceExpander().occurrences(of: event, in: range).map { monthDay(for: $0.occurrenceStartDate, timeZoneIdentifier: "UTC") }
+
+        XCTAssertEqual(monthDays, ["09-25", "10-30", "11-27"])
+    }
+
+    // BC-REC-011
+    func testMonthlyRecurrenceWithMultipleDaysOfMonth() {
+        let start = date(year: 2026, month: 9, day: 1, hour: 9, timeZoneIdentifier: "UTC")
+        let event = event(
+            startDate: start,
+            endDate: start.addingTimeInterval(60 * 60),
+            recurrence: RecurrenceRule(frequency: .monthly, interval: 1, weekdays: [], daysOfMonth: [1, 15], end: .afterOccurrences(4))
+        )
+        let range = DateInterval(start: TestData.date("2026-09-01T00:00:00Z"), end: TestData.date("2026-11-01T00:00:00Z"))
+
+        let monthDays = RecurrenceExpander().occurrences(of: event, in: range).map { monthDay(for: $0.occurrenceStartDate, timeZoneIdentifier: "UTC") }
+
+        XCTAssertEqual(monthDays, ["09-01", "09-15", "10-01", "10-15"])
+    }
+
+    // BC-REC-010
+    func testExpanderSkipsCancelledExceptionOccurrence() {
+        let start = TestData.date("2026-09-07T14:00:00Z") // a Monday
+        let master = event(
+            startDate: start,
+            endDate: start.addingTimeInterval(60 * 60),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(3))
+        )
+        let exception = RecurrenceException(
+            id: UUID(),
+            masterEventID: master.id,
+            originalOccurrenceStart: TestData.date("2026-09-14T14:00:00Z"),
+            originalOccurrenceLocalDate: nil,
+            exceptionType: .cancelled,
+            replacementEventID: nil
+        )
+        let range = DateInterval(start: TestData.date("2026-09-01T00:00:00Z"), end: TestData.date("2026-10-01T00:00:00Z"))
+
+        let occurrences = RecurrenceExpander().occurrences(of: master, in: range, exceptions: [exception])
+
+        XCTAssertEqual(occurrences.map(\.occurrenceStartDate), [start, TestData.date("2026-09-21T14:00:00Z")])
+    }
+
+    // BC-REC-010
+    func testExpanderOmitsSlotForModifiedException() {
+        let start = TestData.date("2026-09-07T14:00:00Z")
+        let master = event(
+            startDate: start,
+            endDate: start.addingTimeInterval(60 * 60),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(3))
+        )
+        let exception = RecurrenceException(
+            id: UUID(),
+            masterEventID: master.id,
+            originalOccurrenceStart: TestData.date("2026-09-14T14:00:00Z"),
+            originalOccurrenceLocalDate: nil,
+            exceptionType: .modified,
+            replacementEventID: UUID()
+        )
+        let range = DateInterval(start: TestData.date("2026-09-01T00:00:00Z"), end: TestData.date("2026-10-01T00:00:00Z"))
+
+        let occurrences = RecurrenceExpander().occurrences(of: master, in: range, exceptions: [exception])
+
+        XCTAssertEqual(occurrences.map(\.occurrenceStartDate), [start, TestData.date("2026-09-21T14:00:00Z")])
+    }
+
+    // BC-REC-010
+    func testNotificationPlannerSuppressesNotificationsForCancelledOccurrence() {
+        let reminder = EventReminder(id: UUID(), offset: .minutesBefore(10))
+        let start = TestData.date("2026-09-07T14:00:00Z")
+        var master = event(
+            startDate: start,
+            endDate: start.addingTimeInterval(60 * 60),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(2))
+        )
+        master.reminders = [reminder]
+        let exception = RecurrenceException(
+            id: UUID(),
+            masterEventID: master.id,
+            originalOccurrenceStart: TestData.date("2026-09-14T14:00:00Z"),
+            originalOccurrenceLocalDate: nil,
+            exceptionType: .cancelled,
+            replacementEventID: nil
+        )
+
+        let plan = LocalNotificationPlanner().plan(
+            events: [master],
+            calendars: [TestData.calendar()],
+            pendingIdentifiers: [],
+            now: TestData.date("2026-09-01T00:00:00Z"),
+            horizonEnd: TestData.date("2026-09-30T00:00:00Z"),
+            recurrenceExceptions: [exception]
+        )
+
+        XCTAssertEqual(plan.requestsToSchedule.count, 1)
+        XCTAssertEqual(plan.requestsToSchedule.first?.fireDate, start.addingTimeInterval(-600))
+    }
+
     func testAllDayOccurrenceUsesDisplayDateInsteadOfAbsoluteMidnight() throws {
         let start = date(year: 2026, month: 10, day: 12, timeZoneIdentifier: "America/Detroit")
         let end = date(year: 2026, month: 10, day: 14, timeZoneIdentifier: "America/Detroit")

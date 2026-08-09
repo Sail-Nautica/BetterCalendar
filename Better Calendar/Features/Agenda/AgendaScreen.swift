@@ -59,7 +59,12 @@ struct AgendaScreen: View {
                         selectedOccurrence = nil
                         editingEvent = event
                     },
+                    onEditOccurrence: { occurrence in
+                        selectedOccurrence = nil
+                        editingEvent = store.eventForEditingOccurrence(occurrence)
+                    },
                     onDelete: store.deleteEvent,
+                    onDeleteOccurrence: store.deleteOccurrence,
                     onDuplicate: { event in
                         store.duplicateEvent(event, startDate: event.startDate)
                     },

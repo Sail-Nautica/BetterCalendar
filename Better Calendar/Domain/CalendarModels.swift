@@ -7,16 +7,18 @@ struct LocalCalendarDatabase: Equatable {
     var pendingMutations: [PendingMutation]
     var deletedEventTombstones: [DeletedEventTombstone]
     var settings: AppSettings = .defaultSettings
+    var recurrenceExceptions: [RecurrenceException] = []
 
     static let currentSchemaVersion = 1
 }
 
 extension LocalCalendarDatabase: Codable {
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, calendars, events, pendingMutations, deletedEventTombstones, settings
+        case schemaVersion, calendars, events, pendingMutations, deletedEventTombstones, settings, recurrenceExceptions
     }
 
-    /// Decodes tolerantly so databases written before `settings` existed still load.
+    /// Decodes tolerantly so databases written before `settings`/`recurrenceExceptions`
+    /// existed still load.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
@@ -25,6 +27,7 @@ extension LocalCalendarDatabase: Codable {
         pendingMutations = try container.decode([PendingMutation].self, forKey: .pendingMutations)
         deletedEventTombstones = try container.decode([DeletedEventTombstone].self, forKey: .deletedEventTombstones)
         settings = try container.decodeIfPresent(AppSettings.self, forKey: .settings) ?? .defaultSettings
+        recurrenceExceptions = try container.decodeIfPresent([RecurrenceException].self, forKey: .recurrenceExceptions) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -35,6 +38,7 @@ extension LocalCalendarDatabase: Codable {
         try container.encode(pendingMutations, forKey: .pendingMutations)
         try container.encode(deletedEventTombstones, forKey: .deletedEventTombstones)
         try container.encode(settings, forKey: .settings)
+        try container.encode(recurrenceExceptions, forKey: .recurrenceExceptions)
     }
 }
 
@@ -226,6 +230,13 @@ struct CalendarEvent: Identifiable, Codable, Hashable {
     var providerMetadata: ProviderMetadata
     var createdAt: Date
     var updatedAt: Date
+    /// Set only on a standalone replacement event created for a single recurring occurrence
+    /// (BC-REC-010, "This Event" edit scope, spec 1.11) — the master series' id.
+    var recurrenceMasterID: UUID?
+    /// Paired with `recurrenceMasterID`: the occurrence's original start, used both to find an
+    /// existing replacement when re-editing the same occurrence and to match the
+    /// `RecurrenceException` that hides the master's slot at that date.
+    var recurrenceOriginalStart: Date?
 
     /// Compatibility accessor over `timeType`, so the many existing call sites that think in
     /// terms of a boolean keep working.
@@ -259,6 +270,7 @@ extension CalendarEvent {
         case id, calendarID, title, startDate, endDate, timeType, isAllDay
         case timeZoneIdentifier, location, urlString, notes, reminders
         case recurrence, providerMetadata, createdAt, updatedAt
+        case recurrenceMasterID, recurrenceOriginalStart
     }
 
     /// Decodes tolerantly so databases written before `timeType` existed still load.
@@ -284,6 +296,8 @@ extension CalendarEvent {
         providerMetadata = try container.decode(ProviderMetadata.self, forKey: .providerMetadata)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        recurrenceMasterID = try container.decodeIfPresent(UUID.self, forKey: .recurrenceMasterID)
+        recurrenceOriginalStart = try container.decodeIfPresent(Date.self, forKey: .recurrenceOriginalStart)
 
         if let decodedTimeType = try container.decodeIfPresent(EventTimeType.self, forKey: .timeType) {
             timeType = decodedTimeType
@@ -312,6 +326,8 @@ extension CalendarEvent {
         try container.encode(providerMetadata, forKey: .providerMetadata)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(updatedAt, forKey: .updatedAt)
+        try container.encodeIfPresent(recurrenceMasterID, forKey: .recurrenceMasterID)
+        try container.encodeIfPresent(recurrenceOriginalStart, forKey: .recurrenceOriginalStart)
     }
 
     /// Boolean-shaped initializer preserving the pre-`timeType` signature.
@@ -334,7 +350,9 @@ extension CalendarEvent {
         recurrence: RecurrenceRule?,
         providerMetadata: ProviderMetadata,
         createdAt: Date,
-        updatedAt: Date
+        updatedAt: Date,
+        recurrenceMasterID: UUID? = nil,
+        recurrenceOriginalStart: Date? = nil
     ) {
         self.init(
             id: id,
@@ -351,7 +369,9 @@ extension CalendarEvent {
             recurrence: recurrence,
             providerMetadata: providerMetadata,
             createdAt: createdAt,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            recurrenceMasterID: recurrenceMasterID,
+            recurrenceOriginalStart: recurrenceOriginalStart
         )
     }
 }
@@ -451,21 +471,70 @@ enum ReminderOffset: Codable, Hashable, CaseIterable, Identifiable {
     }
 }
 
-struct RecurrenceRule: Codable, Hashable {
+struct RecurrenceRule: Hashable {
     var frequency: RecurrenceFrequency
     var interval: Int
     var weekdays: Set<Weekday>
+    /// Explicit days of the month (1-31, clamped to the month's actual length). Empty unless
+    /// the user picks specific dates in the custom recurrence editor (BC-REC-011).
+    var daysOfMonth: [Int] = []
+    /// Positional rule ("last Friday of the month" = `[-1]` combined with `weekdays = [.friday]`;
+    /// "2nd Tuesday" = `[2]`). Empty unless the user picks a positional rule (BC-REC-011).
+    var setPositions: [Int] = []
     var end: RecurrenceEnd
 
     var summary: String {
         guard frequency != .never else { return "Never" }
 
         let cadence = interval == 1 ? frequency.label : "Every \(interval) \(frequency.pluralLabel)"
-        let dayText = weekdays.isEmpty ? "" : " on " + weekdays.sorted().map(\.shortLabel).joined(separator: ", ")
+        let dayText = summaryDayText
         return cadence + dayText + end.label
     }
 
+    private var summaryDayText: String {
+        if !setPositions.isEmpty, !weekdays.isEmpty {
+            let positions = setPositions.map(\.ordinalLabel).joined(separator: ", ")
+            let days = weekdays.sorted().map(\.shortLabel).joined(separator: ", ")
+            return " on the \(positions) \(days)"
+        }
+
+        if !daysOfMonth.isEmpty {
+            let days = daysOfMonth.sorted().map { $0.ordinalLabel }.joined(separator: ", ")
+            return " on the \(days)"
+        }
+
+        return weekdays.isEmpty ? "" : " on " + weekdays.sorted().map(\.shortLabel).joined(separator: ", ")
+    }
+
     nonisolated static let never = RecurrenceRule(frequency: .never, interval: 1, weekdays: [], end: .never)
+}
+
+extension RecurrenceRule: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case frequency, interval, weekdays, daysOfMonth, setPositions, end
+    }
+
+    /// Decodes tolerantly so recurrence rules written before `daysOfMonth`/`setPositions`
+    /// existed still load, defaulting both to empty (matches previous behavior exactly).
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        frequency = try container.decode(RecurrenceFrequency.self, forKey: .frequency)
+        interval = try container.decode(Int.self, forKey: .interval)
+        weekdays = try container.decode(Set<Weekday>.self, forKey: .weekdays)
+        daysOfMonth = try container.decodeIfPresent([Int].self, forKey: .daysOfMonth) ?? []
+        setPositions = try container.decodeIfPresent([Int].self, forKey: .setPositions) ?? []
+        end = try container.decode(RecurrenceEnd.self, forKey: .end)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(frequency, forKey: .frequency)
+        try container.encode(interval, forKey: .interval)
+        try container.encode(weekdays, forKey: .weekdays)
+        try container.encode(daysOfMonth, forKey: .daysOfMonth)
+        try container.encode(setPositions, forKey: .setPositions)
+        try container.encode(end, forKey: .end)
+    }
 }
 
 enum RecurrenceFrequency: String, Codable, CaseIterable, Identifiable {
@@ -524,6 +593,27 @@ enum Weekday: Int, Codable, CaseIterable, Comparable, Identifiable {
     static func < (lhs: Weekday, rhs: Weekday) -> Bool {
         lhs.rawValue < rhs.rawValue
     }
+
+    /// Monday through Friday — the "Every Weekday" recurrence preset (spec 1.11).
+    static let weekdays: Set<Weekday> = [.monday, .tuesday, .wednesday, .thursday, .friday]
+}
+
+extension Int {
+    /// "1st"/"2nd"/"3rd"/"4th"/"last" for set-position values (`-1` means "last", following the
+    /// RFC 5545 `BYSETPOS` convention) and "1st".."31st" for explicit days-of-month.
+    var ordinalLabel: String {
+        if self == -1 { return "last" }
+
+        let suffix: String
+        switch (self % 100, self % 10) {
+        case (11, _), (12, _), (13, _): suffix = "th"
+        case (_, 1): suffix = "st"
+        case (_, 2): suffix = "nd"
+        case (_, 3): suffix = "rd"
+        default: suffix = "th"
+        }
+        return "\(self)\(suffix)"
+    }
 }
 
 enum RecurrenceEnd: Codable, Hashable {
@@ -559,6 +649,26 @@ enum MutationOperation: String, Codable {
     case delete
 }
 
+/// A single recurring occurrence that no longer follows its master's rule unmodified
+/// (BC-REC-010, spec 0.10/1.11): either cancelled ("This Event" delete) or modified, in which
+/// case `replacementEventID` points to a standalone `CalendarEvent` carrying the edits.
+///
+/// Exactly one of `originalOccurrenceStart` (timed/floating) or `originalOccurrenceLocalDate`
+/// (all-day) is set, mirroring how `CalendarEvent` itself splits instant vs. local-date storage.
+struct RecurrenceException: Identifiable, Codable, Hashable {
+    var id: UUID
+    var masterEventID: UUID
+    var originalOccurrenceStart: Date?
+    var originalOccurrenceLocalDate: String?
+    var exceptionType: RecurrenceExceptionType
+    var replacementEventID: UUID?
+}
+
+enum RecurrenceExceptionType: String, Codable, Hashable {
+    case modified
+    case cancelled
+}
+
 struct DeletedEventTombstone: Identifiable, Codable, Hashable {
     var id: UUID
     var eventID: UUID
@@ -583,6 +693,10 @@ struct EventDraft: Equatable {
     var notes: String
     var reminderOffsets: [ReminderOffset]
     var recurrence: RecurrenceRule
+    /// Carried through unchanged from the seed/existing event so `saveEvent(from:)` can tell a
+    /// "This Event" occurrence edit apart from an ordinary event edit (BC-REC-010).
+    var recurrenceMasterID: UUID?
+    var recurrenceOriginalStart: Date?
 
     nonisolated init(event: CalendarEvent) {
         id = event.id
@@ -597,6 +711,8 @@ struct EventDraft: Equatable {
         notes = event.notes ?? ""
         reminderOffsets = event.reminders.map(\.offset).orderPreservingUniqued()
         recurrence = event.recurrence ?? .never
+        recurrenceMasterID = event.recurrenceMasterID
+        recurrenceOriginalStart = event.recurrenceOriginalStart
     }
 
     /// - Parameter roundingMinutes: rounds `startDate` up to the next boundary of this many
@@ -617,6 +733,8 @@ struct EventDraft: Equatable {
         notes = ""
         reminderOffsets = []
         recurrence = .never
+        recurrenceMasterID = nil
+        recurrenceOriginalStart = nil
     }
 
     private static func roundedUp(_ date: Date, toNearestMinutes minutes: Int, calendar: Calendar = .current) -> Date {

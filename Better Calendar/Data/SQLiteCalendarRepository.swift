@@ -36,7 +36,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 events: try fetchEvents(in: db),
                 pendingMutations: try fetchPendingMutations(in: db),
                 deletedEventTombstones: try fetchDeletedEventTombstones(in: db),
-                settings: try fetchSettings(in: db)
+                settings: try fetchSettings(in: db),
+                recurrenceExceptions: try fetchRecurrenceExceptions(in: db)
             )
         }
     }
@@ -324,6 +325,10 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             try insert(tombstone: tombstone, in: db)
         }
 
+        for exception in database.recurrenceExceptions {
+            try insert(exception: exception, in: db)
+        }
+
         try upsertSettings(database.settings, in: db)
 
         try db.execute(
@@ -405,8 +410,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 "confirmed",
                 "default",
                 nil,
-                nil,
-                nil,
+                event.recurrenceMasterID?.uuidString,
+                event.recurrenceOriginalStart.map(encodeInstant),
                 event.recurrence == nil ? 0 : 1,
                 event.providerMetadata.syncStatus.databaseValue,
                 encodeInstant(event.createdAt),
@@ -452,13 +457,13 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 recurrence.frequency.rawValue,
                 max(recurrence.interval, 1),
                 encodeIntegerArray(recurrence.weekdays.sorted().map(\.rawValue)),
-                nil,
+                encodeIntegerArray(recurrence.daysOfMonth.sorted()),
                 nil,
                 Weekday.monday.rawValue,
                 endValues.count,
                 endValues.untilInstant,
                 endValues.untilLocalDate,
-                nil,
+                encodeIntegerArray(recurrence.setPositions.sorted()),
                 nil
             ]
         )
@@ -502,6 +507,46 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 tombstone.deletionSyncedAt.map(encodeInstant)
             ]
         )
+    }
+
+    private func insert(exception: RecurrenceException, in db: Database) throws {
+        try db.execute(
+            sql: """
+                INSERT INTO event_recurrence_exceptions (
+                    id, master_event_id, original_occurrence_start, original_occurrence_local_date,
+                    exception_type, replacement_event_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+            arguments: [
+                exception.id.uuidString,
+                exception.masterEventID.uuidString,
+                exception.originalOccurrenceStart.map(encodeInstant),
+                exception.originalOccurrenceLocalDate,
+                exception.exceptionType.rawValue,
+                exception.replacementEventID?.uuidString
+            ]
+        )
+    }
+
+    private func fetchRecurrenceExceptions(in db: Database) throws -> [RecurrenceException] {
+        let rows = try Row.fetchAll(db, sql: "SELECT * FROM event_recurrence_exceptions")
+        return rows.compactMap { row in
+            guard let id = UUID(uuidString: row["id"]),
+                  let masterEventID = UUID(uuidString: row["master_event_id"]),
+                  let exceptionType = RecurrenceExceptionType(rawValue: row["exception_type"]) else {
+                return nil
+            }
+
+            return RecurrenceException(
+                id: id,
+                masterEventID: masterEventID,
+                originalOccurrenceStart: decodeInstant(row["original_occurrence_start"]),
+                originalOccurrenceLocalDate: row["original_occurrence_local_date"],
+                exceptionType: exceptionType,
+                replacementEventID: (row["replacement_event_id"] as String?).flatMap(UUID.init(uuidString:))
+            )
+        }
     }
 
     private func fetchCalendars(in db: Database) throws -> [BetterCalendar] {
@@ -592,7 +637,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 deletedAt: decodeInstant(row["deleted_at"])
             ),
             createdAt: decodeInstant(row["created_at"]) ?? .now,
-            updatedAt: decodeInstant(row["updated_at"]) ?? .now
+            updatedAt: decodeInstant(row["updated_at"]) ?? .now,
+            recurrenceMasterID: (row["recurrence_master_id"] as String?).flatMap(UUID.init(uuidString:)),
+            recurrenceOriginalStart: decodeInstant(row["recurrence_original_start"])
         )
     }
 
@@ -623,6 +670,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
         let weekdayValues = decodeIntegerArray(row["days_of_week"]) ?? []
         let weekdays = Set(weekdayValues.compactMap(Weekday.init(rawValue:)))
+        let daysOfMonth = decodeIntegerArray(row["days_of_month"]) ?? []
+        let setPositions = decodeIntegerArray(row["set_positions"]) ?? []
 
         let end: RecurrenceEnd
         if let count: Int = row["count"] {
@@ -640,6 +689,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             frequency: frequency,
             interval: max(row["interval"] as Int, 1),
             weekdays: weekdays,
+            daysOfMonth: daysOfMonth,
+            setPositions: setPositions,
             end: end
         )
     }

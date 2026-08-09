@@ -282,6 +282,94 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(store.settings.snapIntervalMinutes, originalSnapInterval)
     }
 
+    // BC-REC-010
+    func testDeleteThisEventOnlyCreatesCancelledExceptionLeavingSiblingsIntact() throws {
+        let start = TestData.date("2026-09-07T14:00:00Z") // a Monday
+        let master = TestData.event(
+            startDate: start,
+            endDate: start.addingTimeInterval(60 * 60),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(3))
+        )
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [master])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        let range = DateInterval(start: TestData.date("2026-09-01T00:00:00Z"), end: TestData.date("2026-10-01T00:00:00Z"))
+        let occurrences = store.visibleOccurrences(in: range)
+        XCTAssertEqual(occurrences.count, 3)
+
+        let secondOccurrence = try XCTUnwrap(occurrences.first { $0.occurrenceStartDate == TestData.date("2026-09-14T14:00:00Z") })
+        store.deleteOccurrence(secondOccurrence)
+
+        let remaining = store.visibleOccurrences(in: range)
+        XCTAssertEqual(remaining.map(\.occurrenceStartDate), [start, TestData.date("2026-09-21T14:00:00Z")])
+        XCTAssertEqual(store.recurrenceExceptions.count, 1)
+        XCTAssertEqual(store.recurrenceExceptions.first?.exceptionType, .cancelled)
+        XCTAssertEqual(store.events.count, 1, "The master event itself must be untouched by a This-Event delete.")
+    }
+
+    // BC-REC-010
+    func testEditThisEventOnlyCreatesModifiedExceptionAndReplacementEvent() throws {
+        let start = TestData.date("2026-09-07T14:00:00Z")
+        let master = TestData.event(
+            title: "Standup",
+            startDate: start,
+            endDate: start.addingTimeInterval(30 * 60),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(3))
+        )
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [master])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        let range = DateInterval(start: TestData.date("2026-09-01T00:00:00Z"), end: TestData.date("2026-10-01T00:00:00Z"))
+        let secondOccurrence = try XCTUnwrap(store.visibleOccurrences(in: range).first { $0.occurrenceStartDate == TestData.date("2026-09-14T14:00:00Z") })
+
+        var draft = EventDraft(event: store.eventForEditingOccurrence(secondOccurrence))
+        draft.title = "Standup (moved room)"
+        draft.location = "Room 202"
+        XCTAssertTrue(store.saveEvent(from: draft))
+
+        XCTAssertEqual(store.events.count, 2, "Editing This Event only creates a standalone replacement; the master stays put.")
+        XCTAssertEqual(store.recurrenceExceptions.count, 1)
+        XCTAssertEqual(store.recurrenceExceptions.first?.exceptionType, .modified)
+
+        let occurrences = store.visibleOccurrences(in: range).sorted { $0.occurrenceStartDate < $1.occurrenceStartDate }
+        XCTAssertEqual(occurrences.count, 3)
+        XCTAssertEqual(occurrences[0].event.title, "Standup")
+        XCTAssertEqual(occurrences[1].event.title, "Standup (moved room)")
+        XCTAssertEqual(occurrences[1].event.location, "Room 202")
+        XCTAssertEqual(occurrences[2].event.title, "Standup")
+    }
+
+    // BC-REC-010
+    func testEditingSameOccurrenceTwiceUpdatesExistingReplacementRatherThanCreatingASecondOne() throws {
+        let start = TestData.date("2026-09-07T14:00:00Z")
+        let master = TestData.event(
+            title: "Standup",
+            startDate: start,
+            endDate: start.addingTimeInterval(30 * 60),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(3))
+        )
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [master])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        let range = DateInterval(start: TestData.date("2026-09-01T00:00:00Z"), end: TestData.date("2026-10-01T00:00:00Z"))
+        let secondOccurrence = try XCTUnwrap(store.visibleOccurrences(in: range).first { $0.occurrenceStartDate == TestData.date("2026-09-14T14:00:00Z") })
+
+        var firstEdit = EventDraft(event: store.eventForEditingOccurrence(secondOccurrence))
+        firstEdit.location = "Room 202"
+        XCTAssertTrue(store.saveEvent(from: firstEdit))
+        XCTAssertEqual(store.events.count, 2)
+        XCTAssertEqual(store.recurrenceExceptions.count, 1)
+
+        let reEditedOccurrence = try XCTUnwrap(store.visibleOccurrences(in: range).first { $0.occurrenceStartDate == TestData.date("2026-09-14T14:00:00Z") })
+        var secondEdit = EventDraft(event: store.eventForEditingOccurrence(reEditedOccurrence))
+        secondEdit.location = "Room 303"
+        XCTAssertTrue(store.saveEvent(from: secondEdit))
+
+        XCTAssertEqual(store.events.count, 2, "A second edit of the same occurrence must update the existing replacement, not create a new one.")
+        XCTAssertEqual(store.recurrenceExceptions.count, 1, "No second exception should be recorded.")
+        XCTAssertEqual(store.events.first { $0.recurrenceMasterID != nil }?.location, "Room 303")
+    }
+
     // BC-ONB-001
     func testCompletingOnboardingPersistsFlagAndSurvivesReload() throws {
         let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [])))

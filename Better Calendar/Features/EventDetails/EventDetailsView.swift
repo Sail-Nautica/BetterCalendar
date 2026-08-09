@@ -4,12 +4,24 @@ struct EventDetailsView: View {
     let occurrence: CalendarOccurrence
     let calendar: BetterCalendar?
     let onEdit: (CalendarEvent) -> Void
+    /// "This Event" edit scope (BC-REC-010, spec 1.11) — the caller resolves which event to
+    /// open via `store.eventForEditingOccurrence(_:)`.
+    let onEditOccurrence: (CalendarOccurrence) -> Void
     let onDelete: (CalendarEvent) -> Void
+    /// "This Event" delete scope (BC-REC-010, spec 1.11) — the caller calls
+    /// `store.deleteOccurrence(_:)`.
+    let onDeleteOccurrence: (CalendarOccurrence) -> Void
     let onDuplicate: (CalendarEvent) -> Void
     let onMove: (CalendarEvent, Date) -> Void
     let onResize: (CalendarEvent, Date, Date) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @State private var pendingScopeAction: ScopeAction?
+
+    private enum ScopeAction: Equatable {
+        case edit
+        case delete
+    }
 
     private var event: CalendarEvent {
         occurrence.displayEvent
@@ -43,8 +55,12 @@ struct EventDetailsView: View {
 
                 Section("Actions") {
                     Button("Edit", systemImage: "pencil") {
-                        dismiss()
-                        onEdit(occurrence.event)
+                        if occurrence.isRecurringOccurrence {
+                            pendingScopeAction = .edit
+                        } else {
+                            dismiss()
+                            onEdit(occurrence.event)
+                        }
                     }
 
                     Button("Duplicate this occurrence", systemImage: "plus.square.on.square") {
@@ -85,14 +101,18 @@ struct EventDetailsView: View {
                     }
 
                     Button("Delete", systemImage: "trash", role: .destructive) {
-                        dismiss()
-                        onDelete(occurrence.event)
+                        if occurrence.isRecurringOccurrence {
+                            pendingScopeAction = .delete
+                        } else {
+                            dismiss()
+                            onDelete(occurrence.event)
+                        }
                     }
                 }
 
                 if occurrence.isRecurringOccurrence {
                     Section {
-                        Text("For now, edit, move, resize, and delete operations apply to the recurring series. Duplicate creates a standalone copy of only this occurrence.")
+                        Text("Move and resize apply to the whole recurring series. Duplicate creates a standalone copy of only this occurrence.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -141,6 +161,35 @@ struct EventDetailsView: View {
                     }
                 }
             }
+            .confirmationDialog(
+                pendingScopeAction == .delete ? "Delete recurring event" : "Edit recurring event",
+                isPresented: Binding(get: { pendingScopeAction != nil }, set: { if !$0 { pendingScopeAction = nil } }),
+                titleVisibility: .visible
+            ) {
+                Button("This Event") {
+                    performScopedAction(applyToThisEventOnly: true)
+                }
+                Button("All Events") {
+                    performScopedAction(applyToThisEventOnly: false)
+                }
+                Button("Cancel", role: .cancel) {
+                    pendingScopeAction = nil
+                }
+            }
+        }
+    }
+
+    private func performScopedAction(applyToThisEventOnly: Bool) {
+        defer { pendingScopeAction = nil }
+        dismiss()
+
+        switch pendingScopeAction {
+        case .edit:
+            applyToThisEventOnly ? onEditOccurrence(occurrence) : onEdit(occurrence.event)
+        case .delete:
+            applyToThisEventOnly ? onDeleteOccurrence(occurrence) : onDelete(occurrence.event)
+        case nil:
+            break
         }
     }
 
