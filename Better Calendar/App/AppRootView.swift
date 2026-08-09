@@ -5,10 +5,21 @@ import UIKit
 #endif
 
 struct AppRootView: View {
-    @State private var store = BetterCalendarStore()
-    @State private var selectedTab: BetterCalendarTab = .calendar
-    @State private var calendarViewMode: CalendarViewMode = .day
+    @State private var store: BetterCalendarStore
+    @State private var selectedTab: BetterCalendarTab
+    @State private var calendarViewMode: CalendarViewMode
+    @State private var isShowingOnboarding: Bool
     @Environment(\.scenePhase) private var scenePhase
+
+    init() {
+        let store = BetterCalendarStore()
+        _store = State(initialValue: store)
+        // BC-VIEW-010 (spec 1.2): resume where the user left off across relaunch.
+        _selectedTab = State(initialValue: store.settings.lastSelectedTab ?? .calendar)
+        _calendarViewMode = State(initialValue: store.settings.defaultCalendarView)
+        // BC-ONB-001 (spec 1.1): shown once, on first launch.
+        _isShowingOnboarding = State(initialValue: !store.settings.hasCompletedOnboarding)
+    }
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -57,6 +68,17 @@ struct AppRootView: View {
                 store.refreshForSystemTimeChange()
             }
         }
+        .onChange(of: selectedTab) { _, newTab in
+            store.updateLastViewState(tab: newTab)
+        }
+        .onChange(of: calendarViewMode) { _, newMode in
+            store.updateLastViewState(viewMode: newMode)
+        }
+        .fullScreenCover(isPresented: $isShowingOnboarding) {
+            OnboardingView(store: store) {
+                isShowingOnboarding = false
+            }
+        }
 #if canImport(UIKit)
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification)) { _ in
             store.refreshForSystemTimeChange()
@@ -66,12 +88,6 @@ struct AppRootView: View {
             store.refreshForSystemTimeChange()
         }
     }
-}
-
-enum BetterCalendarTab: Hashable {
-    case calendar
-    case agenda
-    case search
 }
 
 private struct UndoBanner: View {

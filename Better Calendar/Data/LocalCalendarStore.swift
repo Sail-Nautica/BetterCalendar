@@ -7,6 +7,7 @@ final class BetterCalendarStore {
     private(set) var events: [CalendarEvent] = []
     private(set) var pendingMutations: [PendingMutation] = []
     private(set) var deletedEventTombstones: [DeletedEventTombstone] = []
+    private(set) var settings: AppSettings = .defaultSettings
     private(set) var lastError: String?
     private(set) var environmentRevision = 0
     var undoAction: UndoAction?
@@ -37,6 +38,7 @@ final class BetterCalendarStore {
             apply(database)
             ensureDefaultCalendar()
             lastError = nil
+            purgeExpiredTombstones()
             reconcileNotifications()
         } catch {
             let fallback = LocalCalendarDatabase.seed
@@ -107,7 +109,16 @@ final class BetterCalendarStore {
     func deleteEvent(_ event: CalendarEvent) {
         let didDelete = withPersistedMutation {
             events.removeAll { $0.id == event.id }
-            deletedEventTombstones.append(DeletedEventTombstone(id: UUID(), eventID: event.id, title: event.title, deletedAt: .now))
+            deletedEventTombstones.append(
+                DeletedEventTombstone(
+                    id: UUID(),
+                    eventID: event.id,
+                    title: event.title,
+                    deletedAt: .now,
+                    eventSnapshotJSON: event.encodedSnapshotJSON(),
+                    deletionSyncedAt: nil
+                )
+            )
             recordMutation(objectID: event.id, objectType: .event, operation: .delete)
             undoAction = UndoAction(message: "Deleted \"\(event.title)\"", actionTitle: "Undo") { [weak self] in
                 self?.withPersistedMutation {
@@ -119,6 +130,28 @@ final class BetterCalendarStore {
         }
         if didDelete {
             notificationScheduler.cancelNotifications(for: [event.id])
+        }
+    }
+
+    /// Reconstructs a soft-deleted event from its tombstone's durable snapshot (spec 0.12).
+    /// This is the recovery path for when the app was force-quit before the in-memory Undo
+    /// banner was tapped — the undo closure itself does not survive a relaunch.
+    @discardableResult
+    func restoreDeletedEvent(_ tombstone: DeletedEventTombstone) -> Bool {
+        guard let snapshotJSON = tombstone.eventSnapshotJSON,
+              var restoredEvent = CalendarEvent(snapshotJSON: snapshotJSON) else {
+            return false
+        }
+
+        if !calendars.contains(where: { $0.id == restoredEvent.calendarID }), let fallbackID = defaultCalendarID {
+            restoredEvent.calendarID = fallbackID
+        }
+
+        return withPersistedMutation {
+            events.append(restoredEvent)
+            sortEvents()
+            deletedEventTombstones.removeAll { $0.id == tombstone.id }
+            recordMutation(objectID: restoredEvent.id, objectType: .event, operation: .create)
         }
     }
 
@@ -214,6 +247,7 @@ final class BetterCalendarStore {
                 colorName: colorName,
                 isVisible: true,
                 isDefault: calendars.isEmpty,
+                sortOrder: calendars.count,
                 createdAt: .now,
                 updatedAt: .now
             )
@@ -243,6 +277,48 @@ final class BetterCalendarStore {
         }
     }
 
+    /// Reorders calendars per a drag gesture's `.onMove` offsets/destination (spec 1.3), then
+    /// renumbers `sortOrder` sequentially so it stays a stable, persisted ordering rather than
+    /// being re-derived from array position at save time.
+    ///
+    /// This is a manual reimplementation of `Array.move(fromOffsets:toOffset:)` — that method
+    /// is a SwiftUI extension, and the Data layer must not import SwiftUI.
+    func reorderCalendars(fromOffsets source: IndexSet, toOffset destination: Int) {
+        withPersistedMutation {
+            var reordered = calendars
+            let itemsToMove = source.map { reordered[$0] }
+            for index in source.sorted(by: >) {
+                reordered.remove(at: index)
+            }
+            let adjustedDestination = destination - source.filter { $0 < destination }.count
+            reordered.insert(contentsOf: itemsToMove, at: adjustedDestination)
+
+            calendars = reordered
+            for index in calendars.indices {
+                calendars[index].sortOrder = index
+                calendars[index].updatedAt = .now
+            }
+        }
+    }
+
+    /// Count of this calendar's not-yet-past events, expanding recurrence within a bounded
+    /// one-year lookahead so an open-ended recurring event still counts without generating an
+    /// unbounded number of occurrences (spec 1.3 calendar list "number of future events").
+    func futureEventCount(for calendar: BetterCalendar, now: Date = .now) -> Int {
+        let horizon = DateInterval(start: now, end: now.addingTimeInterval(365 * 24 * 60 * 60))
+        let expander = RecurrenceExpander()
+
+        return events
+            .filter { $0.calendarID == calendar.id }
+            .filter { event in
+                guard event.recurrence != nil else {
+                    return event.endDate >= now
+                }
+                return !expander.occurrences(of: event, in: horizon).isEmpty
+            }
+            .count
+    }
+
     func toggleCalendarVisibility(_ calendar: BetterCalendar) {
         guard let index = calendars.firstIndex(where: { $0.id == calendar.id }) else { return }
         withPersistedMutation {
@@ -266,7 +342,16 @@ final class BetterCalendarStore {
             } else {
                 events.removeAll { $0.calendarID == calendar.id }
                 for event in affectedEvents {
-                    deletedEventTombstones.append(DeletedEventTombstone(id: UUID(), eventID: event.id, title: event.title, deletedAt: .now))
+                    deletedEventTombstones.append(
+                        DeletedEventTombstone(
+                            id: UUID(),
+                            eventID: event.id,
+                            title: event.title,
+                            deletedAt: .now,
+                            eventSnapshotJSON: event.encodedSnapshotJSON(),
+                            deletionSyncedAt: nil
+                        )
+                    )
                     recordMutation(objectID: event.id, objectType: .event, operation: .delete)
                 }
             }
@@ -274,6 +359,28 @@ final class BetterCalendarStore {
             calendars.removeAll { $0.id == calendar.id }
             recordMutation(objectID: calendar.id, objectType: .calendar, operation: .delete)
             ensureDefaultCalendar()
+        }
+    }
+
+    /// Applies a settings change through the same persist-then-rollback-on-failure path as
+    /// every other mutation (BC-SET-001, spec 1.20).
+    @discardableResult
+    func updateSettings(_ mutate: (inout AppSettings) -> Void) -> Bool {
+        withPersistedMutation {
+            mutate(&settings)
+        }
+    }
+
+    /// Persists the pieces of view state spec 1.2 requires survive relaunch (BC-VIEW-010).
+    /// Each parameter is independently optional so a caller only touches the fields it owns
+    /// (`AppRootView` owns tab/view mode, `CalendarScreen` owns the selected date).
+    @discardableResult
+    func updateLastViewState(tab: BetterCalendarTab? = nil, date: Date? = nil, viewMode: CalendarViewMode? = nil) -> Bool {
+        guard tab != nil || date != nil || viewMode != nil else { return true }
+        return updateSettings { settings in
+            if let tab { settings.lastSelectedTab = tab }
+            if let date { settings.lastSelectedDate = date }
+            if let viewMode { settings.defaultCalendarView = viewMode }
         }
     }
 
@@ -285,8 +392,47 @@ final class BetterCalendarStore {
         lastError = nil
     }
 
+    /// Spec 1.20 "Delete all local data" (and the debug "Reset database" diagnostic, which is
+    /// the same operation): wipes back to a single fresh default calendar with no events,
+    /// tombstones, or pending mutations. Settings are preserved — a full settings reset is a
+    /// bigger destructive step than this control promises.
+    @discardableResult
+    func deleteAllLocalData() -> Bool {
+        withPersistedMutation {
+            calendars = [BetterCalendar.localDefault()]
+            events = []
+            pendingMutations = []
+            deletedEventTombstones = []
+        }
+    }
+
+    /// Debug-only diagnostic (spec 1.20): merges the built-in sample calendars/events into the
+    /// current database without disturbing existing data.
+    @discardableResult
+    func loadSampleData() -> Bool {
+        let sample = LocalCalendarDatabase.seed
+        return withPersistedMutation {
+            for sampleCalendar in sample.calendars where !calendars.contains(where: { $0.name == sampleCalendar.name }) {
+                calendars.append(sampleCalendar)
+            }
+            events.append(contentsOf: sample.events)
+            sortEvents()
+        }
+    }
+
+    /// Debug-only diagnostic (spec 1.20): forces an immediate notification reconciliation pass.
+    func reconcileAllNotifications() {
+        reconcileNotifications(authorizationRequestPolicy: .ifNeeded)
+    }
+
+    /// Debug-only diagnostic (spec 1.20 "pending notification count").
+    func pendingNotificationCount() async -> Int {
+        await notificationScheduler.pendingRequestCount()
+    }
+
     func refreshForSystemTimeChange() {
         environmentRevision += 1
+        purgeExpiredTombstones()
         reconcileNotifications()
     }
 
@@ -386,6 +532,19 @@ final class BetterCalendarStore {
         pendingMutations.append(PendingMutation(id: UUID(), objectID: objectID, objectType: objectType, operation: operation, createdAt: .now))
     }
 
+    /// Spec 0.12: "retain soft-deleted data for a cleanup period." The spec gives no exact
+    /// number, so 30 days is used as a reasonable, generous recovery window.
+    private static let tombstoneRetentionInterval: TimeInterval = 30 * 24 * 60 * 60
+
+    private func purgeExpiredTombstones(now: Date = .now) {
+        let expirationCutoff = now.addingTimeInterval(-Self.tombstoneRetentionInterval)
+        guard deletedEventTombstones.contains(where: { $0.deletedAt < expirationCutoff }) else { return }
+
+        withPersistedMutation {
+            deletedEventTombstones.removeAll { $0.deletedAt < expirationCutoff }
+        }
+    }
+
     private func ensureDefaultCalendar() {
         if calendars.isEmpty {
             calendars = [BetterCalendar.localDefault()]
@@ -448,7 +607,8 @@ final class BetterCalendarStore {
             calendars: calendars,
             events: events,
             pendingMutations: pendingMutations,
-            deletedEventTombstones: deletedEventTombstones
+            deletedEventTombstones: deletedEventTombstones,
+            settings: settings
         )
     }
 
@@ -457,6 +617,7 @@ final class BetterCalendarStore {
         events = database.events
         pendingMutations = database.pendingMutations
         deletedEventTombstones = database.deletedEventTombstones
+        settings = database.settings
     }
 
     private func persist() -> Bool {
@@ -472,7 +633,7 @@ final class BetterCalendarStore {
     }
 
     private func reconcileNotifications(authorizationRequestPolicy: NotificationAuthorizationRequestPolicy = .never) {
-        notificationScheduler.reconcile(events: events, calendars: calendars, now: .now, authorizationRequestPolicy: authorizationRequestPolicy)
+        notificationScheduler.reconcile(events: events, calendars: calendars, now: .now, authorizationRequestPolicy: authorizationRequestPolicy, allDayAlertHour: settings.allDayReminderHour)
     }
 }
 
@@ -546,7 +707,8 @@ struct JSONCalendarRepository: LocalCalendarRepository {
             calendars: database.calendars,
             events: database.events,
             pendingMutations: database.pendingMutations,
-            deletedEventTombstones: database.deletedEventTombstones
+            deletedEventTombstones: database.deletedEventTombstones,
+            settings: database.settings
         )
     }
 
@@ -613,6 +775,7 @@ extension LocalCalendarDatabase {
             colorName: .success,
             isVisible: true,
             isDefault: false,
+            sortOrder: 1,
             createdAt: .now,
             updatedAt: .now
         )

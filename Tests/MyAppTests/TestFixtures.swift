@@ -18,7 +18,8 @@ enum TestData {
     static func calendar(
         id: UUID = calendarID,
         name: String = "School",
-        isDefault: Bool = true
+        isDefault: Bool = true,
+        sortOrder: Int = 0
     ) -> BetterCalendar {
         BetterCalendar(
             id: id,
@@ -26,6 +27,7 @@ enum TestData {
             colorName: .betterBlue,
             isVisible: true,
             isDefault: isDefault,
+            sortOrder: sortOrder,
             createdAt: date("2026-09-01T12:00:00Z"),
             updatedAt: date("2026-09-01T12:00:00Z")
         )

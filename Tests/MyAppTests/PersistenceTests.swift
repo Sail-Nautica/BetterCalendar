@@ -178,6 +178,159 @@ final class PersistenceTests: XCTestCase {
         XCTAssertNotEqual(newReminder.id, originalReminderID)
     }
 
+    // BC-DEL-001
+    func testDeletingEventPersistsFullSnapshotSurvivingReloadFromRepository() throws {
+        let event = TestData.event(title: "Study Session")
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [event])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        store.deleteEvent(event)
+
+        let savedDatabase = try XCTUnwrap(repository.savedDatabases.last)
+        let tombstone = try XCTUnwrap(savedDatabase.deletedEventTombstones.first)
+        XCTAssertNotNil(tombstone.eventSnapshotJSON)
+
+        // Simulate a relaunch: a fresh store loads from exactly what was persisted, with no
+        // in-memory `UndoAction` closure available.
+        let reloadedRepository = StubCalendarRepository(loadResult: .success(savedDatabase))
+        let reloadedStore = BetterCalendarStore(repository: reloadedRepository, notificationScheduler: NoopNotificationScheduler())
+
+        XCTAssertTrue(reloadedStore.events.isEmpty)
+        let reloadedTombstone = try XCTUnwrap(reloadedStore.deletedEventTombstones.first)
+        let snapshotJSON = try XCTUnwrap(reloadedTombstone.eventSnapshotJSON)
+        let restoredEvent = try XCTUnwrap(CalendarEvent(snapshotJSON: snapshotJSON))
+        XCTAssertEqual(restoredEvent.id, event.id)
+        XCTAssertEqual(restoredEvent.title, event.title)
+    }
+
+    // BC-DEL-001
+    func testRestoringTombstoneReinsertsEventWithOriginalRemindersAndRecurrence() throws {
+        var event = TestData.event(
+            title: "Lab Section",
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.tuesday], end: .never)
+        )
+        event.reminders = [EventReminder(id: UUID(), offset: .minutesBefore(15))]
+
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [event])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        store.deleteEvent(event)
+        XCTAssertTrue(store.events.isEmpty)
+
+        let tombstone = try XCTUnwrap(store.deletedEventTombstones.first)
+        XCTAssertTrue(store.restoreDeletedEvent(tombstone))
+
+        let restored = try XCTUnwrap(store.events.first)
+        XCTAssertEqual(restored.id, event.id)
+        XCTAssertEqual(restored.reminders.map(\.offset), [.minutesBefore(15)])
+        XCTAssertEqual(restored.recurrence?.frequency, .weekly)
+        XCTAssertTrue(store.deletedEventTombstones.isEmpty)
+    }
+
+    // BC-DEL-001
+    func testExpiredTombstonesArePurgedOnLoadButRecentOnesSurvive() {
+        let expiredTombstone = DeletedEventTombstone(
+            id: UUID(),
+            eventID: UUID(),
+            title: "Old Deleted Event",
+            deletedAt: Date.now.addingTimeInterval(-31 * 24 * 60 * 60),
+            eventSnapshotJSON: nil,
+            deletionSyncedAt: nil
+        )
+        let recentTombstone = DeletedEventTombstone(
+            id: UUID(),
+            eventID: UUID(),
+            title: "Recently Deleted Event",
+            deletedAt: Date.now.addingTimeInterval(-60),
+            eventSnapshotJSON: nil,
+            deletionSyncedAt: nil
+        )
+        let repository = StubCalendarRepository(
+            loadResult: .success(TestData.database(events: [], deletedEventTombstones: [expiredTombstone, recentTombstone]))
+        )
+
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        XCTAssertEqual(store.deletedEventTombstones.map(\.id), [recentTombstone.id])
+    }
+
+    // BC-SET-001
+    func testUpdateSettingsPersistsChange() {
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        let didUpdate = store.updateSettings {
+            $0.showWeekends = false
+            $0.snapIntervalMinutes = 10
+        }
+
+        XCTAssertTrue(didUpdate)
+        XCTAssertFalse(store.settings.showWeekends)
+        XCTAssertEqual(store.settings.snapIntervalMinutes, 10)
+        XCTAssertEqual(repository.savedDatabases.last?.settings.snapIntervalMinutes, 10)
+    }
+
+    // BC-SET-001
+    func testUpdateSettingsRollsBackWhenRepositorySaveFails() {
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [])), saveError: TestRepositoryError.saveFailed)
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+        let originalSnapInterval = store.settings.snapIntervalMinutes
+
+        let didUpdate = store.updateSettings { $0.snapIntervalMinutes = 5 }
+
+        XCTAssertFalse(didUpdate)
+        XCTAssertEqual(store.settings.snapIntervalMinutes, originalSnapInterval)
+    }
+
+    // BC-ONB-001
+    func testCompletingOnboardingPersistsFlagAndSurvivesReload() throws {
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        XCTAssertFalse(store.settings.hasCompletedOnboarding)
+
+        store.updateSettings { $0.hasCompletedOnboarding = true }
+
+        XCTAssertTrue(store.settings.hasCompletedOnboarding)
+        let savedDatabase = try XCTUnwrap(repository.savedDatabases.last)
+        XCTAssertTrue(savedDatabase.settings.hasCompletedOnboarding)
+
+        let reloadedStore = BetterCalendarStore(repository: StubCalendarRepository(loadResult: .success(savedDatabase)), notificationScheduler: NoopNotificationScheduler())
+        XCTAssertTrue(reloadedStore.settings.hasCompletedOnboarding, "Onboarding must not be shown again after it has been completed once.")
+    }
+
+    // BC-CAL-001
+    func testReorderCalendarsPersistsNewSortOrderAndRollsBackOnFailure() {
+        let first = TestData.calendar(id: TestData.calendarID, name: "School", isDefault: true, sortOrder: 0)
+        let second = TestData.calendar(id: TestData.secondCalendarID, name: "Personal", isDefault: false, sortOrder: 1)
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(calendars: [first, second], events: [])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        store.reorderCalendars(fromOffsets: IndexSet(integer: 1), toOffset: 0)
+
+        XCTAssertEqual(store.calendars.map(\.id), [second.id, first.id])
+        XCTAssertEqual(store.calendars.map(\.sortOrder), [0, 1])
+    }
+
+    // BC-CAL-001
+    func testFutureEventCountExcludesPastNonRecurringEventsButIncludesOpenEndedRecurringEvents() {
+        let pastEvent = TestData.event(id: UUID(), title: "Past", startDate: TestData.date("2026-01-01T10:00:00Z"), endDate: TestData.date("2026-01-01T11:00:00Z"))
+        let futureEvent = TestData.event(id: UUID(), title: "Future", startDate: TestData.date("2027-01-01T10:00:00Z"), endDate: TestData.date("2027-01-01T11:00:00Z"))
+        let recurringEvent = TestData.event(
+            id: UUID(),
+            title: "Weekly",
+            startDate: TestData.date("2020-01-06T10:00:00Z"),
+            endDate: TestData.date("2020-01-06T11:00:00Z"),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .never)
+        )
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [pastEvent, futureEvent, recurringEvent])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        let count = store.futureEventCount(for: TestData.calendar(), now: TestData.date("2026-09-01T00:00:00Z"))
+
+        XCTAssertEqual(count, 2)
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("BetterCalendarTests-\(UUID().uuidString)", isDirectory: true)

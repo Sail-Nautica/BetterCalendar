@@ -10,7 +10,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v004_create_recurrence",
         "v005_create_search_index",
         "v006_create_event_extensions",
-        "v007_create_sync_and_settings"
+        "v007_create_sync_and_settings",
+        "v008_add_deletion_snapshot"
     ]
 
     private let fileURLOverride: URL?
@@ -34,7 +35,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 calendars: calendars,
                 events: try fetchEvents(in: db),
                 pendingMutations: try fetchPendingMutations(in: db),
-                deletedEventTombstones: try fetchDeletedEventTombstones(in: db)
+                deletedEventTombstones: try fetchDeletedEventTombstones(in: db),
+                settings: try fetchSettings(in: db)
             )
         }
     }
@@ -273,6 +275,14 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             )
         }
 
+        // Spec 0.12: a soft-deleted event must be recoverable even after a force-quit, not
+        // only via the in-memory Undo closure. This stores a full JSON snapshot of the deleted
+        // event alongside its tombstone, plus when the tombstone was last purge-eligible.
+        migrator.registerMigration("v008_add_deletion_snapshot") { db in
+            try db.execute(sql: "ALTER TABLE deleted_objects ADD COLUMN event_snapshot_json TEXT")
+            try db.execute(sql: "ALTER TABLE deleted_objects ADD COLUMN deletion_synced_at TEXT")
+        }
+
         return migrator
     }
 
@@ -289,8 +299,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         try db.execute(sql: "DELETE FROM events")
         try db.execute(sql: "DELETE FROM calendars")
 
-        for (index, calendar) in database.calendars.enumerated() {
-            try insert(calendar: calendar, sortOrder: index, in: db)
+        for calendar in database.calendars {
+            try insert(calendar: calendar, in: db)
         }
 
         for event in database.events {
@@ -314,13 +324,15 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             try insert(tombstone: tombstone, in: db)
         }
 
+        try upsertSettings(database.settings, in: db)
+
         try db.execute(
             sql: "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) VALUES ('schema_version', ?, ?)",
             arguments: [String(Self.migrationIdentifiers.count), encodeInstant(Date())]
         )
     }
 
-    private func insert(calendar: BetterCalendar, sortOrder: Int, in db: Database) throws {
+    private func insert(calendar: BetterCalendar, in db: Database) throws {
         try db.execute(
             sql: """
                 INSERT INTO calendars (
@@ -341,7 +353,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 0,
                 calendar.isDefault.databaseInt,
                 nil,
-                sortOrder,
+                calendar.sortOrder,
                 encodeInstant(calendar.createdAt),
                 encodeInstant(calendar.updatedAt),
                 nil
@@ -474,12 +486,20 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
     private func insert(tombstone: DeletedEventTombstone, in db: Database) throws {
         try db.execute(
-            sql: "INSERT INTO deleted_objects (id, object_id, object_type, title, deleted_at) VALUES (?, ?, 'event', ?, ?)",
+            sql: """
+                INSERT INTO deleted_objects (
+                    id, object_id, object_type, title, deleted_at,
+                    event_snapshot_json, deletion_synced_at
+                )
+                VALUES (?, ?, 'event', ?, ?, ?, ?)
+                """,
             arguments: [
                 tombstone.id.uuidString,
                 tombstone.eventID.uuidString,
                 tombstone.title,
-                encodeInstant(tombstone.deletedAt)
+                encodeInstant(tombstone.deletedAt),
+                tombstone.eventSnapshotJSON,
+                tombstone.deletionSyncedAt.map(encodeInstant)
             ]
         )
     }
@@ -494,6 +514,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 colorName: CalendarColorName(hexValue: row["color_hex"]) ?? .betterBlue,
                 isVisible: row.boolValue("is_visible"),
                 isDefault: row.boolValue("is_default"),
+                sortOrder: row["sort_order"],
                 createdAt: decodeInstant(row["created_at"]) ?? .now,
                 updatedAt: decodeInstant(row["updated_at"]) ?? .now
             )
@@ -655,8 +676,127 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 id: id,
                 eventID: eventID,
                 title: row["title"] ?? "Deleted Event",
-                deletedAt: decodeInstant(row["deleted_at"]) ?? .now
+                deletedAt: decodeInstant(row["deleted_at"]) ?? .now,
+                eventSnapshotJSON: row["event_snapshot_json"],
+                deletionSyncedAt: decodeInstant(row["deletion_synced_at"])
             )
+        }
+    }
+
+    /// One `application_settings` row per key (BC-SET-001, spec 1.20). Optional `AppSettings`
+    /// fields simply have no row when unset; `upsertSettings` deletes the row for a key that
+    /// becomes unset rather than ever issuing a blanket `DELETE`, so it never clobbers a
+    /// forward-compatible key this schema doesn't yet model.
+    private enum SettingsKey: String, CaseIterable {
+        case defaultEventDurationMinutes = "default_event_duration_minutes"
+        case defaultReminderOffset = "default_reminder_offset"
+        case firstWeekday = "first_weekday"
+        case showWeekends = "show_weekends"
+        case timeFormat = "time_format"
+        case defaultCalendarView = "default_calendar_view"
+        case allDayReminderHour = "all_day_reminder_hour"
+        case snapIntervalMinutes = "snap_interval_minutes"
+        case appearance = "appearance"
+        case reduceCalendarAnimation = "reduce_calendar_animation"
+        case hasCompletedOnboarding = "has_completed_onboarding"
+        case lastSelectedTab = "last_selected_tab"
+        case lastSelectedDate = "last_selected_date"
+        case secondaryTimeZoneIdentifier = "secondary_time_zone_identifier"
+    }
+
+    private func fetchSettings(in db: Database) throws -> AppSettings {
+        let rows = try Row.fetchAll(db, sql: "SELECT key, value FROM application_settings")
+        var values: [String: String] = [:]
+        for row in rows {
+            values[row["key"]] = row["value"]
+        }
+
+        var settings = AppSettings.defaultSettings
+
+        if let raw = values[SettingsKey.defaultEventDurationMinutes.rawValue], let minutes = Int(raw) {
+            settings.defaultEventDurationMinutes = minutes
+        }
+        if let raw = values[SettingsKey.defaultReminderOffset.rawValue], let seconds = Int(raw) {
+            settings.defaultReminderOffset = ReminderOffset(relativeOffsetSeconds: seconds)
+        }
+        if let raw = values[SettingsKey.firstWeekday.rawValue], let rawValue = Int(raw) {
+            settings.firstWeekday = Weekday(rawValue: rawValue)
+        }
+        if let raw = values[SettingsKey.showWeekends.rawValue] {
+            settings.showWeekends = raw == "1"
+        }
+        if let raw = values[SettingsKey.timeFormat.rawValue], let value = TimeFormatPreference(rawValue: raw) {
+            settings.timeFormat = value
+        }
+        if let raw = values[SettingsKey.defaultCalendarView.rawValue], let value = CalendarViewMode(rawValue: raw) {
+            settings.defaultCalendarView = value
+        }
+        if let raw = values[SettingsKey.allDayReminderHour.rawValue], let hour = Int(raw) {
+            settings.allDayReminderHour = hour
+        }
+        if let raw = values[SettingsKey.snapIntervalMinutes.rawValue], let minutes = Int(raw) {
+            settings.snapIntervalMinutes = minutes
+        }
+        if let raw = values[SettingsKey.appearance.rawValue], let value = AppearancePreference(rawValue: raw) {
+            settings.appearance = value
+        }
+        if let raw = values[SettingsKey.reduceCalendarAnimation.rawValue] {
+            settings.reduceCalendarAnimation = raw == "1"
+        }
+        if let raw = values[SettingsKey.hasCompletedOnboarding.rawValue] {
+            settings.hasCompletedOnboarding = raw == "1"
+        }
+        if let raw = values[SettingsKey.lastSelectedTab.rawValue], let value = BetterCalendarTab(rawValue: raw) {
+            settings.lastSelectedTab = value
+        }
+        if let raw = values[SettingsKey.lastSelectedDate.rawValue] {
+            settings.lastSelectedDate = decodeInstant(raw)
+        }
+        settings.secondaryTimeZoneIdentifier = values[SettingsKey.secondaryTimeZoneIdentifier.rawValue]
+
+        return settings
+    }
+
+    private func upsertSettings(_ settings: AppSettings, in db: Database) throws {
+        var values: [SettingsKey: String] = [
+            .defaultEventDurationMinutes: String(settings.defaultEventDurationMinutes),
+            .showWeekends: settings.showWeekends.databaseInt.description,
+            .timeFormat: settings.timeFormat.rawValue,
+            .defaultCalendarView: settings.defaultCalendarView.rawValue,
+            .allDayReminderHour: String(settings.allDayReminderHour),
+            .snapIntervalMinutes: String(settings.snapIntervalMinutes),
+            .appearance: settings.appearance.rawValue,
+            .reduceCalendarAnimation: settings.reduceCalendarAnimation.databaseInt.description,
+            .hasCompletedOnboarding: settings.hasCompletedOnboarding.databaseInt.description
+        ]
+
+        if let offsetSeconds = settings.defaultReminderOffset?.relativeOffsetSeconds {
+            values[.defaultReminderOffset] = String(offsetSeconds)
+        }
+        if let firstWeekday = settings.firstWeekday {
+            values[.firstWeekday] = String(firstWeekday.rawValue)
+        }
+        if let lastSelectedTab = settings.lastSelectedTab {
+            values[.lastSelectedTab] = lastSelectedTab.rawValue
+        }
+        if let lastSelectedDate = settings.lastSelectedDate {
+            values[.lastSelectedDate] = encodeInstant(lastSelectedDate)
+        }
+        if let secondaryTimeZoneIdentifier = settings.secondaryTimeZoneIdentifier {
+            values[.secondaryTimeZoneIdentifier] = secondaryTimeZoneIdentifier
+        }
+
+        let now = encodeInstant(Date())
+        for (key, value) in values {
+            try db.execute(
+                sql: "INSERT OR REPLACE INTO application_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                arguments: [key.rawValue, value, now]
+            )
+        }
+
+        let presentKeys = Set(values.keys)
+        for key in SettingsKey.allCases where !presentKeys.contains(key) {
+            try db.execute(sql: "DELETE FROM application_settings WHERE key = ?", arguments: [key.rawValue])
         }
     }
 

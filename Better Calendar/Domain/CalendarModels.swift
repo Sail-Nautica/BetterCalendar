@@ -1,21 +1,50 @@
 import Foundation
 
-struct LocalCalendarDatabase: Codable, Equatable {
+struct LocalCalendarDatabase: Equatable {
     var schemaVersion: Int
     var calendars: [BetterCalendar]
     var events: [CalendarEvent]
     var pendingMutations: [PendingMutation]
     var deletedEventTombstones: [DeletedEventTombstone]
+    var settings: AppSettings = .defaultSettings
 
     static let currentSchemaVersion = 1
 }
 
-struct BetterCalendar: Identifiable, Codable, Hashable {
+extension LocalCalendarDatabase: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, calendars, events, pendingMutations, deletedEventTombstones, settings
+    }
+
+    /// Decodes tolerantly so databases written before `settings` existed still load.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        calendars = try container.decode([BetterCalendar].self, forKey: .calendars)
+        events = try container.decode([CalendarEvent].self, forKey: .events)
+        pendingMutations = try container.decode([PendingMutation].self, forKey: .pendingMutations)
+        deletedEventTombstones = try container.decode([DeletedEventTombstone].self, forKey: .deletedEventTombstones)
+        settings = try container.decodeIfPresent(AppSettings.self, forKey: .settings) ?? .defaultSettings
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(calendars, forKey: .calendars)
+        try container.encode(events, forKey: .events)
+        try container.encode(pendingMutations, forKey: .pendingMutations)
+        try container.encode(deletedEventTombstones, forKey: .deletedEventTombstones)
+        try container.encode(settings, forKey: .settings)
+    }
+}
+
+struct BetterCalendar: Identifiable, Hashable {
     var id: UUID
     var name: String
     var colorName: CalendarColorName
     var isVisible: Bool
     var isDefault: Bool
+    var sortOrder: Int
     var createdAt: Date
     var updatedAt: Date
 
@@ -26,10 +55,134 @@ struct BetterCalendar: Identifiable, Codable, Hashable {
             colorName: .betterBlue,
             isVisible: true,
             isDefault: true,
+            sortOrder: 0,
             createdAt: now,
             updatedAt: now
         )
     }
+}
+
+extension BetterCalendar: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case id, name, colorName, isVisible, isDefault, sortOrder, createdAt, updatedAt
+    }
+
+    /// Decodes tolerantly so calendars written before `sortOrder` existed still load,
+    /// defaulting to 0 (matches the previous array-index-derived ordering).
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        colorName = try container.decode(CalendarColorName.self, forKey: .colorName)
+        isVisible = try container.decode(Bool.self, forKey: .isVisible)
+        isDefault = try container.decode(Bool.self, forKey: .isDefault)
+        sortOrder = try container.decodeIfPresent(Int.self, forKey: .sortOrder) ?? 0
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(colorName, forKey: .colorName)
+        try container.encode(isVisible, forKey: .isVisible)
+        try container.encode(isDefault, forKey: .isDefault)
+        try container.encode(sortOrder, forKey: .sortOrder)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
+    }
+}
+
+enum BetterCalendarTab: String, Hashable, Codable {
+    case calendar
+    case agenda
+    case search
+}
+
+enum CalendarViewMode: String, CaseIterable, Identifiable, Codable {
+    case day
+    case week
+    case month
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .day: "Day"
+        case .week: "Week"
+        case .month: "Month"
+        }
+    }
+}
+
+enum TimeFormatPreference: String, CaseIterable, Identifiable, Codable {
+    case system
+    case twelveHour
+    case twentyFourHour
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .system: "System"
+        case .twelveHour: "12-Hour"
+        case .twentyFourHour: "24-Hour"
+        }
+    }
+}
+
+enum AppearancePreference: String, CaseIterable, Identifiable, Codable {
+    case system
+    case light
+    case dark
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .system: "System"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+}
+
+/// Spec 1.20 calendar settings, plus the last-view-state fields spec 1.2 requires survive
+/// relaunch (BC-VIEW-010) and the onboarding flag spec 1.1 requires (BC-ONB-001). Persisted as
+/// individual `application_settings` rows, one key per field — see `SQLiteCalendarRepository`.
+struct AppSettings: Codable, Equatable {
+    var defaultEventDurationMinutes: Int
+    var defaultReminderOffset: ReminderOffset?
+    var firstWeekday: Weekday?
+    var showWeekends: Bool
+    var timeFormat: TimeFormatPreference
+    var defaultCalendarView: CalendarViewMode
+    var allDayReminderHour: Int
+    var snapIntervalMinutes: Int
+    var appearance: AppearancePreference
+    var reduceCalendarAnimation: Bool
+    var hasCompletedOnboarding: Bool
+    var lastSelectedTab: BetterCalendarTab?
+    var lastSelectedDate: Date?
+    var secondaryTimeZoneIdentifier: String?
+
+    static let defaultSettings = AppSettings(
+        defaultEventDurationMinutes: 60,
+        defaultReminderOffset: nil,
+        firstWeekday: nil,
+        showWeekends: true,
+        timeFormat: .system,
+        defaultCalendarView: .day,
+        allDayReminderHour: 9,
+        snapIntervalMinutes: 15,
+        appearance: .system,
+        reduceCalendarAnimation: false,
+        hasCompletedOnboarding: false,
+        lastSelectedTab: nil,
+        lastSelectedDate: nil,
+        secondaryTimeZoneIdentifier: nil
+    )
 }
 
 enum CalendarColorName: String, CaseIterable, Identifiable, Codable {
@@ -200,6 +353,26 @@ extension CalendarEvent {
             createdAt: createdAt,
             updatedAt: updatedAt
         )
+    }
+}
+
+extension CalendarEvent {
+    /// Serializes the full event to JSON for durable tombstone storage (spec 0.12): a deleted
+    /// event must survive a force-quit before Undo is tapped, not live only in an in-memory
+    /// `UndoAction` closure.
+    func encodedSnapshotJSON() -> String? {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(self) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    init?(snapshotJSON: String) {
+        guard let data = snapshotJSON.data(using: .utf8) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let decoded = try? decoder.decode(CalendarEvent.self, from: data) else { return nil }
+        self = decoded
     }
 }
 
@@ -391,6 +564,10 @@ struct DeletedEventTombstone: Identifiable, Codable, Hashable {
     var eventID: UUID
     var title: String
     var deletedAt: Date
+    /// Full JSON snapshot of the deleted event, enough to reconstruct it (spec 0.12). Optional
+    /// so tombstones written before this field existed still decode.
+    var eventSnapshotJSON: String?
+    var deletionSyncedAt: Date?
 }
 
 struct EventDraft: Equatable {
@@ -422,8 +599,12 @@ struct EventDraft: Equatable {
         recurrence = event.recurrence ?? .never
     }
 
-    init(calendarID: UUID, startDate: Date = .now, duration: TimeInterval = 60 * 60) {
-        let roundedStart = Calendar.current.nextDate(after: startDate, matching: DateComponents(minute: 0), matchingPolicy: .nextTime) ?? startDate
+    /// - Parameter roundingMinutes: rounds `startDate` up to the next boundary of this many
+    ///   minutes. Spec 1.4 calls for "the next sensible time boundary, such as the next
+    ///   30-minute mark" — the default matches that; callers with a configured snap interval
+    ///   (BC-SET-001) should pass `store.settings.snapIntervalMinutes` instead.
+    init(calendarID: UUID, startDate: Date = .now, duration: TimeInterval = 60 * 60, roundingMinutes: Int = 30) {
+        let roundedStart = Self.roundedUp(startDate, toNearestMinutes: roundingMinutes)
         id = nil
         self.calendarID = calendarID
         title = ""
@@ -436,6 +617,16 @@ struct EventDraft: Equatable {
         notes = ""
         reminderOffsets = []
         recurrence = .never
+    }
+
+    private static func roundedUp(_ date: Date, toNearestMinutes minutes: Int, calendar: Calendar = .current) -> Date {
+        guard minutes > 0 else { return date }
+
+        let referenceDate = calendar.startOfDay(for: date)
+        let intervalSeconds = TimeInterval(minutes * 60)
+        let secondsSinceReference = date.timeIntervalSince(referenceDate)
+        let roundedSeconds = (secondsSinceReference / intervalSeconds).rounded(.up) * intervalSeconds
+        return referenceDate.addingTimeInterval(roundedSeconds)
     }
 
     var validationError: String? {

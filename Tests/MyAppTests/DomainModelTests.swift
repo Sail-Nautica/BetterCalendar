@@ -16,12 +16,24 @@ final class DomainModelTests: XCTestCase {
         XCTAssertNil(draft.validationError)
     }
 
-    func testEventDraftRoundsInitialStartToNextHour() {
+    // BC-SET-001: spec 1.4 calls for "the next sensible time boundary, such as the next
+    // 30-minute mark" for quick-create's default start time, not the next hour.
+    func testEventDraftRoundsInitialStartToNextThirtyMinuteMark() {
         let originalStart = TestData.date("2026-09-02T14:15:00Z")
         let draft = EventDraft(calendarID: TestData.calendarID, startDate: originalStart)
 
         XCTAssertGreaterThan(draft.startDate, originalStart)
-        XCTAssertEqual(Calendar.current.component(.minute, from: draft.startDate), 0)
+        let minute = Calendar.current.component(.minute, from: draft.startDate)
+        XCTAssertTrue(minute == 0 || minute == 30, "Quick-create should round up to the next 30-minute mark.")
+    }
+
+    // BC-SET-001
+    func testEventDraftRoundingMinutesParameterHonoursConfiguredSnapInterval() {
+        let originalStart = TestData.date("2026-09-02T14:05:00Z")
+        let draft = EventDraft(calendarID: TestData.calendarID, startDate: originalStart, roundingMinutes: 15)
+
+        let minute = Calendar.current.component(.minute, from: draft.startDate)
+        XCTAssertEqual(minute % 15, 0)
     }
 
     // BC-NOT-001
@@ -166,6 +178,55 @@ final class DomainModelTests: XCTestCase {
         var draft = EventDraft(calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T14:15:00Z"))
         draft.title = "Office Hours"
         return draft
+    }
+
+    // BC-CAL-001
+    func testLegacyCalendarJSONWithoutSortOrderDecodesDefaultingToZero() throws {
+        let calendar = TestData.calendar(sortOrder: 3)
+        let encoded = try JSONEncoder().encode(calendar)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+
+        object.removeValue(forKey: "sortOrder")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(BetterCalendar.self, from: legacyData)
+
+        XCTAssertEqual(decoded.sortOrder, 0, "A calendar written before sortOrder existed must default to 0, not fail to decode.")
+        XCTAssertEqual(decoded.id, calendar.id)
+    }
+
+    // BC-SET-001
+    func testAppSettingsDefaultsMatchSpecifiedFallbackValues() {
+        let settings = AppSettings.defaultSettings
+
+        XCTAssertEqual(settings.defaultEventDurationMinutes, 60)
+        XCTAssertNil(settings.defaultReminderOffset)
+        XCTAssertNil(settings.firstWeekday)
+        XCTAssertTrue(settings.showWeekends)
+        XCTAssertEqual(settings.timeFormat, .system)
+        XCTAssertEqual(settings.defaultCalendarView, .day)
+        XCTAssertEqual(settings.allDayReminderHour, 9)
+        XCTAssertEqual(settings.snapIntervalMinutes, 15)
+        XCTAssertEqual(settings.appearance, .system)
+        XCTAssertFalse(settings.reduceCalendarAnimation)
+        XCTAssertFalse(settings.hasCompletedOnboarding)
+        XCTAssertNil(settings.lastSelectedTab)
+        XCTAssertNil(settings.lastSelectedDate)
+        XCTAssertNil(settings.secondaryTimeZoneIdentifier)
+    }
+
+    // BC-SET-001
+    func testLegacyDatabaseJSONWithoutSettingsDecodesDefaultingToDefaultSettings() throws {
+        let database = TestData.database()
+        let encoded = try JSONEncoder().encode(database)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+
+        object.removeValue(forKey: "settings")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(LocalCalendarDatabase.self, from: legacyData)
+
+        XCTAssertEqual(decoded.settings, .defaultSettings)
     }
 
     func testCalendarDatabaseCodableRoundTrips() throws {

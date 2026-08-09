@@ -14,6 +14,9 @@ struct CalendarManagerView: View {
                     ForEach(store.calendars) { calendar in
                         CalendarManagerRow(calendar: calendar, store: store)
                     }
+                    .onMove { source, destination in
+                        store.reorderCalendars(fromOffsets: source, toOffset: destination)
+                    }
                 }
 
                 Section("Add Calendar") {
@@ -31,6 +34,33 @@ struct CalendarManagerView: View {
                     .disabled(newCalendarName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
 
+                Section("Recently Deleted") {
+                    if store.deletedEventTombstones.isEmpty {
+                        Text("No recently deleted events.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(store.deletedEventTombstones.sorted { $0.deletedAt > $1.deletedAt }) { tombstone in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(tombstone.title)
+                                    Text("Deleted \(tombstone.deletedAt.formatted(date: .abbreviated, time: .shortened))")
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                Spacer()
+
+                                Button("Restore") {
+                                    store.restoreDeletedEvent(tombstone)
+                                }
+                                .font(.footnote)
+                                .disabled(tombstone.eventSnapshotJSON == nil)
+                            }
+                        }
+                    }
+                }
+
                 Section("Data") {
                     NavigationLink("Import / Export") {
                         ImportExportView(store: store)
@@ -43,8 +73,13 @@ struct CalendarManagerView: View {
             }
             .navigationTitle("Calendars")
             .toolbar {
-                Button("Done") {
-                    dismiss()
+                ToolbarItem(placement: .cancellationAction) {
+                    EditButton()
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
                 }
             }
         }
@@ -83,6 +118,10 @@ private struct CalendarManagerRow: View {
                 .labelStyle(.iconOnly)
                 .accessibilityLabel(calendar.isVisible ? "Hide \(calendar.name)" : "Show \(calendar.name)")
             }
+
+            Text(futureEventCountLabel)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
 
             HStack {
                 Picker("Color", selection: $editedColor) {
@@ -126,6 +165,11 @@ private struct CalendarManagerRow: View {
         } message: {
             Text("Calendar deletion never silently deletes events. Choose whether to move or delete contained events.")
         }
+    }
+
+    private var futureEventCountLabel: String {
+        let count = store.futureEventCount(for: calendar)
+        return count == 1 ? "1 upcoming event" : "\(count) upcoming events"
     }
 
     private func saveEdits() {

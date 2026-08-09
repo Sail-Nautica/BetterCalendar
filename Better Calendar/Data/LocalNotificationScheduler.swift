@@ -2,13 +2,18 @@ import Foundation
 import UserNotifications
 
 protocol LocalNotificationScheduling {
-    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy)
+    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy, allDayAlertHour: Int)
     func cancelNotifications(for eventIDs: Set<UUID>)
+    func pendingRequestCount() async -> Int
 }
 
 extension LocalNotificationScheduling {
     func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date) {
-        reconcile(events: events, calendars: calendars, now: now, authorizationRequestPolicy: .never)
+        reconcile(events: events, calendars: calendars, now: now, authorizationRequestPolicy: .never, allDayAlertHour: 9)
+    }
+
+    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy) {
+        reconcile(events: events, calendars: calendars, now: now, authorizationRequestPolicy: authorizationRequestPolicy, allDayAlertHour: 9)
     }
 }
 
@@ -112,7 +117,7 @@ struct LocalNotificationPlanner {
 }
 
 struct UserNotificationScheduler: LocalNotificationScheduling {
-    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date = .now, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy = .never) {
+    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date = .now, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy = .never, allDayAlertHour: Int = 9) {
         Task {
             let center = UNUserNotificationCenter.current()
             let settings = await center.notificationSettings()
@@ -136,7 +141,9 @@ struct UserNotificationScheduler: LocalNotificationScheduling {
 
             let pendingRequests = await center.pendingNotificationRequests()
             let pendingIdentifiers = Set(pendingRequests.map(\.identifier))
-            let plan = LocalNotificationPlanner().plan(
+            var planner = LocalNotificationPlanner()
+            planner.allDayAlertHour = allDayAlertHour
+            let plan = planner.plan(
                 events: events,
                 calendars: calendars,
                 pendingIdentifiers: pendingIdentifiers,
@@ -182,9 +189,14 @@ struct UserNotificationScheduler: LocalNotificationScheduling {
             }
         }
     }
+
+    func pendingRequestCount() async -> Int {
+        await UNUserNotificationCenter.current().pendingNotificationRequests().count
+    }
 }
 
 struct NoopNotificationScheduler: LocalNotificationScheduling {
-    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy) { }
+    func reconcile(events: [CalendarEvent], calendars: [BetterCalendar], now: Date, authorizationRequestPolicy: NotificationAuthorizationRequestPolicy, allDayAlertHour: Int) { }
     func cancelNotifications(for eventIDs: Set<UUID>) { }
+    func pendingRequestCount() async -> Int { 0 }
 }
