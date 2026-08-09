@@ -11,7 +11,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v005_create_search_index",
         "v006_create_event_extensions",
         "v007_create_sync_and_settings",
-        "v008_add_deletion_snapshot"
+        "v008_add_deletion_snapshot",
+        "v009_extend_search_index"
     ]
 
     private let fileURLOverride: URL?
@@ -47,6 +48,37 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         try databaseQueue.write { db in
             try replaceDatabase(database, in: db)
         }
+    }
+
+    /// BC-SRCH-001: an indexed FTS5 prefix-per-word query across title/notes/location/calendar
+    /// name/URL host — the recall step. Exact ranking is intentionally left to the caller,
+    /// which already holds full event data in memory and can apply spec 1.13's precise
+    /// tie-breaking rules more directly than translating them into SQL.
+    func searchEventIDs(matching query: String) throws -> [UUID] {
+        let ftsQuery = Self.sanitizedFTSQuery(query)
+        guard !ftsQuery.isEmpty else { return [] }
+
+        let databaseQueue = try openDatabase()
+        return try databaseQueue.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT event_id FROM event_search WHERE event_search MATCH ?",
+                arguments: [ftsQuery]
+            )
+            return rows.compactMap { UUID(uuidString: $0["event_id"]) }
+        }
+    }
+
+    /// Turns free-text user input into an FTS5 query: each whitespace-separated token becomes
+    /// a quoted prefix match, ANDed together by FTS5's default query syntax. Quoting each token
+    /// as a phrase (`"token"*`) sidesteps FTS5's special-character query syntax (`-`, `:`, `(`,
+    /// unbalanced `"`, etc.) — none of it is meant to be available to a calendar search box.
+    static func sanitizedFTSQuery(_ query: String) -> String {
+        query
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .map { "\"\($0.replacingOccurrences(of: "\"", with: "\"\""))\"*" }
+            .joined(separator: " ")
     }
 
     private func openDatabase() throws -> DatabaseQueue {
@@ -284,6 +316,24 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             try db.execute(sql: "ALTER TABLE deleted_objects ADD COLUMN deletion_synced_at TEXT")
         }
 
+        // BC-SRCH-001, spec 1.13: index calendar name and URL host too, in addition to the
+        // original title/notes/location columns. FTS5 virtual tables can't have columns added
+        // in place, so this drops and recreates the (previously unqueried, so no data to lose)
+        // table under the same name.
+        migrator.registerMigration("v009_extend_search_index") { db in
+            try db.execute(sql: "DROP TABLE event_search")
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE event_search USING fts5(
+                    event_id UNINDEXED,
+                    title,
+                    notes,
+                    location_name,
+                    calendar_name,
+                    url_host
+                )
+                """)
+        }
+
         return migrator
     }
 
@@ -304,9 +354,11 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             try insert(calendar: calendar, in: db)
         }
 
+        let calendarNamesByID = Dictionary(uniqueKeysWithValues: database.calendars.map { ($0.id, $0.name) })
+
         for event in database.events {
             try insert(event: event, in: db)
-            try insertSearchRow(for: event, in: db)
+            try insertSearchRow(for: event, calendarName: calendarNamesByID[event.calendarID], in: db)
 
             for reminder in event.reminders {
                 try insert(reminder: reminder, eventID: event.id, in: db)
@@ -469,10 +521,20 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         )
     }
 
-    private func insertSearchRow(for event: CalendarEvent, in db: Database) throws {
+    private func insertSearchRow(for event: CalendarEvent, calendarName: String?, in db: Database) throws {
         try db.execute(
-            sql: "INSERT INTO event_search (event_id, title, notes, location_name) VALUES (?, ?, ?, ?)",
-            arguments: [event.id.uuidString, event.title, event.notes, event.location]
+            sql: """
+                INSERT INTO event_search (event_id, title, notes, location_name, calendar_name, url_host)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+            arguments: [
+                event.id.uuidString,
+                event.title,
+                event.notes,
+                event.location,
+                calendarName,
+                event.urlString.flatMap { URL(string: $0)?.host }
+            ]
         )
     }
 

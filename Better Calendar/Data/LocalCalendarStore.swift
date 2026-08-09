@@ -568,6 +568,52 @@ final class BetterCalendarStore {
             }
     }
 
+    /// BC-SRCH-001/002 (spec 1.13): full-text search via the FTS5 index (recall) plus
+    /// `SearchFilters` (date range/calendar/timeframe/all-day/recurring), ranked exact title
+    /// match → title prefix → title contains → location → notes → calendar name, with future
+    /// events sorted before past ones on ties. Falls back to an empty result (rather than a
+    /// full in-memory scan) if the index query itself fails — that would mean a corrupt
+    /// database, at which point `lastError` from the surrounding load/save path is the more
+    /// useful signal.
+    func searchEvents(matching query: String, filters: SearchFilters = SearchFilters(), now: Date = .now) -> [CalendarEvent] {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else { return [] }
+
+        let candidateIDs = (try? repository.searchEventIDs(matching: trimmedQuery)).map(Set.init) ?? []
+        guard !candidateIDs.isEmpty else { return [] }
+
+        // An explicit calendar filter searches that calendar regardless of its visibility
+        // toggle (the user asked for it by name); with no calendar filter, search only the
+        // calendars currently shown, matching what every other view already displays.
+        let scopedEvents = filters.calendarID == nil ? visibleEvents : events
+        let lowercasedQuery = trimmedQuery.lowercased()
+        return scopedEvents
+            .filter { candidateIDs.contains($0.id) && filters.matches($0, now: now) }
+            .sorted { lhs, rhs in
+                let lhsRank = searchRank(for: lhs, query: lowercasedQuery)
+                let rhsRank = searchRank(for: rhs, query: lowercasedQuery)
+                if lhsRank != rhsRank { return lhsRank < rhsRank }
+
+                let lhsFuture = lhs.startDate >= now
+                let rhsFuture = rhs.startDate >= now
+                if lhsFuture != rhsFuture { return lhsFuture }
+                return lhs.startDate < rhs.startDate
+            }
+    }
+
+    /// Lower is more relevant. Mirrors spec 1.13's ranking order exactly: exact title match,
+    /// title prefix, title contains, location match, notes match, calendar-name match.
+    private func searchRank(for event: CalendarEvent, query: String) -> Int {
+        let title = event.title.lowercased()
+        if title == query { return 0 }
+        if title.hasPrefix(query) { return 1 }
+        if title.contains(query) { return 2 }
+        if let location = event.location?.lowercased(), location.contains(query) { return 3 }
+        if let notes = event.notes?.lowercased(), notes.contains(query) { return 4 }
+        if let calendarName = calendars.first(where: { $0.id == event.calendarID })?.name.lowercased(), calendarName.contains(query) { return 5 }
+        return 6
+    }
+
     func exportICS() -> String {
         ICSCalendarCodec.export(events: events, calendars: calendars)
     }
@@ -738,6 +784,11 @@ struct UndoAction {
 protocol LocalCalendarRepository {
     func load() throws -> LocalCalendarDatabase
     func save(_ database: LocalCalendarDatabase) throws
+    /// BC-SRCH-001 (spec 1.13): candidate event IDs matching `query`, found via an indexed
+    /// query rather than loading every event into memory to substring-scan it. No ranking
+    /// guarantee beyond "these matched" — the caller (the store, which already holds every
+    /// event's full data in memory) applies the exact tie-breaking rules spec 1.13 lists.
+    func searchEventIDs(matching query: String) throws -> [UUID]
 }
 
 struct JSONCalendarRepository: LocalCalendarRepository {
@@ -765,6 +816,26 @@ struct JSONCalendarRepository: LocalCalendarRepository {
             try preserveUnreadableFile(at: fileURL)
             throw error
         }
+    }
+
+    /// No FTS index in the flat-file repository — falls back to a plain substring scan over
+    /// the (already fully in-memory, by this repository's own design) loaded database. Covers
+    /// the same fields as the SQLite FTS5 index (title/notes/location/calendar name/URL host)
+    /// so ranking behaves identically regardless of which repository is behind the store.
+    func searchEventIDs(matching query: String) throws -> [UUID] {
+        let database = try load()
+        let lowercasedQuery = query.lowercased()
+        let calendarNamesByID = Dictionary(uniqueKeysWithValues: database.calendars.map { ($0.id, $0.name) })
+
+        return database.events
+            .filter { event in
+                event.title.lowercased().contains(lowercasedQuery)
+                    || (event.notes?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (event.location?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (calendarNamesByID[event.calendarID]?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (event.urlString.flatMap { URL(string: $0)?.host }?.lowercased().contains(lowercasedQuery) ?? false)
+            }
+            .map(\.id)
     }
 
     func save(_ database: LocalCalendarDatabase) throws {

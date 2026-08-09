@@ -235,6 +235,57 @@ final class SQLiteCalendarRepositoryTests: XCTestCase {
         XCTAssertNil(loaded.settings.lastSelectedDate)
     }
 
+    // BC-SRCH-001
+    func testSearchEventIDsFindsMatchesAcrossTitleNotesLocationCalendarNameAndURLHost() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let calendar = TestData.calendar(name: "Coursework")
+        let titleMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Calculus Review")
+        let notesMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Study Session", notes: "Bring calculus notes")
+        let locationMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Meeting", location: "Calculus Building")
+        let urlMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Webinar", urlString: "https://calculus.example.com/join")
+        let noMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Unrelated")
+
+        try repository.save(TestData.database(calendars: [calendar], events: [titleMatch, notesMatch, locationMatch, urlMatch, noMatch]))
+
+        let matches = Set(try repository.searchEventIDs(matching: "calculus"))
+
+        XCTAssertTrue(matches.contains(titleMatch.id))
+        XCTAssertTrue(matches.contains(notesMatch.id))
+        XCTAssertTrue(matches.contains(locationMatch.id))
+        XCTAssertTrue(matches.contains(urlMatch.id))
+        XCTAssertFalse(matches.contains(noMatch.id))
+    }
+
+    // BC-SRCH-001
+    func testSearchEventIDsMatchesByCalendarName() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let calendar = TestData.calendar(name: "Astronomy")
+        let event = TestData.event(calendarID: calendar.id, title: "Weekly Lecture")
+
+        try repository.save(TestData.database(calendars: [calendar], events: [event]))
+
+        let matches = try repository.searchEventIDs(matching: "astronomy")
+
+        XCTAssertEqual(matches, [event.id])
+    }
+
+    // BC-SRCH-001
+    func testSearchEventIDsReturnsEmptyForBlankQuery() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        try repository.save(TestData.database())
+
+        XCTAssertTrue(try repository.searchEventIDs(matching: "   ").isEmpty)
+    }
+
     // BC-REC-011
     func testDaysOfMonthAndSetPositionsRoundTripThroughSQLite() throws {
         let databaseURL = try makeTemporaryDatabaseURL()

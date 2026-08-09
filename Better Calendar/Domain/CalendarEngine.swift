@@ -343,6 +343,47 @@ struct RecurrenceExpander {
     }
 }
 
+/// Spec 1.13 search filters (BC-SRCH-002): date range, calendar, past/future, all-day, and
+/// recurring. Every field is independently optional/off by default, so an unfiltered search
+/// (the common case) needs no special-casing at the call site.
+struct SearchFilters: Equatable {
+    enum Timeframe: Equatable {
+        case all
+        case futureOnly
+        case pastOnly
+    }
+
+    var calendarID: UUID?
+    var dateRange: DateInterval?
+    var timeframe: Timeframe = .all
+    var allDayOnly = false
+    var recurringOnly = false
+
+    func matches(_ event: CalendarEvent, now: Date) -> Bool {
+        if let calendarID, event.calendarID != calendarID {
+            return false
+        }
+        if let dateRange, !event.intersects(dateRange) {
+            return false
+        }
+        switch timeframe {
+        case .all:
+            break
+        case .futureOnly:
+            if event.endDate < now { return false }
+        case .pastOnly:
+            if event.endDate >= now { return false }
+        }
+        if allDayOnly, !event.isAllDay {
+            return false
+        }
+        if recurringOnly, event.recurrence == nil {
+            return false
+        }
+        return true
+    }
+}
+
 struct LocalCalendarDate: Comparable, Hashable {
     var year: Int
     var month: Int
