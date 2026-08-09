@@ -48,7 +48,9 @@ green; an item is only `Done` once the full suite passes and it has its own comm
 | BC-VIEW-010 | Persist view state | Done — 66 tests green | `c910492` |
 | BC-ONB-001 | First-launch onboarding | Done — 66 tests green | `c910492` |
 | BC-TZ-001 | Time-zone settings (secondary zone, search, lock) | Not started | — |
-| Milestone B–D | Recurrence, search, interchange | Not started | — |
+| BC-REC-010 | Recurrence exceptions + edit/delete scope | Done — 81 tests green | `bc389ff` |
+| BC-REC-011 | Full recurrence editor | Done — 81 tests green | `bc389ff` |
+| Milestone C–D | Search, interchange | Not started | — |
 
 Milestone A landed as one combined commit rather than six — the items share
 the `AppSettings` type, the `LocalCalendarDatabase` schema, and the store's
@@ -137,25 +139,45 @@ table only tracks status.
 
 ---
 
-## Milestone B — Recurrence correctness
+## Milestone B — Recurrence correctness ✅ Done
 
 ### BC-REC-010 — Recurrence exceptions + edit/delete scope
-- Spec 0.10, 1.11. **Highest-risk item.** `event_recurrence_exceptions` exists but is never
-  read or written; all edits currently hit the whole series.
-- Implement "This Event" vs "All Events" for both edit and delete.
-- A modified occurrence becomes an exception attached to the master; a deleted occurrence
-  becomes a cancelled exception. Expander must skip cancelled and substitute modified.
-- Schema must keep room for future "this and future" splitting.
-- Acceptance: edit one occurrence leaves siblings untouched; delete one occurrence removes
-  only it; both survive a save/load round trip.
+- Spec 0.10, 1.11. New `RecurrenceException` domain type + `CalendarEvent.recurrenceMasterID`/
+  `.recurrenceOriginalStart`, wired through the previously-unused `event_recurrence_exceptions`
+  table and the `events.recurrence_master_id`/`.recurrence_original_start` columns.
+- A modified occurrence becomes its own standalone replacement `CalendarEvent` (so the existing
+  `EventEditorView` edits it with zero new editor UI) plus a `.modified` exception; a deleted
+  occurrence becomes a `.cancelled` exception. `RecurrenceExpander.occurrences(of:in:exceptions:)`
+  skips both — modified occurrences' replacements surface "for free" via the store's existing
+  non-recurring event pass. `LocalNotificationPlanner`/`LocalNotificationScheduling.reconcile`
+  thread exceptions through too, so cancelled occurrences stop notifying.
+- `EventDetailsView` shows a "This Event"/"All Events" `confirmationDialog` for Edit and Delete
+  when the occurrence recurs; store gains `deleteOccurrence(_:)`, `eventForEditingOccurrence(_:)`,
+  `existingReplacementEvent(forOccurrenceOf:occurrenceStartDate:)`. Re-editing an already-modified
+  occurrence updates the existing replacement rather than creating a second one.
+- Move/resize on a recurring occurrence still apply to the whole series (pre-existing behavior,
+  unchanged) — per-occurrence move/resize was scoped out; only Edit/Delete needed scope per spec
+  1.11's explicit "This Event"/"All Events" dialogs.
+- Schema already has room for future "this and future" splitting (per-occurrence exception rows).
 
 ### BC-REC-011 — Full recurrence editor
-- Spec 1.11. Presets: Never, Daily, Weekly, Every 2 Weeks, Monthly, Yearly, Every Weekday, Custom.
-- Custom: frequency, interval, weekday multi-select, day-of-month, monthly positional rule
-  ("last Friday"), end Never / after N occurrences / on date.
-- Requires extending `RecurrenceRule` with `daysOfMonth` and `setPositions` (columns already
-  exist in `event_recurrence_rules`) and teaching `RecurrenceExpander` to honour them.
-- Keep the human-readable `summary` accurate for every combination.
+- Spec 1.11. `RecurrenceRule` gains `daysOfMonth`/`setPositions` (columns already existed in
+  `event_recurrence_rules`, previously always written `NULL`). `RecurrenceExpander`'s
+  `monthlyDates`/`yearlyDates` gained a shared `nthWeekdayDates` helper for positional rules
+  ("last Friday" = `setPositions: [-1], weekdays: [.friday]`) and multi-value day-of-month
+  support, with the empty-arrays case byte-identical to the old single-day behavior.
+- `EventEditorView`'s Repeat section now has all 8 presets (a view-only `RecurrencePreset` enum
+  layered over the raw rule fields — "Every 2 Weeks"/"Every Weekday" aren't real
+  `RecurrenceFrequency` cases), a Custom mode with weekday multi-select, day-of-month vs.
+  day-of-week pattern picker, and an Ends picker (Never/After/On Date) shown for any active
+  recurrence, not just Custom.
+- `summary` extended to describe positional ("on the last Fri") and explicit-day-of-month
+  ("on the 15th") rules.
+
+Landed as one commit (both items touch the same expander/schema/editor files closely enough
+that separating them would mean re-deriving the same plumbing). 81 tests green (66 baseline +
+15 new): exception round-tripping/skip-behavior, positional/multi-day recurrence expansion,
+this-event edit/delete/re-edit flows, and recurrence-rule Codable tolerance.
 
 ---
 
