@@ -11,7 +11,7 @@ The three "Done" rows below were re-verified against the actual code and tests
 PASS their acceptance criteria. The "Not started" rows were spot-checked
 against the actual implementation, not assumed — see per-item notes.
 
-- 28 tests green via:
+- 66 tests green via:
   `xcodebuild test -project "Better Calendar.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 17'`
 - Sole dependency: GRDB 6.29.3. **No new third-party dependencies** without explicit approval.
 - Test target `MyAppTests` was repaired (TEST_HOST + module name) as the first commit on this branch.
@@ -41,14 +41,20 @@ green; an item is only `Done` once the full suite passes and it has its own comm
 | BC-NOT-001 | Multiple reminders per event | Done — 38 tests green | `aa83f18` |
 | BC-EVT-010 | Field limit validation | Done — 43 tests green | `95c5f88` |
 | BC-EVT-011 | Floating event model | Done — 50 tests green | `37b29ce` |
-| BC-DEL-001 | Durable soft-delete / undo persistence | Not started | — |
-| BC-CAL-001 | Calendar list completeness (reorder, counts) | Not started | — |
-| BC-SET-001 | Settings persistence layer | Not started | — |
-| BC-SET-002 | Settings screen | Not started | — |
-| BC-VIEW-010 | Persist view state | Not started | — |
-| BC-ONB-001 | First-launch onboarding | Not started | — |
+| BC-DEL-001 | Durable soft-delete / undo persistence | Done — 66 tests green | `c910492` |
+| BC-CAL-001 | Calendar list completeness (reorder, counts) | Done — 66 tests green | `c910492` |
+| BC-SET-001 | Settings persistence layer | Done — 66 tests green | `c910492` |
+| BC-SET-002 | Settings screen | Done — 66 tests green | `c910492` |
+| BC-VIEW-010 | Persist view state | Done — 66 tests green | `c910492` |
+| BC-ONB-001 | First-launch onboarding | Done — 66 tests green | `c910492` |
 | BC-TZ-001 | Time-zone settings (secondary zone, search, lock) | Not started | — |
 | Milestone B–D | Recurrence, search, interchange | Not started | — |
+
+Milestone A landed as one combined commit rather than six — the items share
+the `AppSettings` type, the `LocalCalendarDatabase` schema, and the store's
+persist/rollback machinery closely enough that separating them would mean
+re-deriving the same plumbing repeatedly. All 66 tests (50 baseline + 16 new)
+pass with every item included.
 
 Full per-item detail for the new rows is under their milestones below; the
 table only tracks status.
@@ -58,19 +64,16 @@ table only tracks status.
 - **Custom reminder durations (spec 1.12)** — the preset list is implemented in full,
   but arbitrary user-entered durations ("Custom": minutes/hours/days/weeks) are not.
   Deferred out of BC-NOT-001; no backlog item currently owns this.
-- **Configurable all-day alert time** — hard-coded to 09:00 local in
-  `LocalNotificationPlanner.allDayAlertHour`. Becomes user-configurable in BC-SET-001.
+- ~~**Configurable all-day alert time**~~ — resolved by BC-SET-001;
+  `LocalNotificationPlanner.allDayAlertHour` is now sourced from
+  `store.settings.allDayReminderHour`, editable in the new Settings screen.
 
-### Real gap found in audit (not deliberate — see BC-DEL-001)
+### Resolved since last audit
 
-- **Force-quitting the app before Undo is tapped loses the deleted event permanently.**
-  `deleteEvent` removes the event from the in-memory array and the repository does a
-  full snapshot delete+reinsert; the only place the full event data survives is the
-  closure captured by the in-session `UndoAction`. The `deleted_objects`/tombstone
-  table only retains `id`/`title`/`deletedAt` — not enough to restore the event. This
-  directly contradicts the spec 0.3 success criterion "No valid local event should
-  disappear after force-closing the application," so it is tracked as BC-DEL-001
-  rather than filed here as accepted.
+- ~~**Force-quitting the app before Undo is tapped loses the deleted event permanently.**~~
+  Resolved by BC-DEL-001: tombstones now carry a full JSON snapshot of the deleted event
+  (migration `v008_add_deletion_snapshot`), restorable via `store.restoreDeletedEvent(_:)`
+  and surfaced as "Recently Deleted" in the calendar manager, with a 30-day retention purge.
 
 ---
 
@@ -219,12 +222,13 @@ table only tracks status.
 - No `print`/`os_log`/`Logger` calls exist anywhere in the app target today, so there
   are no current violations to fix — this is new-build work, not cleanup.
 
-### Needs verification (not a confirmed defect)
+### Resolved during BC-SET-001
 
-- **Quick-create default start time (spec 1.4)** — spec calls for rounding to the next
-  30-minute mark; one existing test name (`testEventDraftRoundsInitialStartToNextHour`)
-  suggests the current behavior may round to the next hour instead. Worth a quick check
-  against `EventDraft` init logic before or during BC-VIEW-010.
+- ~~**Quick-create default start time (spec 1.4)**~~ — confirmed and fixed: `EventDraft.init`
+  was rounding to the next hour; it now rounds to the next 30-minute mark by default (and
+  accepts a `roundingMinutes` parameter so a configured snap interval can override it).
+  `testEventDraftRoundsInitialStartToNextHour` was replaced with
+  `testEventDraftRoundsInitialStartToNextThirtyMinuteMark`.
 
 ---
 
