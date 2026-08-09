@@ -4,13 +4,21 @@ struct CalendarScreen: View {
     let store: BetterCalendarStore
     @Binding var viewMode: CalendarViewMode
 
-    @State private var selectedDate = Date.now
+    @State private var selectedDate: Date
     @State private var selectedOccurrence: CalendarOccurrence?
     @State private var editingEvent: CalendarEvent?
     @State private var isAddingEvent = false
     @State private var newEventStartDate = Date.now
     @State private var isShowingCalendars = false
     @State private var isChoosingDate = false
+    @State private var isShowingSettings = false
+
+    init(store: BetterCalendarStore, viewMode: Binding<CalendarViewMode>) {
+        self.store = store
+        self._viewMode = viewMode
+        // BC-VIEW-010 (spec 1.2): resume on the last-selected date across relaunch.
+        self._selectedDate = State(initialValue: store.settings.lastSelectedDate ?? .now)
+    }
 
     var body: some View {
         NavigationStack {
@@ -68,6 +76,10 @@ struct CalendarScreen: View {
             .navigationTitle(viewMode.title)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
+                    Button("Settings", systemImage: "gearshape") {
+                        isShowingSettings = true
+                    }
+
                     Button("Calendars", systemImage: "calendar.badge.checkmark") {
                         isShowingCalendars = true
                     }
@@ -103,8 +115,14 @@ struct CalendarScreen: View {
             .sheet(isPresented: $isShowingCalendars) {
                 CalendarManagerView(store: store)
             }
+            .sheet(isPresented: $isShowingSettings) {
+                SettingsScreen(store: store)
+            }
             .sheet(isPresented: $isChoosingDate) {
                 DatePickerNavigationSheet(selectedDate: $selectedDate, viewMode: viewMode)
+            }
+            .onChange(of: selectedDate) { _, newDate in
+                store.updateLastViewState(date: newDate)
             }
         }
     }
@@ -211,22 +229,6 @@ struct CalendarScreen: View {
             )
         } else {
             ContentUnavailableView("No calendar", systemImage: "calendar.badge.exclamationmark", description: Text("Create a local calendar before adding events."))
-        }
-    }
-}
-
-enum CalendarViewMode: String, CaseIterable, Identifiable {
-    case day
-    case week
-    case month
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .day: "Day"
-        case .week: "Week"
-        case .month: "Month"
         }
     }
 }

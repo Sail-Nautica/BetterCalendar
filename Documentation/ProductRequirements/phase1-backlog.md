@@ -4,9 +4,14 @@ Source of truth for the Phase 1 completion effort. Derived from
 `Instructions/phase0_phase1_specification.md`. Every item has a stable requirement
 ID per spec 0.3 — use these IDs in commits, tests, and PR descriptions.
 
-## Baseline (verified 2026-08-08)
+## Baseline (verified 2026-08-08, re-audited 2026-08-08)
 
-- 28 tests green via:
+The three "Done" rows below were re-verified against the actual code and tests
+(not just re-read from this file): BC-NOT-001, BC-EVT-010, and BC-EVT-011 all
+PASS their acceptance criteria. The "Not started" rows were spot-checked
+against the actual implementation, not assumed — see per-item notes.
+
+- 66 tests green via:
   `xcodebuild test -project "Better Calendar.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 17'`
 - Sole dependency: GRDB 6.29.3. **No new third-party dependencies** without explicit approval.
 - Test target `MyAppTests` was repaired (TEST_HOST + module name) as the first commit on this branch.
@@ -36,19 +41,39 @@ green; an item is only `Done` once the full suite passes and it has its own comm
 | BC-NOT-001 | Multiple reminders per event | Done — 38 tests green | `aa83f18` |
 | BC-EVT-010 | Field limit validation | Done — 43 tests green | `95c5f88` |
 | BC-EVT-011 | Floating event model | Done — 50 tests green | `37b29ce` |
-| BC-SET-001 | Settings persistence layer | Not started | — |
-| BC-SET-002 | Settings screen | Not started | — |
-| BC-VIEW-010 | Persist view state | Not started | — |
-| BC-ONB-001 | First-launch onboarding | Not started | — |
+| BC-DEL-001 | Durable soft-delete / undo persistence | Done — 66 tests green | `c910492` |
+| BC-CAL-001 | Calendar list completeness (reorder, counts) | Done — 66 tests green | `c910492` |
+| BC-SET-001 | Settings persistence layer | Done — 66 tests green | `c910492` |
+| BC-SET-002 | Settings screen | Done — 66 tests green | `c910492` |
+| BC-VIEW-010 | Persist view state | Done — 66 tests green | `c910492` |
+| BC-ONB-001 | First-launch onboarding | Done — 66 tests green | `c910492` |
+| BC-TZ-001 | Time-zone settings (secondary zone, search, lock) | Not started | — |
 | Milestone B–D | Recurrence, search, interchange | Not started | — |
+
+Milestone A landed as one combined commit rather than six — the items share
+the `AppSettings` type, the `LocalCalendarDatabase` schema, and the store's
+persist/rollback machinery closely enough that separating them would mean
+re-deriving the same plumbing repeatedly. All 66 tests (50 baseline + 16 new)
+pass with every item included.
+
+Full per-item detail for the new rows is under their milestones below; the
+table only tracks status.
 
 ### Known gaps against the spec (deliberate, not defects)
 
 - **Custom reminder durations (spec 1.12)** — the preset list is implemented in full,
   but arbitrary user-entered durations ("Custom": minutes/hours/days/weeks) are not.
   Deferred out of BC-NOT-001; no backlog item currently owns this.
-- **Configurable all-day alert time** — hard-coded to 09:00 local in
-  `LocalNotificationPlanner.allDayAlertHour`. Becomes user-configurable in BC-SET-001.
+- ~~**Configurable all-day alert time**~~ — resolved by BC-SET-001;
+  `LocalNotificationPlanner.allDayAlertHour` is now sourced from
+  `store.settings.allDayReminderHour`, editable in the new Settings screen.
+
+### Resolved since last audit
+
+- ~~**Force-quitting the app before Undo is tapped loses the deleted event permanently.**~~
+  Resolved by BC-DEL-001: tombstones now carry a full JSON snapshot of the deleted event
+  (migration `v008_add_deletion_snapshot`), restorable via `store.restoreDeletedEvent(_:)`
+  and surfaced as "Recently Deleted" in the calendar manager, with a 30-day retention purge.
 
 ---
 
@@ -69,6 +94,26 @@ green; an item is only `Done` once the full suite passes and it has its own comm
 - Spec 0.9. Schema already permits `event_type = 'floating'`; the domain has no case.
 - Model internally (same wall-clock time regardless of zone). UI exposure not required.
 - Acceptance: floating event keeps its local clock time across a simulated zone change.
+
+### BC-DEL-001 — Durable soft-delete / undo persistence
+- Spec 0.12. **Highest-risk item in Milestone A** — the current implementation can
+  silently lose user data, which spec 0.3 lists as a top engineering success criterion.
+- `LocalCalendarStore.deleteEvent` (and move/duplicate undo paths) must persist enough
+  of the deleted event to reconstruct it from disk, not just from an in-memory closure.
+  The existing tombstone table needs the full record (or a serialized snapshot), not
+  just `id`/`title`/`deletedAt`.
+- Undo must survive the app being backgrounded or force-quit during the undo window;
+  a cleanup pass (spec 0.12 "retain soft-deleted data for a cleanup period") should
+  purge tombstones only after that period elapses, not immediately.
+- Acceptance: delete an event, force-quit the app before tapping Undo, relaunch, and
+  confirm the event is still recoverable (or, at minimum, its data was never destroyed
+  before the retention period expired).
+
+### BC-CAL-001 — Calendar list completeness
+- Spec 1.3. `CalendarManagerView` is missing two listed actions: reorder calendars
+  (schema already has `sortOrder`) and showing each calendar's count of future events.
+- Acceptance: dragging a calendar row persists its new `sortOrder`; each row shows an
+  accurate future-event count that updates after create/delete/move.
 
 ### BC-SET-001 — Settings persistence layer
 - Spec 1.20. Wire the existing `application_settings` table through a repository API.
@@ -156,11 +201,34 @@ green; an item is only `Done` once the full suite passes and it has its own comm
 - Show created/last-edited times where useful; recurrence summary; time zone when relevant.
 
 ### BC-VIEW-012 — Week/Month drag-and-drop
-- Spec 1.7: drag events between days in week view. Month view long-press to create already exists.
+- Spec 1.7: drag events between days in week view. `WeekCalendarView` currently renders
+  each day as a vertical card list (not an hourly timeline) with zero drag gesture code.
+  Month view long-press to create already exists.
+- Spec 1.6: also add the still-missing haptic feedback at 15/30-minute snap boundaries
+  and auto-scroll while dragging near the top/bottom edge for the existing day-view
+  drag/resize gestures (`CalendarScreen.swift` overlap-column algorithm and drag/resize
+  gestures themselves are already implemented correctly — this item is just the
+  haptics/auto-scroll polish called out in spec 1.6).
+
+### BC-TZ-001 — Time-zone settings
+- Spec 1.17. The editor currently offers only a flat hardcoded list of ~6 time zones.
+- Add: optional secondary time-zone display, time-zone search, and a "lock event to
+  this time zone" toggle (view model should support dual-time display even if hidden
+  by default per spec).
 
 ### BC-PRIV-001 — Privacy logging wrapper
 - Spec 0.13: logging wrapper with privacy classifications; never log event title, notes,
   location, or search query. Analytics limited to the allow-listed event names.
+- No `print`/`os_log`/`Logger` calls exist anywhere in the app target today, so there
+  are no current violations to fix — this is new-build work, not cleanup.
+
+### Resolved during BC-SET-001
+
+- ~~**Quick-create default start time (spec 1.4)**~~ — confirmed and fixed: `EventDraft.init`
+  was rounding to the next hour; it now rounds to the next 30-minute mark by default (and
+  accepts a `roundingMinutes` parameter so a configured snap interval can override it).
+  `testEventDraftRoundsInitialStartToNextHour` was replaced with
+  `testEventDraftRoundsInitialStartToNextThirtyMinuteMark`.
 
 ---
 

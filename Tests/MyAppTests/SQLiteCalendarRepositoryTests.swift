@@ -184,6 +184,99 @@ final class SQLiteCalendarRepositoryTests: XCTestCase {
         XCTAssertEqual(Set(loadedEvent.reminders.map(\.offset)), Set(reminders.map(\.offset)))
     }
 
+    // BC-SET-001
+    func testApplicationSettingsRoundTripThroughSQLite() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        var settings = AppSettings.defaultSettings
+        settings.defaultEventDurationMinutes = 45
+        settings.defaultReminderOffset = .minutesBefore(15)
+        settings.firstWeekday = .monday
+        settings.showWeekends = false
+        settings.timeFormat = .twentyFourHour
+        settings.defaultCalendarView = .week
+        settings.allDayReminderHour = 8
+        settings.snapIntervalMinutes = 10
+        settings.appearance = .dark
+        settings.reduceCalendarAnimation = true
+        settings.hasCompletedOnboarding = true
+        settings.lastSelectedTab = .agenda
+        settings.lastSelectedDate = TestData.date("2026-09-05T00:00:00Z")
+        settings.secondaryTimeZoneIdentifier = "America/Los_Angeles"
+
+        var database = TestData.database(events: [])
+        database.settings = settings
+        try repository.save(database)
+
+        let loaded = try repository.load()
+        XCTAssertEqual(loaded.settings, settings)
+    }
+
+    // BC-SET-001
+    func testUnsetOptionalSettingsRoundTripAsNilRatherThanStaleValues() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        var withOptionals = TestData.database(events: [])
+        withOptionals.settings.firstWeekday = .sunday
+        withOptionals.settings.lastSelectedDate = TestData.date("2026-09-05T00:00:00Z")
+        try repository.save(withOptionals)
+
+        var cleared = withOptionals
+        cleared.settings.firstWeekday = nil
+        cleared.settings.lastSelectedDate = nil
+        try repository.save(cleared)
+
+        let loaded = try repository.load()
+        XCTAssertNil(loaded.settings.firstWeekday)
+        XCTAssertNil(loaded.settings.lastSelectedDate)
+    }
+
+    // BC-CAL-001
+    func testCalendarSortOrderRoundTripsAndReorderPersists() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let first = TestData.calendar(id: TestData.calendarID, name: "School", isDefault: true, sortOrder: 1)
+        let second = TestData.calendar(id: TestData.secondCalendarID, name: "Personal", isDefault: false, sortOrder: 0)
+
+        try repository.save(TestData.database(calendars: [first, second], events: []))
+        let loaded = try repository.load()
+
+        XCTAssertEqual(loaded.calendars.map(\.name), ["Personal", "School"], "Calendars load ordered by sort_order, not insertion order.")
+        XCTAssertEqual(loaded.calendars.map(\.sortOrder), [0, 1])
+    }
+
+    // BC-DEL-001
+    func testDeletedEventTombstoneRoundTripsSnapshotJSONThroughSQLite() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let event = TestData.event(title: "Deleted Lecture")
+        let tombstone = DeletedEventTombstone(
+            id: UUID(),
+            eventID: event.id,
+            title: event.title,
+            deletedAt: TestData.date("2026-09-05T00:00:00Z"),
+            eventSnapshotJSON: event.encodedSnapshotJSON(),
+            deletionSyncedAt: nil
+        )
+
+        try repository.save(TestData.database(events: [], deletedEventTombstones: [tombstone]))
+        let loaded = try repository.load()
+
+        let loadedTombstone = try XCTUnwrap(loaded.deletedEventTombstones.first)
+        XCTAssertEqual(loadedTombstone.id, tombstone.id)
+        let restoredEvent = try XCTUnwrap(loadedTombstone.eventSnapshotJSON.flatMap(CalendarEvent.init(snapshotJSON:)))
+        XCTAssertEqual(restoredEvent.id, event.id)
+        XCTAssertEqual(restoredEvent.title, event.title)
+    }
+
     private func makeTemporaryDatabaseURL() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("BetterCalendarSQLiteTests-\(UUID().uuidString)", isDirectory: true)
