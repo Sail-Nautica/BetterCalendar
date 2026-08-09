@@ -47,13 +47,19 @@ green; an item is only `Done` once the full suite passes and it has its own comm
 | BC-SET-002 | Settings screen | Done — 66 tests green | `c910492` |
 | BC-VIEW-010 | Persist view state | Done — 66 tests green | `c910492` |
 | BC-ONB-001 | First-launch onboarding | Done — 66 tests green | `c910492` |
-| BC-TZ-001 | Time-zone settings (secondary zone, search, lock) | Not started | — |
+| BC-TZ-001 | Time-zone settings (secondary zone, search, lock) | Done — 116 tests green | `c128666` |
 | BC-REC-010 | Recurrence exceptions + edit/delete scope | Done — 81 tests green | `bc389ff` |
 | BC-REC-011 | Full recurrence editor | Done — 81 tests green | `bc389ff` |
 | BC-SRCH-001 | FTS5-backed search | Done — 88 tests green | `fb785d8` |
 | BC-SRCH-002 | Search filters | Done — 88 tests green | `fb785d8` |
 | BC-VIEW-011 | Agenda view completion | Done — 88 tests green | `fb785d8` |
-| Milestone D | Interchange, detail actions, interaction | Not started | — |
+| BC-ICS-001 | ICS import completeness | Done — 116 tests green | `c128666` |
+| BC-ICS-002 | ICS export completeness | Done — 116 tests green | `c128666` |
+| BC-ICS-003 | File-based import/export | Done — 116 tests green | `c128666` |
+| BC-EVT-020 | Event detail actions | Done — 116 tests green | `c128666` |
+| BC-VIEW-012 | Week/Month drag-and-drop + haptics | Done — 116 tests green | `c128666` |
+| BC-PRIV-001 | Privacy logging wrapper | Done — 116 tests green | `c128666` |
+| Milestone D | Interchange, detail actions, interaction | Done — 116 tests green | `c128666` |
 
 Milestone A landed as one combined commit rather than six — the items share
 the `AppSettings` type, the `LocalCalendarDatabase` schema, and the store's
@@ -227,46 +233,90 @@ out of scope) — verified by build success and code review, not a dedicated tes
 ## Milestone D — Interchange, detail actions, interaction
 
 ### BC-ICS-001 — ICS import completeness
-- Spec 1.18. Currently: SUMMARY/DTSTART/DTEND/LOCATION/DESCRIPTION only, paste-only.
-- Add: RRULE, EXDATE, RECURRENCE-ID, VALARM, UID, DURATION, TZID (incl. unknown-zone fallback),
-  line unfolding per RFC 5545.
-- UID-based duplicate detection (current check is title+start).
-- Import preview with destination-calendar picker; imported/skipped/failed counts; one transaction.
-- Preserve unrecognised properties in raw metadata so export is non-destructive.
+- Spec 1.18. `ICSCalendarCodec.importEvents(from:defaultCalendarID:)` rewritten to a two-pass
+  parser (master `VEVENT`s, then `RECURRENCE-ID` overrides matched back to their master by UID)
+  supporting RRULE (incl. the BC-REC-011 positional/day-of-month fields), EXDATE → `.cancelled`
+  exceptions, RECURRENCE-ID → `.modified` exceptions, VALARM → reminders, UID, DURATION (as a
+  DTEND fallback), TZID resolution with graceful fallback for unknown zones, and RFC 5545 line
+  unfolding.
+- `commitImport` does UID-based dedup (`providerMetadata.providerObjectID`) falling back to
+  title+start-date matching when no UID is present; a duplicate master's replacement events and
+  exceptions are skipped alongside it.
+- `LocalCalendarStore.previewImportICS(_:)` / `.commitImport(_:destinationCalendarID:)` split the
+  old monolithic `importICS(_:)` into parse-then-preview and a separate commit step; `importICS`
+  itself now just chains the two so old call sites/tests keep working.
+- Unrecognised properties are preserved verbatim in `ProviderMetadata.rawICSProperties` (new
+  migration `v010_add_raw_ics_metadata`) so a round-tripped import→export doesn't lose data.
 
 ### BC-ICS-002 — ICS export completeness
-- Spec 1.19. Export one event, one series, a date range, or a whole calendar.
-- Emit VALARM for reminders, EXDATE/RECURRENCE-ID for exceptions, correct TZID handling,
-  and RFC 5545 line folding at 75 octets.
+- Spec 1.19. `LocalCalendarStore.exportICS(scope:)` replaces the old parameterless export with an
+  `ICSExportScope` (`.singleEvent`, `.series(masterEventID:)`, `.dateRange`, `.calendar`, `.all`).
+- Emits VALARM per reminder, EXDATE for cancelled exceptions and RECURRENCE-ID for modified ones,
+  TZID on DTSTART/DTEND for timed events, and RFC 5545 75-octet line folding
+  (`foldLines`/`foldLine`).
 
 ### BC-ICS-003 — File-based import/export
-- Spec 1.18/1.19: open/share `.ics` files rather than paste-only text.
+- Spec 1.18/1.19. `ImportExportView` rewritten: `.fileImporter` for picking a `.ics` file feeds
+  the same preview/commit flow as paste; export uses `ShareLink` with a `Transferable`
+  `ICSDocument` (`UTType.icsCalendar`, `filenameExtension: "ics"`) so it can be shared/saved
+  through the system share sheet rather than only copy/paste.
 
 ### BC-EVT-020 — Event detail actions
-- Spec 1.10: Share as text, Export as ICS, Move to calendar, Open location (Maps), Open URL.
-- Show created/last-edited times where useful; recurrence summary; time zone when relevant.
+- Spec 1.10. `EventDetailsView` gained: a "Move to Calendar" menu (shown when more than one
+  calendar exists), `ShareLink` "Share as Text" (`CalendarEvent.shareSummaryText(calendarName:)`
+  — title/time/calendar/location/URL/recurrence, deliberately never notes), `ShareLink`
+  "Export as ICS" (scoped to the series when the occurrence recurs), and an "Open in Maps" link
+  built from the event's location text. Details section gained created/last-edited timestamps and
+  an availability row; the time-zone row is now suppressed for all-day events or when it matches
+  the device's zone.
 
 ### BC-VIEW-012 — Week/Month drag-and-drop
-- Spec 1.7: drag events between days in week view. `WeekCalendarView` currently renders
-  each day as a vertical card list (not an hourly timeline) with zero drag gesture code.
-  Month view long-press to create already exists.
-- Spec 1.6: also add the still-missing haptic feedback at 15/30-minute snap boundaries
-  and auto-scroll while dragging near the top/bottom edge for the existing day-view
-  drag/resize gestures (`CalendarScreen.swift` overlap-column algorithm and drag/resize
-  gestures themselves are already implemented correctly — this item is just the
-  haptics/auto-scroll polish called out in spec 1.6).
+- Spec 1.7. `WeekCalendarView` day columns are now `.dropDestination(for: String.self)` targets
+  and each `CompactOccurrenceCard` is `.draggable(occurrence.id)`; dropping moves the event to the
+  target day while preserving its time-of-day (`CalendarEvent.movedPreservingTimeOfDay(to:calendar:)`).
+  Month view's card stays non-draggable since `.draggable` is only added at the week-view call
+  site, not on the shared card view.
+- Spec 1.6. Day-view drag/resize gestures gained haptic feedback at each newly-reached 15-minute
+  snap increment (`UIImpactFeedbackGenerator`, throttled so it fires once per increment) and
+  auto-scroll that follows the drag's destination hour via `ScrollViewReader` — a deliberately
+  simpler "follow the destination hour" approach rather than precise viewport-edge detection,
+  chosen given no way to interactively verify edge-of-screen behavior.
 
 ### BC-TZ-001 — Time-zone settings
-- Spec 1.17. The editor currently offers only a flat hardcoded list of ~6 time zones.
-- Add: optional secondary time-zone display, time-zone search, and a "lock event to
-  this time zone" toggle (view model should support dual-time display even if hidden
-  by default per spec).
+- Spec 1.17. Replaced the editor's flat hardcoded ~7-zone picker with a searchable
+  `TimeZoneSearchView` (`.searchable` over `TimeZone.knownTimeZoneIdentifiers`), reused from both
+  `EventEditorView` and a new "Time Zone" section in `SettingsScreen` (optional secondary zone,
+  with a clear button).
+- Added a "Lock to This Time Zone" toggle backed by a new `EventDraft.isLockedToTimeZone` flag.
+  This also fixed a latent bug: `EventDraft` previously had no way to represent `.floating`
+  events distinctly from `.timed` ones (`CalendarEvent.isAllDay`'s getter returns `false` for
+  both), so editing a floating event through the standard editor silently converted it to timed.
+  `saveEvent(from:)` now resolves `EventTimeType` from `isAllDay` and `isLockedToTimeZone`
+  together instead of the lossy `isAllDay` boolean shim.
+- `CalendarEvent.startTime(displayedIn:)` computes the dual-time display; `EventDetailsView` shows
+  it as "Also in \<zone\>" when a secondary zone is configured and differs from the event's own zone.
 
 ### BC-PRIV-001 — Privacy logging wrapper
-- Spec 0.13: logging wrapper with privacy classifications; never log event title, notes,
-  location, or search query. Analytics limited to the allow-listed event names.
-- No `print`/`os_log`/`Logger` calls exist anywhere in the app target today, so there
-  are no current violations to fix — this is new-build work, not cleanup.
+- Spec 0.13. New `Shared/PrivacyLog.swift`: `debug(_:metadata:isPublic:)` takes a `StaticString`
+  message (so a call site can never interpolate event content into a log line) plus optional
+  redacted metadata, and `track(_:metadata:)` is restricted to the closed `AnalyticsEvent` enum —
+  the spec's seven allow-listed event names verbatim, with no free-form string path.
+- Wired into: `calendar_view_opened` (`CalendarScreen.onAppear`), `event_creation_started`
+  (`EventEditorView.onAppear` when `event == nil`), `event_saved`/`event_deleted`
+  (`LocalCalendarStore.saveEvent`/`.deleteEvent`), `search_performed`
+  (`LocalCalendarStore.searchEvents`, event only — the query string itself is never included),
+  `notification_permission_result` (`UserNotificationScheduler`, granted/denied metadata), and
+  `ics_import_result` (`commitImport`, imported/skipped/failed counts as metadata).
+- No `print`/`os_log`/`Logger` calls existed anywhere in the app target before this — this was
+  new-build work, not cleanup, as anticipated.
+
+Landed as one commit. 116 tests green (88 baseline + 28 new): RRULE/EXDATE/RECURRENCE-ID/VALARM/
+TZID/DURATION/UID import and export round-tripping, line fold/unfold, ICS export scoping,
+`movedPreservingTimeOfDay`, `moveEventToCalendar` persistence + rollback, secondary-time-zone
+display (incl. nil for all-day/unknown-zone), the floating-event-editing regression fix, and the
+`AnalyticsEvent` allow-list matching spec 0.13 exactly. Drag-and-drop/haptics/auto-scroll are
+UI-level and follow the project's existing "Done bar" — verified by build success and code
+review, not a dedicated test.
 
 ### Resolved during BC-SET-001
 
