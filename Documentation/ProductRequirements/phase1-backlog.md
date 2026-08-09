@@ -50,7 +50,10 @@ green; an item is only `Done` once the full suite passes and it has its own comm
 | BC-TZ-001 | Time-zone settings (secondary zone, search, lock) | Not started | — |
 | BC-REC-010 | Recurrence exceptions + edit/delete scope | Done — 81 tests green | `bc389ff` |
 | BC-REC-011 | Full recurrence editor | Done — 81 tests green | `bc389ff` |
-| Milestone C–D | Search, interchange | Not started | — |
+| BC-SRCH-001 | FTS5-backed search | Done — 88 tests green | `fb785d8` |
+| BC-SRCH-002 | Search filters | Done — 88 tests green | `fb785d8` |
+| BC-VIEW-011 | Agenda view completion | Done — 88 tests green | `fb785d8` |
+| Milestone D | Interchange, detail actions, interaction | Not started | — |
 
 Milestone A landed as one combined commit rather than six — the items share
 the `AppSettings` type, the `LocalCalendarDatabase` schema, and the store's
@@ -181,22 +184,43 @@ this-event edit/delete/re-edit flows, and recurrence-rule Codable tolerance.
 
 ---
 
-## Milestone C — Search & agenda
+## Milestone C — Search & agenda ✅ Done
 
 ### BC-SRCH-001 — FTS5-backed search
-- Spec 1.13. `event_search` (fts5) is populated but never queried; `SearchScreen` does an
-  in-memory substring scan.
-- Query through SQLite. Ranking: exact title → title prefix → title contains → location →
-  notes → calendar name; future before past on ties.
-- Index calendar name and URL host in addition to current columns.
-- Search terms must never reach logs or analytics (spec 1.13 privacy).
+- Spec 1.13. `event_search` now indexes `calendar_name`/`url_host` too (migration
+  `v009_extend_search_index` — FTS5 tables can't have columns added in place, so this drops
+  and recreates the previously-unqueried table under the same name).
+- `LocalCalendarRepository` gains `searchEventIDs(matching:) throws -> [UUID]`: an indexed
+  FTS5 prefix-per-word query for recall (`SQLiteCalendarRepository`), with an equivalent
+  substring-scan fallback in `JSONCalendarRepository`/`StubCalendarRepository` so ranking
+  behaves identically regardless of which repository backs the store.
+- `BetterCalendarStore.searchEvents(matching:filters:now:)` does the actual ranking in Swift
+  (it already holds every event in memory) against the FTS-narrowed candidate set: exact title
+  → title prefix → title contains → location → notes → calendar name, future before past on
+  ties. `SearchScreen` now calls this instead of scanning in-memory itself.
+- Search terms are never logged (no logging exists yet at all — BC-PRIV-001 is Milestone D).
 
 ### BC-SRCH-002 — Search filters
-- Spec 1.13: date range, calendar, past/future, all-day, recurring.
+- Spec 1.13. New `SearchFilters` domain type (calendar, date range, past/future/all timeframe,
+  all-day-only, recurring-only), applied inside `searchEvents(matching:filters:now:)`.
+  `SearchScreen` gained a Filters section exposing all five dimensions.
 
 ### BC-VIEW-011 — Agenda view completion
-- Spec 1.9: sticky date headers, grouping by date, all-day before timed, empty-day handling,
-  past-event de-emphasis, "Today" jump, paginated range loading (drop the fixed 90-day window).
+- Spec 1.9. `AgendaScreen` rewritten: occurrences grouped into per-date `Section`s (sticky via
+  `.listStyle(.plain)`) with all-day occurrences sorted before timed ones within a day; days
+  with zero occurrences are simply omitted rather than shown empty; past occurrences render at
+  reduced opacity; a toolbar "Today" button scrolls to today's section via `ScrollViewReader`.
+- Replaced the fixed `-1 day…+90 day` window with a growing forward horizon (starts at 30
+  days, extends by 30-day pages via `.onAppear` on the last row, capped at 365 days) — the
+  past side stays a fixed 7-day window since an agenda's job is showing what's coming up, not
+  unbounded scrollback; this is a deliberate scope decision, not an oversight.
+
+Landed as one commit (all three touch the same search/store/agenda surface closely enough
+that separating them would add little). 88 tests green (81 baseline + 7 new): FTS5 recall
+across all five indexed fields, ranking-tier ordering, future-before-past tie-breaking, and
+each filter dimension. Agenda's grouping/sticky-header/pagination behavior itself is UI-level
+and follows the project's existing "Done bar" (functional + unit tests; snapshot/UI tests
+out of scope) — verified by build success and code review, not a dedicated test.
 
 ---
 
