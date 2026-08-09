@@ -214,6 +214,20 @@ enum EventTimeType: String, Codable, CaseIterable, Identifiable, Hashable {
     var id: String { rawValue }
 }
 
+enum EventAvailability: String, Codable, CaseIterable, Identifiable {
+    case busy
+    case free
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .busy: "Busy"
+        case .free: "Free"
+        }
+    }
+}
+
 struct CalendarEvent: Identifiable, Codable, Hashable {
     var id: UUID
     var calendarID: BetterCalendar.ID
@@ -230,6 +244,9 @@ struct CalendarEvent: Identifiable, Codable, Hashable {
     var providerMetadata: ProviderMetadata
     var createdAt: Date
     var updatedAt: Date
+    /// BC-EVT-020, spec 1.5/1.10. The `events.availability` SQLite column already existed
+    /// (hardcoded to `'busy'` on every write) — this is the first domain-level exposure of it.
+    var availability: EventAvailability = .busy
     /// Set only on a standalone replacement event created for a single recurring occurrence
     /// (BC-REC-010, "This Event" edit scope, spec 1.11) — the master series' id.
     var recurrenceMasterID: UUID?
@@ -271,6 +288,7 @@ extension CalendarEvent {
         case timeZoneIdentifier, location, urlString, notes, reminders
         case recurrence, providerMetadata, createdAt, updatedAt
         case recurrenceMasterID, recurrenceOriginalStart
+        case availability
     }
 
     /// Decodes tolerantly so databases written before `timeType` existed still load.
@@ -298,6 +316,7 @@ extension CalendarEvent {
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
         recurrenceMasterID = try container.decodeIfPresent(UUID.self, forKey: .recurrenceMasterID)
         recurrenceOriginalStart = try container.decodeIfPresent(Date.self, forKey: .recurrenceOriginalStart)
+        availability = try container.decodeIfPresent(EventAvailability.self, forKey: .availability) ?? .busy
 
         if let decodedTimeType = try container.decodeIfPresent(EventTimeType.self, forKey: .timeType) {
             timeType = decodedTimeType
@@ -328,6 +347,7 @@ extension CalendarEvent {
         try container.encode(updatedAt, forKey: .updatedAt)
         try container.encodeIfPresent(recurrenceMasterID, forKey: .recurrenceMasterID)
         try container.encodeIfPresent(recurrenceOriginalStart, forKey: .recurrenceOriginalStart)
+        try container.encode(availability, forKey: .availability)
     }
 
     /// Boolean-shaped initializer preserving the pre-`timeType` signature.
@@ -404,6 +424,10 @@ struct ProviderMetadata: Codable, Hashable {
     var providerVersion: String?
     var syncStatus: SyncStatus
     var deletedAt: Date?
+    /// BC-ICS-001, spec 1.18: unrecognized/original ICS properties from import, preserved so a
+    /// later export is non-destructive. Best-effort reconstruction of the source properties,
+    /// not a byte-exact copy of the original file.
+    var rawICSProperties: String?
 
     static let local = ProviderMetadata(
         provider: .betterCalendar,
@@ -687,6 +711,12 @@ struct EventDraft: Equatable {
     var startDate: Date
     var endDate: Date
     var isAllDay: Bool
+    /// BC-TZ-001 (spec 1.17 "lock event to this time zone"): UI exposure of the `.floating`
+    /// case BC-EVT-011 already modeled. Tracked as its own flag (not derived from `isAllDay`)
+    /// so `EventDraft` can represent all three `EventTimeType` cases, not just two — without
+    /// this, editing a floating event through the standard editor would silently collapse it
+    /// to timed, since `CalendarEvent.isAllDay`'s getter reads `false` for `.floating` too.
+    var isLockedToTimeZone: Bool
     var timeZoneIdentifier: String
     var location: String
     var urlString: String
@@ -705,6 +735,7 @@ struct EventDraft: Equatable {
         startDate = event.startDate
         endDate = event.endDate
         isAllDay = event.isAllDay
+        isLockedToTimeZone = event.isFloating
         timeZoneIdentifier = event.timeZoneIdentifier
         location = event.location ?? ""
         urlString = event.urlString ?? ""
@@ -727,6 +758,7 @@ struct EventDraft: Equatable {
         self.startDate = roundedStart
         endDate = roundedStart.addingTimeInterval(duration)
         isAllDay = false
+        isLockedToTimeZone = false
         timeZoneIdentifier = TimeZone.current.identifier
         location = ""
         urlString = ""

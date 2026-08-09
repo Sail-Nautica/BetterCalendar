@@ -457,6 +457,23 @@ extension CalendarEvent {
         return parts.joined(separator: ", ")
     }
 
+    /// BC-EVT-020 (spec 1.10 "Share as text"): a short, human-readable plain-text summary
+    /// suitable for `ShareLink`/Messages/Mail — never event notes, matching spec 0.13 privacy
+    /// guidance for anything that could leave the device via a general-purpose share sheet.
+    func shareSummaryText(calendarName: String) -> String {
+        var lines = [title, timeRangeText(), calendarName]
+        if let location {
+            lines.append(location)
+        }
+        if let urlString {
+            lines.append(urlString)
+        }
+        if recurrence != nil {
+            lines.append("Repeats")
+        }
+        return lines.joined(separator: "\n")
+    }
+
     /// Start date as it should be displayed in `displayCalendar`'s time zone.
     ///
     /// Floating events re-anchor their stored wall-clock components into the viewing zone, so
@@ -481,6 +498,32 @@ extension CalendarEvent {
 
     func intersects(_ interval: DateInterval) -> Bool {
         startDate < interval.end && endDate > interval.start
+    }
+
+    /// This event's start time as it would read in a different time zone (BC-TZ-001, spec
+    /// 1.17 "dual-time display"). `nil` for all-day/floating events, where a secondary-zone
+    /// reading doesn't apply — an all-day event has no clock time, and a floating event reads
+    /// the same everywhere by definition.
+    func startTime(displayedIn timeZoneIdentifier: String) -> String? {
+        guard timeType == .timed, let zone = TimeZone(identifier: timeZoneIdentifier) else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.timeZone = zone
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter.string(from: startDate)
+    }
+
+    /// This event's own time-of-day combined with a different calendar date — used when
+    /// dragging an event to a different day in week view (BC-VIEW-012, spec 1.7), where only
+    /// the date should change, never the time.
+    func movedPreservingTimeOfDay(to newDate: Date, calendar: Calendar = .current) -> Date {
+        let timeComponents = calendar.dateComponents([.hour, .minute, .second], from: startDate)
+        var targetComponents = calendar.dateComponents([.year, .month, .day], from: newDate)
+        targetComponents.hour = timeComponents.hour
+        targetComponents.minute = timeComponents.minute
+        targetComponents.second = timeComponents.second
+        return calendar.date(from: targetComponents) ?? startDate
     }
 
     func durationComponents(in calendar: Calendar) -> DateComponents {

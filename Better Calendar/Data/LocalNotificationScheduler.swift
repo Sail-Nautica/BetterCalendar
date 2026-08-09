@@ -131,7 +131,8 @@ struct UserNotificationScheduler: LocalNotificationScheduling {
                 guard authorizationRequestPolicy == .ifNeeded else {
                     return
                 }
-                _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+                let granted = (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+                PrivacyLog.track(.notificationPermissionResult, metadata: granted ? "granted" : "denied")
             }
 
             let updatedSettings = await center.notificationSettings()

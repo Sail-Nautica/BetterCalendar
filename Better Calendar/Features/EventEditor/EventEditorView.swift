@@ -84,10 +84,17 @@ struct EventEditorView: View {
                             }
                         }
 
-                    Picker("Time Zone", selection: $draft.timeZoneIdentifier) {
-                        ForEach(timeZoneOptions, id: \.self) { identifier in
-                            Text(timeZoneLabel(identifier)).tag(identifier)
+                    if !draft.isAllDay {
+                        NavigationLink {
+                            TimeZoneSearchView(selection: $draft.timeZoneIdentifier)
+                        } label: {
+                            LabeledContent("Time Zone", value: timeZoneLabel(draft.timeZoneIdentifier))
                         }
+
+                        // BC-TZ-001, spec 1.17: pure UI exposure of the floating-event model
+                        // (BC-EVT-011) — the event keeps the same wall-clock time regardless of
+                        // which zone it's viewed from, instead of shifting with the device.
+                        Toggle("Lock to This Time Zone", isOn: $draft.isLockedToTimeZone)
                     }
                 }
 
@@ -190,6 +197,11 @@ struct EventEditorView: View {
                     dismiss()
                 }
                 Button("Keep Editing", role: .cancel) { }
+            }
+            .onAppear {
+                if event == nil {
+                    PrivacyLog.track(.eventCreationStarted)
+                }
             }
         }
     }
@@ -446,26 +458,6 @@ struct EventEditorView: View {
         ReminderOffset.allCases.filter { $0 != .none && !draft.reminderOffsets.contains($0) }
     }
 
-    private var timeZoneOptions: [String] {
-        var identifiers = [
-            TimeZone.current.identifier,
-            draft.timeZoneIdentifier,
-            "America/Detroit",
-            "America/New_York",
-            "America/Chicago",
-            "America/Denver",
-            "America/Los_Angeles",
-            "UTC"
-        ]
-        var seen: Set<String> = []
-        identifiers.removeAll { identifier in
-            if seen.contains(identifier) { return true }
-            seen.insert(identifier)
-            return false
-        }
-        return identifiers
-    }
-
     private func timeZoneLabel(_ identifier: String) -> String {
         if identifier == TimeZone.current.identifier {
             return "Current (\(identifier))"
@@ -505,5 +497,41 @@ struct EventEditorView: View {
         draft.endDate = timedStart.addingTimeInterval(60 * 60)
         isProgrammaticallyUpdatingEndDate = false
         preservesDuration = true
+    }
+}
+
+/// BC-TZ-001, spec 1.17 "time-zone search": replaces the old flat 7-entry hardcoded list with
+/// a searchable list over every IANA zone, matching the `.searchable` idiom already used by
+/// `SearchScreen`. Not private: `SettingsScreen` reuses it for the secondary-time-zone picker.
+struct TimeZoneSearchView: View {
+    @Binding var selection: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+
+    var body: some View {
+        List(filteredIdentifiers, id: \.self) { identifier in
+            Button {
+                selection = identifier
+                dismiss()
+            } label: {
+                HStack {
+                    Text(identifier.replacingOccurrences(of: "_", with: " "))
+                    Spacer()
+                    if identifier == selection {
+                        Image(systemName: "checkmark")
+                            .foregroundStyle(.tint)
+                    }
+                }
+            }
+            .foregroundStyle(.primary)
+        }
+        .searchable(text: $query, prompt: "Search time zones")
+        .navigationTitle("Time Zone")
+    }
+
+    private var filteredIdentifiers: [String] {
+        let all = TimeZone.knownTimeZoneIdentifiers.sorted()
+        guard !query.isEmpty else { return all }
+        return all.filter { $0.localizedCaseInsensitiveContains(query) }
     }
 }

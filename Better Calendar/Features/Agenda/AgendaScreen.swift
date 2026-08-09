@@ -91,6 +91,7 @@ struct AgendaScreen: View {
                 }
                 .sheet(item: $selectedOccurrence) { occurrence in
                     EventDetailsView(
+                        store: store,
                         occurrence: occurrence,
                         calendar: calendar(for: occurrence.event),
                         onEdit: { event in

@@ -282,6 +282,53 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(store.settings.snapIntervalMinutes, originalSnapInterval)
     }
 
+    // BC-EVT-020
+    func testSavingDraftWithLockToTimeZoneProducesFloatingTimeTypeRatherThanTimed() {
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        var draft = EventDraft(calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T14:00:00Z"))
+        draft.title = "Standup"
+        draft.isAllDay = false
+        draft.isLockedToTimeZone = true
+
+        XCTAssertTrue(store.saveEvent(from: draft))
+        XCTAssertEqual(store.events.first?.timeType, .floating)
+    }
+
+    func testEditingExistingFloatingEventThroughDraftPreservesFloatingTimeTypeInsteadOfCollapsingToTimed() {
+        let floatingEvent = TestData.event(timeType: .floating)
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [floatingEvent])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        // `EventDraft.init(event:)` is what the editor uses to seed its form state; it must
+        // carry `isFloating` forward via `isLockedToTimeZone` or this round trip silently
+        // collapses the event to `.timed` (the bug BC-TZ-001 fixed).
+        var draft = EventDraft(event: floatingEvent)
+        draft.title = "Renamed"
+
+        XCTAssertTrue(store.saveEvent(from: draft))
+        XCTAssertEqual(store.events.first?.timeType, .floating)
+    }
+
+    func testMoveEventToCalendarUpdatesCalendarIDAndRollsBackOnFailure() {
+        let source = TestData.calendar(id: TestData.calendarID, name: "School")
+        let destination = TestData.calendar(id: TestData.secondCalendarID, name: "Personal", isDefault: false)
+        let event = TestData.event(calendarID: source.id)
+
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(calendars: [source, destination], events: [event])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+
+        XCTAssertTrue(store.moveEventToCalendar(event, calendarID: destination.id))
+        XCTAssertEqual(store.events.first?.calendarID, destination.id)
+
+        let failingRepository = StubCalendarRepository(loadResult: .success(TestData.database(calendars: [source, destination], events: [event])), saveError: TestRepositoryError.saveFailed)
+        let failingStore = BetterCalendarStore(repository: failingRepository, notificationScheduler: NoopNotificationScheduler())
+
+        XCTAssertFalse(failingStore.moveEventToCalendar(event, calendarID: destination.id))
+        XCTAssertEqual(failingStore.events.first?.calendarID, source.id)
+    }
+
     // BC-SRCH-001
     func testSearchEventsRanksExactTitleBeforePrefixBeforeContainsBeforeLocationBeforeNotesBeforeCalendarName() {
         let namedCalendar = TestData.calendar(id: TestData.secondCalendarID, name: "Lecture Series", isDefault: false)

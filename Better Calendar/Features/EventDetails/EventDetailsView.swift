@@ -1,6 +1,11 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct EventDetailsView: View {
+    /// Used directly (not via a closure) for BC-EVT-020 actions that don't need to coordinate
+    /// with the presenting screen's own navigation state: move-to-calendar, ICS export, and
+    /// reading `store.calendars` for the move menu.
+    let store: BetterCalendarStore
     let occurrence: CalendarOccurrence
     let calendar: BetterCalendar?
     let onEdit: (CalendarEvent) -> Void
@@ -100,6 +105,30 @@ struct EventDetailsView: View {
                         }
                     }
 
+                    if store.calendars.count > 1 {
+                        Menu("Move to Calendar") {
+                            ForEach(store.calendars.filter { $0.id != event.calendarID }) { destination in
+                                Button(destination.name) {
+                                    store.moveEventToCalendar(occurrence.event, calendarID: destination.id)
+                                }
+                            }
+                        }
+                    }
+
+                    ShareLink(item: event.shareSummaryText(calendarName: calendar?.name ?? "Local calendar")) {
+                        Label("Share as Text", systemImage: "square.and.arrow.up")
+                    }
+
+                    ShareLink(item: ICSShareDocument(text: exportICSText), preview: SharePreview("\(event.title).ics")) {
+                        Label("Export as ICS", systemImage: "doc.badge.arrow.up")
+                    }
+
+                    if let location = event.location, let mapsURL = mapsURL(for: location) {
+                        Link(destination: mapsURL) {
+                            Label("Open in Maps", systemImage: "map")
+                        }
+                    }
+
                     Button("Delete", systemImage: "trash", role: .destructive) {
                         if occurrence.isRecurringOccurrence {
                             pendingScopeAction = .delete
@@ -120,7 +149,23 @@ struct EventDetailsView: View {
 
                 Section("Details") {
                     DetailRow(title: "Calendar", value: calendar?.name ?? "Local calendar", systemImage: "calendar")
-                    DetailRow(title: "Time Zone", value: event.timeZoneIdentifier, systemImage: "globe")
+
+                    // Spec 1.10 "time zone when relevant": an all-day event has no meaningful
+                    // zone, and a timed event already in the device's current zone doesn't
+                    // need to say so.
+                    if !event.isAllDay && event.timeZoneIdentifier != TimeZone.current.identifier {
+                        DetailRow(title: "Time Zone", value: event.timeZoneIdentifier, systemImage: "globe")
+                    }
+
+                    // BC-TZ-001, spec 1.17 "dual-time display": off by default (per spec) —
+                    // shown only when the user has configured a secondary zone in Settings.
+                    if let secondaryZoneID = store.settings.secondaryTimeZoneIdentifier,
+                       secondaryZoneID != event.timeZoneIdentifier,
+                       let secondaryTime = event.startTime(displayedIn: secondaryZoneID) {
+                        DetailRow(title: "Also in \(secondaryZoneID)", value: secondaryTime, systemImage: "clock.badge")
+                    }
+
+                    DetailRow(title: "Availability", value: event.availability.label, systemImage: event.availability == .busy ? "circle.fill" : "circle")
 
                     if let location = event.location {
                         DetailRow(title: "Location", value: location, systemImage: "location")
@@ -141,6 +186,11 @@ struct EventDetailsView: View {
                             value: event.reminders.map(\.offset.label).joined(separator: ", "),
                             systemImage: "bell"
                         )
+                    }
+
+                    DetailRow(title: "Created", value: event.createdAt.formatted(date: .abbreviated, time: .shortened), systemImage: "clock")
+                    if event.updatedAt != event.createdAt {
+                        DetailRow(title: "Last Edited", value: event.updatedAt.formatted(date: .abbreviated, time: .shortened), systemImage: "clock.arrow.circlepath")
                     }
                 }
 
@@ -193,6 +243,18 @@ struct EventDetailsView: View {
         }
     }
 
+    private var exportICSText: String {
+        let scope: BetterCalendarStore.ICSExportScope = occurrence.isRecurringOccurrence
+            ? .series(masterEventID: occurrence.event.id)
+            : .singleEvent(occurrence.event.id)
+        return store.exportICS(scope: scope)
+    }
+
+    private func mapsURL(for location: String) -> URL? {
+        guard let encoded = location.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return nil }
+        return URL(string: "http://maps.apple.com/?q=\(encoded)")
+    }
+
     private func move(by seconds: TimeInterval) {
         dismiss()
         onMove(occurrence.event, occurrence.occurrenceStartDate.addingTimeInterval(seconds))
@@ -210,6 +272,16 @@ struct EventDetailsView: View {
         guard occurrence.occurrenceEndDate > newStartDate.addingTimeInterval(15 * 60) else { return }
         dismiss()
         onResize(occurrence.event, newStartDate, occurrence.occurrenceEndDate)
+    }
+}
+
+private struct ICSShareDocument: Transferable {
+    let text: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(exportedContentType: .icsCalendar) { document in
+            Data(document.text.utf8)
+        }
     }
 }
 

@@ -235,6 +235,21 @@ final class SQLiteCalendarRepositoryTests: XCTestCase {
         XCTAssertNil(loaded.settings.lastSelectedDate)
     }
 
+    // BC-EVT-020
+    func testAvailabilityRoundTripsThroughSQLite() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        var event = TestData.event()
+        event.availability = .free
+
+        try repository.save(TestData.database(events: [event]))
+        let loaded = try repository.load()
+
+        XCTAssertEqual(loaded.events.first?.availability, .free)
+    }
+
     // BC-SRCH-001
     func testSearchEventIDsFindsMatchesAcrossTitleNotesLocationCalendarNameAndURLHost() throws {
         let databaseURL = try makeTemporaryDatabaseURL()

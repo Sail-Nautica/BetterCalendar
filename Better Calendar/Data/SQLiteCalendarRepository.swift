@@ -12,7 +12,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v006_create_event_extensions",
         "v007_create_sync_and_settings",
         "v008_add_deletion_snapshot",
-        "v009_extend_search_index"
+        "v009_extend_search_index",
+        "v010_add_raw_ics_metadata"
     ]
 
     private let fileURLOverride: URL?
@@ -334,6 +335,12 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 """)
         }
 
+        // BC-ICS-001, spec 1.18: preserve unrecognized ICS properties from import so a later
+        // export is non-destructive.
+        migrator.registerMigration("v010_add_raw_ics_metadata") { db in
+            try db.execute(sql: "ALTER TABLE events ADD COLUMN raw_ics_properties TEXT")
+        }
+
         return migrator
     }
 
@@ -436,9 +443,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                     event_type, start_instant, end_instant, start_local_date, end_local_date_exclusive,
                     original_timezone_id, availability, status, privacy, color_override,
                     recurrence_master_id, recurrence_original_start, is_recurrence_master,
-                    sync_status, created_at, updated_at, deleted_at
+                    sync_status, created_at, updated_at, deleted_at, raw_ics_properties
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
             arguments: [
                 event.id.uuidString,
@@ -458,7 +465,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 startLocalDate,
                 endLocalDateExclusive,
                 event.timeZoneIdentifier,
-                "busy",
+                event.availability.rawValue,
                 "confirmed",
                 "default",
                 nil,
@@ -468,7 +475,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 event.providerMetadata.syncStatus.databaseValue,
                 encodeInstant(event.createdAt),
                 encodeInstant(event.updatedAt),
-                event.providerMetadata.deletedAt.map(encodeInstant)
+                event.providerMetadata.deletedAt.map(encodeInstant),
+                event.providerMetadata.rawICSProperties
             ]
         )
     }
@@ -696,10 +704,12 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 providerObjectID: row["provider_object_id"],
                 providerVersion: row["provider_version"],
                 syncStatus: SyncStatus(databaseValue: row["sync_status"]),
-                deletedAt: decodeInstant(row["deleted_at"])
+                deletedAt: decodeInstant(row["deleted_at"]),
+                rawICSProperties: row["raw_ics_properties"]
             ),
             createdAt: decodeInstant(row["created_at"]) ?? .now,
             updatedAt: decodeInstant(row["updated_at"]) ?? .now,
+            availability: EventAvailability(rawValue: row["availability"]) ?? .busy,
             recurrenceMasterID: (row["recurrence_master_id"] as String?).flatMap(UUID.init(uuidString:)),
             recurrenceOriginalStart: decodeInstant(row["recurrence_original_start"])
         )

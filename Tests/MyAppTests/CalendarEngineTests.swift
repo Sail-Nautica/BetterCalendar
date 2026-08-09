@@ -213,6 +213,46 @@ final class CalendarEngineTests: XCTestCase {
         XCTAssertEqual(plan.requestsToSchedule.first?.fireDate, start.addingTimeInterval(-600))
     }
 
+    // BC-VIEW-012
+    func testMovedPreservingTimeOfDayKeepsClockTimeButChangesCalendarDate() {
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(identifier: "UTC")!
+
+        let thisEvent = event(startDate: TestData.date("2026-09-07T14:30:00Z"), endDate: TestData.date("2026-09-07T15:00:00Z"))
+        let targetDay = TestData.date("2026-09-10T00:00:00Z")
+
+        let moved = thisEvent.movedPreservingTimeOfDay(to: targetDay, calendar: utcCalendar)
+
+        XCTAssertEqual(moved, TestData.date("2026-09-10T14:30:00Z"), "The time-of-day (14:30) must carry over; only the calendar date changes.")
+    }
+
+    func testStartTimeDisplayedInSecondaryZoneConvertsTimedEventToTargetZoneClockTime() {
+        let start = TestData.date("2026-09-07T14:30:00Z")
+        let thisEvent = event(startDate: start, endDate: TestData.date("2026-09-07T15:00:00Z"), timeZoneIdentifier: "UTC")
+
+        let displayed = thisEvent.startTime(displayedIn: "America/New_York")
+
+        let expectedFormatter = DateFormatter()
+        expectedFormatter.locale = .autoupdatingCurrent
+        expectedFormatter.timeZone = TimeZone(identifier: "America/New_York")
+        expectedFormatter.dateStyle = .none
+        expectedFormatter.timeStyle = .short
+
+        XCTAssertEqual(displayed, expectedFormatter.string(from: start))
+    }
+
+    func testStartTimeDisplayedInSecondaryZoneReturnsNilForAllDayEvents() {
+        let thisEvent = event(startDate: TestData.date("2026-09-07T00:00:00Z"), endDate: TestData.date("2026-09-08T00:00:00Z"), isAllDay: true)
+
+        XCTAssertNil(thisEvent.startTime(displayedIn: "America/New_York"))
+    }
+
+    func testStartTimeDisplayedInSecondaryZoneReturnsNilForUnknownZoneIdentifier() {
+        let thisEvent = event(startDate: TestData.date("2026-09-07T14:30:00Z"), endDate: TestData.date("2026-09-07T15:00:00Z"))
+
+        XCTAssertNil(thisEvent.startTime(displayedIn: "Not/AZone"))
+    }
+
     func testAllDayOccurrenceUsesDisplayDateInsteadOfAbsoluteMidnight() throws {
         let start = date(year: 2026, month: 10, day: 12, timeZoneIdentifier: "America/Detroit")
         let end = date(year: 2026, month: 10, day: 14, timeZoneIdentifier: "America/Detroit")
