@@ -43,6 +43,7 @@ enum TestData {
         timeType: EventTimeType? = nil,
         timeZoneIdentifier: String = "UTC",
         location: String? = nil,
+        urlString: String? = nil,
         notes: String? = nil,
         recurrence: RecurrenceRule? = nil
     ) -> CalendarEvent {
@@ -57,7 +58,7 @@ enum TestData {
             timeType: timeType ?? (isAllDay ? .allDay : .timed),
             timeZoneIdentifier: timeZoneIdentifier,
             location: location,
-            urlString: nil,
+            urlString: urlString,
             notes: notes,
             reminders: [],
             recurrence: recurrence,
@@ -102,6 +103,22 @@ final class StubCalendarRepository: LocalCalendarRepository {
             throw saveError
         }
         savedDatabases.append(database)
+    }
+
+    func searchEventIDs(matching query: String) throws -> [UUID] {
+        let database = try loadResult.get()
+        let lowercasedQuery = query.lowercased()
+        let calendarNamesByID = Dictionary(uniqueKeysWithValues: database.calendars.map { ($0.id, $0.name) })
+
+        return database.events
+            .filter { event in
+                event.title.lowercased().contains(lowercasedQuery)
+                    || (event.notes?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (event.location?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (calendarNamesByID[event.calendarID]?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (event.urlString.flatMap { URL(string: $0)?.host }?.lowercased().contains(lowercasedQuery) ?? false)
+            }
+            .map(\.id)
     }
 }
 

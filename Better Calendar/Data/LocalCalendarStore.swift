@@ -8,6 +8,7 @@ final class BetterCalendarStore {
     private(set) var pendingMutations: [PendingMutation] = []
     private(set) var deletedEventTombstones: [DeletedEventTombstone] = []
     private(set) var settings: AppSettings = .defaultSettings
+    private(set) var recurrenceExceptions: [RecurrenceException] = []
     private(set) var lastError: String?
     private(set) var environmentRevision = 0
     var undoAction: UndoAction?
@@ -55,6 +56,10 @@ final class BetterCalendarStore {
         let reminders = reminderRecords(for: draft)
         let recurrence = draft.recurrence.frequency == .never ? nil : draft.recurrence
         let trimmedTitle = draft.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        // BC-TZ-001: resolved directly from both draft flags rather than through the
+        // `isAllDay` boolean shim, which only ever collapses `.allDay`⇄`.timed` and would
+        // silently drop a `.floating` lock-to-timezone toggle.
+        let resolvedTimeType: EventTimeType = draft.isAllDay ? .allDay : (draft.isLockedToTimeZone ? .floating : .timed)
 
         let didSave = withPersistedMutation {
             if let eventID = draft.id, let index = events.firstIndex(where: { $0.id == eventID }) {
@@ -62,7 +67,7 @@ final class BetterCalendarStore {
                 events[index].calendarID = draft.calendarID
                 events[index].startDate = draft.startDate
                 events[index].endDate = normalizedEndDate(for: draft)
-                events[index].isAllDay = draft.isAllDay
+                events[index].timeType = resolvedTimeType
                 events[index].timeZoneIdentifier = draft.timeZoneIdentifier
                 events[index].location = draft.location.nilIfBlank
                 events[index].urlString = draft.urlString.nilIfBlank
@@ -73,7 +78,11 @@ final class BetterCalendarStore {
                 events[index].updatedAt = now
                 recordMutation(objectID: eventID, objectType: .event, operation: .update)
             } else {
-                let eventID = UUID()
+                // A non-nil `draft.id` here means this is a "This Event" occurrence seed
+                // (BC-REC-010) whose id was pre-minted by `seedForOccurrenceEdit` but doesn't
+                // exist in `events` yet — honour it so the new replacement gets a stable id
+                // rather than a second, throwaway one.
+                let eventID = draft.id ?? UUID()
                 events.append(
                     CalendarEvent(
                         id: eventID,
@@ -81,7 +90,7 @@ final class BetterCalendarStore {
                         title: trimmedTitle,
                         startDate: draft.startDate,
                         endDate: normalizedEndDate(for: draft),
-                        isAllDay: draft.isAllDay,
+                        timeType: resolvedTimeType,
                         timeZoneIdentifier: draft.timeZoneIdentifier,
                         location: draft.location.nilIfBlank,
                         urlString: draft.urlString.nilIfBlank,
@@ -90,13 +99,33 @@ final class BetterCalendarStore {
                         recurrence: recurrence,
                         providerMetadata: ProviderMetadata.local,
                         createdAt: now,
-                        updatedAt: now
+                        updatedAt: now,
+                        recurrenceMasterID: draft.recurrenceMasterID,
+                        recurrenceOriginalStart: draft.recurrenceOriginalStart
                     )
                 )
                 recordMutation(objectID: eventID, objectType: .event, operation: .create)
+
+                if let masterID = draft.recurrenceMasterID, let originalStart = draft.recurrenceOriginalStart,
+                   let masterEvent = events.first(where: { $0.id == masterID }) {
+                    recurrenceExceptions.append(
+                        RecurrenceException(
+                            id: UUID(),
+                            masterEventID: masterID,
+                            originalOccurrenceStart: masterEvent.isAllDay ? nil : originalStart,
+                            originalOccurrenceLocalDate: masterEvent.isAllDay ? masterEvent.localDateString(for: originalStart) : nil,
+                            exceptionType: .modified,
+                            replacementEventID: eventID
+                        )
+                    )
+                }
             }
 
             sortEvents()
+        }
+
+        if didSave {
+            PrivacyLog.track(.eventSaved)
         }
 
         if didSave && !reminders.isEmpty {
@@ -129,8 +158,76 @@ final class BetterCalendarStore {
             }
         }
         if didDelete {
+            PrivacyLog.track(.eventDeleted)
             notificationScheduler.cancelNotifications(for: [event.id])
         }
+    }
+
+    /// "This Event" delete scope for a recurring occurrence (BC-REC-010, spec 1.11): records a
+    /// `.cancelled` exception so the expander skips just this slot, leaving sibling occurrences
+    /// and the master event untouched. If this occurrence was already individually modified,
+    /// that replacement is removed too — deleting a modified occurrence deletes it outright,
+    /// it doesn't fall back to showing the master's original content.
+    func deleteOccurrence(_ occurrence: CalendarOccurrence) {
+        guard occurrence.isRecurringOccurrence else {
+            deleteEvent(occurrence.event)
+            return
+        }
+
+        let masterEvent = occurrence.event
+        let existingReplacement = existingReplacementEvent(forOccurrenceOf: masterEvent.id, occurrenceStartDate: occurrence.occurrenceStartDate)
+        let exception = RecurrenceException(
+            id: UUID(),
+            masterEventID: masterEvent.id,
+            originalOccurrenceStart: masterEvent.isAllDay ? nil : occurrence.occurrenceStartDate,
+            originalOccurrenceLocalDate: masterEvent.isAllDay ? masterEvent.localDateString(for: occurrence.occurrenceStartDate) : nil,
+            exceptionType: .cancelled,
+            replacementEventID: nil
+        )
+
+        let didDelete = withPersistedMutation {
+            if let existingReplacement {
+                events.removeAll { $0.id == existingReplacement.id }
+            }
+            recurrenceExceptions.append(exception)
+            recordMutation(objectID: masterEvent.id, objectType: .event, operation: .update)
+            undoAction = UndoAction(message: "Deleted this occurrence of \"\(masterEvent.title)\"", actionTitle: "Undo") { [weak self] in
+                self?.withPersistedMutation {
+                    self?.recurrenceExceptions.removeAll { $0.id == exception.id }
+                    if let existingReplacement {
+                        self?.events.append(existingReplacement)
+                        self?.sortEvents()
+                    }
+                }
+            }
+        }
+        if didDelete, let existingReplacement {
+            notificationScheduler.cancelNotifications(for: [existingReplacement.id])
+        }
+    }
+
+    /// The standalone replacement event already recorded for this specific occurrence, if the
+    /// user has previously chosen "This Event" to edit it (BC-REC-010).
+    func existingReplacementEvent(forOccurrenceOf masterID: UUID, occurrenceStartDate: Date) -> CalendarEvent? {
+        events.first { $0.recurrenceMasterID == masterID && $0.recurrenceOriginalStart == occurrenceStartDate }
+    }
+
+    /// Resolves which event a "This Event" edit should open (BC-REC-010, spec 1.11): the
+    /// existing replacement if this occurrence has already been individually modified,
+    /// otherwise a fresh seed built from the occurrence itself. Saving the result through the
+    /// normal `saveEvent(from:)` path either updates that replacement or creates it for the
+    /// first time — see `seedForOccurrenceEdit`.
+    ///
+    /// If `occurrence` isn't part of a live recurring series at all — e.g. it's already a
+    /// standalone replacement event, encountered when re-editing an already-modified
+    /// occurrence via a fresh `visibleOccurrences` lookup — this just returns its own event
+    /// unchanged, so the normal update path in `saveEvent(from:)` applies instead of
+    /// mistakenly seeding a second replacement chained off the first.
+    func eventForEditingOccurrence(_ occurrence: CalendarOccurrence) -> CalendarEvent {
+        guard occurrence.isRecurringOccurrence else { return occurrence.event }
+
+        return existingReplacementEvent(forOccurrenceOf: occurrence.event.id, occurrenceStartDate: occurrence.occurrenceStartDate)
+            ?? occurrence.event.seedForOccurrenceEdit(occurrenceStartDate: occurrence.occurrenceStartDate, occurrenceEndDate: occurrence.occurrenceEndDate)
     }
 
     /// Reconstructs a soft-deleted event from its tombstone's durable snapshot (spec 0.12).
@@ -199,6 +296,19 @@ final class BetterCalendarStore {
                     self.sortEvents()
                 }
             }
+        }
+    }
+
+    /// BC-EVT-020 (spec 1.10 "Move to calendar"): reassigns an event's owning calendar.
+    /// Distinct from `moveEvent`, which changes an event's *time*.
+    @discardableResult
+    func moveEventToCalendar(_ event: CalendarEvent, calendarID: UUID) -> Bool {
+        guard let index = events.firstIndex(where: { $0.id == event.id }), calendarID != event.calendarID else { return false }
+
+        return withPersistedMutation {
+            events[index].calendarID = calendarID
+            events[index].updatedAt = .now
+            recordMutation(objectID: event.id, objectType: .event, operation: .update)
         }
     }
 
@@ -444,7 +554,9 @@ final class BetterCalendarStore {
         let expander = RecurrenceExpander()
 
         return visibleEvents
-            .flatMap { expander.occurrences(of: $0, in: paddedRange) }
+            .flatMap { event in
+                expander.occurrences(of: event, in: paddedRange, exceptions: recurrenceExceptions.filter { $0.masterEventID == event.id })
+            }
             .filter { occurrence in
                 if occurrence.event.isAllDay {
                     return true
@@ -478,23 +590,135 @@ final class BetterCalendarStore {
             }
     }
 
-    func exportICS() -> String {
-        ICSCalendarCodec.export(events: events, calendars: calendars)
+    /// BC-SRCH-001/002 (spec 1.13): full-text search via the FTS5 index (recall) plus
+    /// `SearchFilters` (date range/calendar/timeframe/all-day/recurring), ranked exact title
+    /// match → title prefix → title contains → location → notes → calendar name, with future
+    /// events sorted before past ones on ties. Falls back to an empty result (rather than a
+    /// full in-memory scan) if the index query itself fails — that would mean a corrupt
+    /// database, at which point `lastError` from the surrounding load/save path is the more
+    /// useful signal.
+    func searchEvents(matching query: String, filters: SearchFilters = SearchFilters(), now: Date = .now) -> [CalendarEvent] {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else { return [] }
+
+        // BC-PRIV-001, spec 0.13: the query string itself is never included, only the fact that
+        // a search happened.
+        PrivacyLog.track(.searchPerformed)
+
+        let candidateIDs = (try? repository.searchEventIDs(matching: trimmedQuery)).map(Set.init) ?? []
+        guard !candidateIDs.isEmpty else { return [] }
+
+        // An explicit calendar filter searches that calendar regardless of its visibility
+        // toggle (the user asked for it by name); with no calendar filter, search only the
+        // calendars currently shown, matching what every other view already displays.
+        let scopedEvents = filters.calendarID == nil ? visibleEvents : events
+        let lowercasedQuery = trimmedQuery.lowercased()
+        return scopedEvents
+            .filter { candidateIDs.contains($0.id) && filters.matches($0, now: now) }
+            .sorted { lhs, rhs in
+                let lhsRank = searchRank(for: lhs, query: lowercasedQuery)
+                let rhsRank = searchRank(for: rhs, query: lowercasedQuery)
+                if lhsRank != rhsRank { return lhsRank < rhsRank }
+
+                let lhsFuture = lhs.startDate >= now
+                let rhsFuture = rhs.startDate >= now
+                if lhsFuture != rhsFuture { return lhsFuture }
+                return lhs.startDate < rhs.startDate
+            }
     }
 
-    func importICS(_ text: String) -> ImportSummary {
-        let summary = ICSCalendarCodec.importEvents(from: text, defaultCalendarID: defaultCalendarID)
+    /// Lower is more relevant. Mirrors spec 1.13's ranking order exactly: exact title match,
+    /// title prefix, title contains, location match, notes match, calendar-name match.
+    private func searchRank(for event: CalendarEvent, query: String) -> Int {
+        let title = event.title.lowercased()
+        if title == query { return 0 }
+        if title.hasPrefix(query) { return 1 }
+        if title.contains(query) { return 2 }
+        if let location = event.location?.lowercased(), location.contains(query) { return 3 }
+        if let notes = event.notes?.lowercased(), notes.contains(query) { return 4 }
+        if let calendarName = calendars.first(where: { $0.id == event.calendarID })?.name.lowercased(), calendarName.contains(query) { return 5 }
+        return 6
+    }
+
+    enum ICSExportScope {
+        case singleEvent(UUID)
+        case series(masterEventID: UUID)
+        case dateRange(DateInterval)
+        case calendar(UUID)
+        case all
+    }
+
+    /// BC-ICS-002 (spec 1.19): exports one event, one recurring series (master + its
+    /// exceptions/replacements), a date range, a whole calendar, or everything. Scoping
+    /// filters `events` down to the relevant subset before handing off to the codec, which
+    /// stays scope-agnostic.
+    func exportICS(scope: ICSExportScope = .all) -> String {
+        let scopedEvents: [CalendarEvent]
+        switch scope {
+        case .singleEvent(let eventID):
+            scopedEvents = events.filter { $0.id == eventID }
+        case .series(let masterEventID):
+            let replacementIDs = Set(
+                recurrenceExceptions
+                    .filter { $0.masterEventID == masterEventID }
+                    .compactMap(\.replacementEventID)
+            )
+            scopedEvents = events.filter { $0.id == masterEventID || replacementIDs.contains($0.id) }
+        case .dateRange(let range):
+            scopedEvents = events.filter { $0.intersects(range) }
+        case .calendar(let calendarID):
+            scopedEvents = events.filter { $0.calendarID == calendarID }
+        case .all:
+            scopedEvents = events
+        }
+
+        let scopedIDs = Set(scopedEvents.map(\.id))
+        let scopedExceptions = recurrenceExceptions.filter { scopedIDs.contains($0.masterEventID) }
+        return ICSCalendarCodec.export(events: scopedEvents, calendars: calendars, recurrenceExceptions: scopedExceptions)
+    }
+
+    /// BC-ICS-001 (spec 1.18): parses without persisting, so the caller can show an import
+    /// preview (imported/skipped/failed counts, destination-calendar picker) before committing.
+    func previewImportICS(_ text: String) -> ImportSummary {
+        ICSCalendarCodec.importEvents(from: text, defaultCalendarID: defaultCalendarID)
+    }
+
+    /// Commits a previously-parsed import in one transaction (spec 1.18/1.22), reassigning
+    /// every imported event to `destinationCalendarID` when given. Duplicate detection is
+    /// UID-based when the imported event carries one (RFC 5545 UID →
+    /// `providerMetadata.providerObjectID`), falling back to title+start-date matching when it
+    /// doesn't. A duplicate master's replacements/exceptions are skipped along with it, since
+    /// they'd otherwise reference a master id that was never created.
+    @discardableResult
+    func commitImport(_ summary: ImportSummary, destinationCalendarID: UUID? = nil) -> ImportSummary {
         guard !summary.events.isEmpty else { return summary }
 
-        let duplicateCount = summary.events.filter { event in
-            events.contains { $0.title == event.title && $0.startDate == event.startDate }
-        }.count
-        let newEvents = summary.events.filter { event in
-            !events.contains { $0.title == event.title && $0.startDate == event.startDate }
+        func isDuplicate(_ event: CalendarEvent) -> Bool {
+            if let uid = event.providerMetadata.providerObjectID {
+                return events.contains { $0.providerMetadata.providerObjectID == uid }
+            }
+            return events.contains { $0.title == event.title && $0.startDate == event.startDate }
+        }
+
+        let masterEvents = summary.events.filter { $0.recurrenceMasterID == nil }
+        let replacementEvents = summary.events.filter { $0.recurrenceMasterID != nil }
+        let duplicateMasterIDs = Set(masterEvents.filter(isDuplicate).map(\.id))
+
+        let newMasters = masterEvents.filter { !duplicateMasterIDs.contains($0.id) }
+        let newReplacements = replacementEvents.filter { !duplicateMasterIDs.contains($0.recurrenceMasterID ?? $0.id) }
+        let newExceptions = summary.recurrenceExceptions.filter { !duplicateMasterIDs.contains($0.masterEventID) }
+        let skippedCount = summary.skippedCount + duplicateMasterIDs.count
+
+        var newEvents = newMasters + newReplacements
+        if let destinationCalendarID {
+            for index in newEvents.indices {
+                newEvents[index].calendarID = destinationCalendarID
+            }
         }
 
         guard !newEvents.isEmpty else {
-            return ImportSummary(importedCount: 0, skippedCount: summary.skippedCount + duplicateCount, failedCount: summary.failedCount, events: [])
+            PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount)")
+            return ImportSummary(importedCount: 0, skippedCount: skippedCount, failedCount: summary.failedCount, events: [])
         }
 
         let didSave = withPersistedMutation {
@@ -502,14 +726,24 @@ final class BetterCalendarStore {
                 events.append(event)
                 recordMutation(objectID: event.id, objectType: .event, operation: .create)
             }
+            recurrenceExceptions.append(contentsOf: newExceptions)
             sortEvents()
         }
 
         if didSave {
-            return ImportSummary(importedCount: newEvents.count, skippedCount: summary.skippedCount + duplicateCount, failedCount: summary.failedCount, events: newEvents)
+            PrivacyLog.track(.icsImportResult, metadata: "imported=\(newEvents.count) skipped=\(skippedCount) failed=\(summary.failedCount)")
+            return ImportSummary(importedCount: newEvents.count, skippedCount: skippedCount, failedCount: summary.failedCount, events: newEvents, recurrenceExceptions: newExceptions)
         }
 
-        return ImportSummary(importedCount: 0, skippedCount: summary.skippedCount + duplicateCount, failedCount: summary.failedCount + newEvents.count, events: [])
+        PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount + newEvents.count)")
+        return ImportSummary(importedCount: 0, skippedCount: skippedCount, failedCount: summary.failedCount + newEvents.count, events: [])
+    }
+
+    /// Convenience for the paste-text flow: parses and commits in one call, keeping the
+    /// existing `store.importICS(text)` call sites and tests working unchanged.
+    @discardableResult
+    func importICS(_ text: String) -> ImportSummary {
+        commitImport(previewImportICS(text))
     }
 
     @discardableResult
@@ -608,7 +842,8 @@ final class BetterCalendarStore {
             events: events,
             pendingMutations: pendingMutations,
             deletedEventTombstones: deletedEventTombstones,
-            settings: settings
+            settings: settings,
+            recurrenceExceptions: recurrenceExceptions
         )
     }
 
@@ -618,6 +853,7 @@ final class BetterCalendarStore {
         pendingMutations = database.pendingMutations
         deletedEventTombstones = database.deletedEventTombstones
         settings = database.settings
+        recurrenceExceptions = database.recurrenceExceptions
     }
 
     private func persist() -> Bool {
@@ -633,7 +869,7 @@ final class BetterCalendarStore {
     }
 
     private func reconcileNotifications(authorizationRequestPolicy: NotificationAuthorizationRequestPolicy = .never) {
-        notificationScheduler.reconcile(events: events, calendars: calendars, now: .now, authorizationRequestPolicy: authorizationRequestPolicy, allDayAlertHour: settings.allDayReminderHour)
+        notificationScheduler.reconcile(events: events, calendars: calendars, now: .now, authorizationRequestPolicy: authorizationRequestPolicy, allDayAlertHour: settings.allDayReminderHour, recurrenceExceptions: recurrenceExceptions)
     }
 }
 
@@ -646,6 +882,11 @@ struct UndoAction {
 protocol LocalCalendarRepository {
     func load() throws -> LocalCalendarDatabase
     func save(_ database: LocalCalendarDatabase) throws
+    /// BC-SRCH-001 (spec 1.13): candidate event IDs matching `query`, found via an indexed
+    /// query rather than loading every event into memory to substring-scan it. No ranking
+    /// guarantee beyond "these matched" — the caller (the store, which already holds every
+    /// event's full data in memory) applies the exact tie-breaking rules spec 1.13 lists.
+    func searchEventIDs(matching query: String) throws -> [UUID]
 }
 
 struct JSONCalendarRepository: LocalCalendarRepository {
@@ -673,6 +914,26 @@ struct JSONCalendarRepository: LocalCalendarRepository {
             try preserveUnreadableFile(at: fileURL)
             throw error
         }
+    }
+
+    /// No FTS index in the flat-file repository — falls back to a plain substring scan over
+    /// the (already fully in-memory, by this repository's own design) loaded database. Covers
+    /// the same fields as the SQLite FTS5 index (title/notes/location/calendar name/URL host)
+    /// so ranking behaves identically regardless of which repository is behind the store.
+    func searchEventIDs(matching query: String) throws -> [UUID] {
+        let database = try load()
+        let lowercasedQuery = query.lowercased()
+        let calendarNamesByID = Dictionary(uniqueKeysWithValues: database.calendars.map { ($0.id, $0.name) })
+
+        return database.events
+            .filter { event in
+                event.title.lowercased().contains(lowercasedQuery)
+                    || (event.notes?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (event.location?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (calendarNamesByID[event.calendarID]?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (event.urlString.flatMap { URL(string: $0)?.host }?.lowercased().contains(lowercasedQuery) ?? false)
+            }
+            .map(\.id)
     }
 
     func save(_ database: LocalCalendarDatabase) throws {
@@ -708,7 +969,8 @@ struct JSONCalendarRepository: LocalCalendarRepository {
             events: database.events,
             pendingMutations: database.pendingMutations,
             deletedEventTombstones: database.deletedEventTombstones,
-            settings: database.settings
+            settings: database.settings,
+            recurrenceExceptions: database.recurrenceExceptions
         )
     }
 
@@ -764,6 +1026,7 @@ struct ImportSummary: Equatable {
     var skippedCount: Int
     var failedCount: Int
     var events: [CalendarEvent]
+    var recurrenceExceptions: [RecurrenceException] = []
 }
 
 extension LocalCalendarDatabase {

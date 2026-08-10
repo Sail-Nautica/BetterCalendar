@@ -235,6 +235,152 @@ final class SQLiteCalendarRepositoryTests: XCTestCase {
         XCTAssertNil(loaded.settings.lastSelectedDate)
     }
 
+    // BC-EVT-020
+    func testAvailabilityRoundTripsThroughSQLite() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        var event = TestData.event()
+        event.availability = .free
+
+        try repository.save(TestData.database(events: [event]))
+        let loaded = try repository.load()
+
+        XCTAssertEqual(loaded.events.first?.availability, .free)
+    }
+
+    // BC-SRCH-001
+    func testSearchEventIDsFindsMatchesAcrossTitleNotesLocationCalendarNameAndURLHost() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let calendar = TestData.calendar(name: "Coursework")
+        let titleMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Calculus Review")
+        let notesMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Study Session", notes: "Bring calculus notes")
+        let locationMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Meeting", location: "Calculus Building")
+        let urlMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Webinar", urlString: "https://calculus.example.com/join")
+        let noMatch = TestData.event(id: UUID(), calendarID: calendar.id, title: "Unrelated")
+
+        try repository.save(TestData.database(calendars: [calendar], events: [titleMatch, notesMatch, locationMatch, urlMatch, noMatch]))
+
+        let matches = Set(try repository.searchEventIDs(matching: "calculus"))
+
+        XCTAssertTrue(matches.contains(titleMatch.id))
+        XCTAssertTrue(matches.contains(notesMatch.id))
+        XCTAssertTrue(matches.contains(locationMatch.id))
+        XCTAssertTrue(matches.contains(urlMatch.id))
+        XCTAssertFalse(matches.contains(noMatch.id))
+    }
+
+    // BC-SRCH-001
+    func testSearchEventIDsMatchesByCalendarName() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let calendar = TestData.calendar(name: "Astronomy")
+        let event = TestData.event(calendarID: calendar.id, title: "Weekly Lecture")
+
+        try repository.save(TestData.database(calendars: [calendar], events: [event]))
+
+        let matches = try repository.searchEventIDs(matching: "astronomy")
+
+        XCTAssertEqual(matches, [event.id])
+    }
+
+    // BC-SRCH-001
+    func testSearchEventIDsReturnsEmptyForBlankQuery() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        try repository.save(TestData.database())
+
+        XCTAssertTrue(try repository.searchEventIDs(matching: "   ").isEmpty)
+    }
+
+    // BC-REC-011
+    func testDaysOfMonthAndSetPositionsRoundTripThroughSQLite() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let event = TestData.event(
+            recurrence: RecurrenceRule(frequency: .monthly, interval: 1, weekdays: [.friday], setPositions: [-1], end: .never)
+        )
+
+        try repository.save(TestData.database(events: [event]))
+        let loaded = try repository.load()
+
+        let loadedRecurrence = try XCTUnwrap(loaded.events.first?.recurrence)
+        XCTAssertEqual(loadedRecurrence.setPositions, [-1])
+        XCTAssertEqual(loadedRecurrence.weekdays, [.friday])
+        XCTAssertEqual(loadedRecurrence.daysOfMonth, [])
+    }
+
+    // BC-REC-010
+    func testRecurrenceExceptionRoundTripsThroughSQLite() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        let master = TestData.event(
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .never)
+        )
+        let replacement = TestData.event(
+            id: UUID(),
+            title: "Standup (moved room)",
+            startDate: TestData.date("2026-09-14T14:00:00Z"),
+            endDate: TestData.date("2026-09-14T14:30:00Z")
+        )
+        let exception = RecurrenceException(
+            id: UUID(),
+            masterEventID: master.id,
+            originalOccurrenceStart: TestData.date("2026-09-14T14:00:00Z"),
+            originalOccurrenceLocalDate: nil,
+            exceptionType: .modified,
+            replacementEventID: replacement.id
+        )
+
+        var database = TestData.database(events: [master, replacement])
+        database.recurrenceExceptions = [exception]
+        try repository.save(database)
+
+        let loaded = try repository.load()
+
+        let loadedException = try XCTUnwrap(loaded.recurrenceExceptions.first)
+        XCTAssertEqual(loadedException.masterEventID, master.id)
+        XCTAssertEqual(loadedException.exceptionType, .modified)
+        XCTAssertEqual(loadedException.replacementEventID, replacement.id)
+        XCTAssertEqual(loadedException.originalOccurrenceStart, TestData.date("2026-09-14T14:00:00Z"))
+    }
+
+    // BC-REC-010
+    func testReplacementEventRecurrenceMasterIDAndOriginalStartRoundTrip() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        // recurrence_master_id is a foreign key onto events(id), so the master must actually
+        // exist in the same save.
+        let master = TestData.event(
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .never)
+        )
+        let originalStart = TestData.date("2026-09-14T14:00:00Z")
+        var replacement = TestData.event(id: UUID(), title: "Standup (moved room)")
+        replacement.recurrenceMasterID = master.id
+        replacement.recurrenceOriginalStart = originalStart
+
+        try repository.save(TestData.database(events: [master, replacement]))
+        let loaded = try repository.load()
+
+        let loadedReplacement = try XCTUnwrap(loaded.events.first { $0.id == replacement.id })
+        XCTAssertEqual(loadedReplacement.recurrenceMasterID, master.id)
+        XCTAssertEqual(loadedReplacement.recurrenceOriginalStart, originalStart)
+    }
+
     // BC-CAL-001
     func testCalendarSortOrderRoundTripsAndReorderPersists() throws {
         let databaseURL = try makeTemporaryDatabaseURL()

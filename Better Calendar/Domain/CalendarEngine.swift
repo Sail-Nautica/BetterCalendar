@@ -83,7 +83,13 @@ struct RecurrenceExpander {
 
     var maximumGeneratedOccurrences = Self.defaultMaximumGeneratedOccurrences
 
-    func occurrences(of event: CalendarEvent, in visibleRange: DateInterval) -> [CalendarOccurrence] {
+    /// - Parameter exceptions: this event's `RecurrenceException`s (BC-REC-010). A cancelled or
+    ///   modified occurrence is skipped here — a modified occurrence's replacement is an
+    ///   ordinary standalone `CalendarEvent` that already flows through the caller's own
+    ///   non-recurring pass, so nothing else needs to happen for it in this function. Exceptions
+    ///   never affect `occurrenceIndex`/COUNT bookkeeping, matching how EXDATE doesn't reduce an
+    ///   RRULE's COUNT in RFC 5545.
+    func occurrences(of event: CalendarEvent, in visibleRange: DateInterval, exceptions: [RecurrenceException] = []) -> [CalendarOccurrence] {
         guard let recurrence = event.recurrence, recurrence.frequency != .never else {
             return event.intersects(visibleRange)
                 ? [CalendarOccurrence(event: event, occurrenceStartDate: event.startDate, occurrenceEndDate: event.endDate, originalStartDate: event.startDate, occurrenceIndex: 0)]
@@ -111,6 +117,10 @@ struct RecurrenceExpander {
                 break
             }
 
+            if exceptions.contains(where: { $0.matches(occurrenceStart: occurrenceStart, event: event) }) {
+                continue
+            }
+
             let occurrence = CalendarOccurrence(
                 event: event,
                 occurrenceStartDate: occurrenceStart,
@@ -136,9 +146,9 @@ struct RecurrenceExpander {
         case .weekly:
             return AnySequence(weeklyDates(startingAt: event.startDate, recurrence: recurrence, calendar: calendar))
         case .monthly:
-            return AnySequence(monthlyDates(startingAt: event.startDate, interval: max(recurrence.interval, 1), calendar: calendar))
+            return AnySequence(monthlyDates(startingAt: event.startDate, recurrence: recurrence, calendar: calendar))
         case .yearly:
-            return AnySequence(yearlyDates(startingAt: event.startDate, interval: max(recurrence.interval, 1), calendar: calendar))
+            return AnySequence(yearlyDates(startingAt: event.startDate, recurrence: recurrence, calendar: calendar))
         }
     }
 
@@ -185,55 +195,137 @@ struct RecurrenceExpander {
         })
     }
 
-    private func monthlyDates(startingAt startDate: Date, interval: Int, calendar: Calendar) -> AnySequence<Date> {
+    /// - Note: when `recurrence.daysOfMonth`/`.setPositions` are both empty (the previous,
+    ///   still-default shape), this produces byte-identical dates to the original single-day
+    ///   implementation — existing persisted rules and tests are unaffected.
+    private func monthlyDates(startingAt startDate: Date, recurrence: RecurrenceRule, calendar: Calendar) -> AnySequence<Date> {
+        let interval = max(recurrence.interval, 1)
         let originalComponents = calendar.dateComponents([.day, .hour, .minute, .second, .nanosecond], from: startDate)
         let day = originalComponents.day ?? 1
         let monthStart = calendar.dateInterval(of: .month, for: startDate)?.start ?? startDate
 
-        return AnySequence(sequence(state: 0) { monthOffset in
-            defer { monthOffset += interval }
-            guard let targetMonthStart = calendar.date(byAdding: .month, value: monthOffset, to: monthStart) else {
-                return nil
-            }
+        return AnySequence(sequence(state: (monthOffset: 0, pending: [Date]())) { state in
+            while true {
+                if !state.pending.isEmpty {
+                    return state.pending.removeFirst()
+                }
 
-            return clampedDate(
-                inMonthContaining: targetMonthStart,
-                day: day,
-                timeComponents: originalComponents,
-                calendar: calendar
-            )
+                guard let targetMonthStart = calendar.date(byAdding: .month, value: state.monthOffset, to: monthStart) else {
+                    return nil
+                }
+                state.monthOffset += interval
+
+                state.pending = datesWithinMonth(
+                    containing: targetMonthStart,
+                    recurrence: recurrence,
+                    fallbackDay: day,
+                    timeComponents: originalComponents,
+                    calendar: calendar
+                )
+            }
         })
     }
 
-    private func yearlyDates(startingAt startDate: Date, interval: Int, calendar: Calendar) -> AnySequence<Date> {
+    /// See `monthlyDates` — same byte-identical-fallback guarantee applies here.
+    private func yearlyDates(startingAt startDate: Date, recurrence: RecurrenceRule, calendar: Calendar) -> AnySequence<Date> {
+        let interval = max(recurrence.interval, 1)
         let originalComponents = calendar.dateComponents([.month, .day, .hour, .minute, .second, .nanosecond], from: startDate)
         let month = originalComponents.month ?? 1
         let day = originalComponents.day ?? 1
         let year = calendar.component(.year, from: startDate)
 
-        return AnySequence(sequence(state: 0) { yearOffset in
-            defer { yearOffset += interval }
+        return AnySequence(sequence(state: (yearOffset: 0, pending: [Date]())) { state in
+            while true {
+                if !state.pending.isEmpty {
+                    return state.pending.removeFirst()
+                }
 
-            var components = DateComponents()
-            components.year = year + yearOffset
-            components.month = month
-            components.day = 1
-            components.hour = originalComponents.hour
-            components.minute = originalComponents.minute
-            components.second = originalComponents.second
-            components.nanosecond = originalComponents.nanosecond
+                var components = DateComponents()
+                components.year = year + state.yearOffset
+                components.month = month
+                components.day = 1
+                components.hour = originalComponents.hour
+                components.minute = originalComponents.minute
+                components.second = originalComponents.second
+                components.nanosecond = originalComponents.nanosecond
+                state.yearOffset += interval
 
-            guard let monthStart = calendar.date(from: components) else {
-                return nil
+                guard let monthStart = calendar.date(from: components) else {
+                    return nil
+                }
+
+                state.pending = datesWithinMonth(
+                    containing: monthStart,
+                    recurrence: recurrence,
+                    fallbackDay: day,
+                    timeComponents: originalComponents,
+                    calendar: calendar
+                )
+            }
+        })
+    }
+
+    /// Every candidate date within the month containing `monthDate`, per the recurrence's
+    /// positional/explicit/single-day configuration — the shared branch used by both
+    /// `monthlyDates` and `yearlyDates` (spec 1.11 custom recurrence: day-of-month and
+    /// "last Friday"-style positional rules, BC-REC-011).
+    private func datesWithinMonth(containing monthDate: Date, recurrence: RecurrenceRule, fallbackDay: Int, timeComponents: DateComponents, calendar: Calendar) -> [Date] {
+        if !recurrence.setPositions.isEmpty, !recurrence.weekdays.isEmpty {
+            return nthWeekdayDates(
+                inMonthContaining: monthDate,
+                weekdays: recurrence.weekdays,
+                setPositions: recurrence.setPositions,
+                timeComponents: timeComponents,
+                calendar: calendar
+            ).sorted()
+        }
+
+        if !recurrence.daysOfMonth.isEmpty {
+            return recurrence.daysOfMonth.sorted().compactMap { dayOfMonth in
+                clampedDate(inMonthContaining: monthDate, day: dayOfMonth, timeComponents: timeComponents, calendar: calendar)
+            }
+        }
+
+        return clampedDate(inMonthContaining: monthDate, day: fallbackDay, timeComponents: timeComponents, calendar: calendar).map { [$0] } ?? []
+    }
+
+    /// Resolves a positional rule ("2nd Tuesday" = `setPositions: [2]`; "last Friday" =
+    /// `setPositions: [-1]`, following the RFC 5545 `BYSETPOS` convention where negative counts
+    /// from the end of the month) against every weekday in `weekdays`, for the month containing
+    /// `monthDate`. A position with no matching date that month (e.g. a "5th Monday" in a month
+    /// with only four) is simply omitted, not clamped.
+    private func nthWeekdayDates(inMonthContaining monthDate: Date, weekdays: Set<Weekday>, setPositions: [Int], timeComponents: DateComponents, calendar: Calendar) -> [Date] {
+        guard let dayRange = calendar.range(of: .day, in: .month, for: monthDate) else { return [] }
+        let monthComponents = calendar.dateComponents([.year, .month], from: monthDate)
+
+        var results: [Date] = []
+        for weekday in weekdays {
+            var matchingDays: [Int] = []
+            for day in dayRange {
+                var components = monthComponents
+                components.day = day
+                guard let date = calendar.date(from: components) else { continue }
+                if calendar.component(.weekday, from: date) == weekday.rawValue {
+                    matchingDays.append(day)
+                }
             }
 
-            return clampedDate(
-                inMonthContaining: monthStart,
-                day: day,
-                timeComponents: originalComponents,
-                calendar: calendar
-            )
-        })
+            for position in setPositions {
+                let index = position > 0 ? position - 1 : matchingDays.count + position
+                guard matchingDays.indices.contains(index) else { continue }
+
+                var components = monthComponents
+                components.day = matchingDays[index]
+                components.hour = timeComponents.hour
+                components.minute = timeComponents.minute
+                components.second = timeComponents.second
+                components.nanosecond = timeComponents.nanosecond
+                if let date = calendar.date(from: components) {
+                    results.append(date)
+                }
+            }
+        }
+        return results
     }
 
     private func clampedDate(inMonthContaining monthDate: Date, day: Int, timeComponents: DateComponents, calendar: Calendar) -> Date? {
@@ -248,6 +340,47 @@ struct RecurrenceExpander {
         components.second = timeComponents.second
         components.nanosecond = timeComponents.nanosecond
         return calendar.date(from: components)
+    }
+}
+
+/// Spec 1.13 search filters (BC-SRCH-002): date range, calendar, past/future, all-day, and
+/// recurring. Every field is independently optional/off by default, so an unfiltered search
+/// (the common case) needs no special-casing at the call site.
+struct SearchFilters: Equatable {
+    enum Timeframe: Equatable {
+        case all
+        case futureOnly
+        case pastOnly
+    }
+
+    var calendarID: UUID?
+    var dateRange: DateInterval?
+    var timeframe: Timeframe = .all
+    var allDayOnly = false
+    var recurringOnly = false
+
+    func matches(_ event: CalendarEvent, now: Date) -> Bool {
+        if let calendarID, event.calendarID != calendarID {
+            return false
+        }
+        if let dateRange, !event.intersects(dateRange) {
+            return false
+        }
+        switch timeframe {
+        case .all:
+            break
+        case .futureOnly:
+            if event.endDate < now { return false }
+        case .pastOnly:
+            if event.endDate >= now { return false }
+        }
+        if allDayOnly, !event.isAllDay {
+            return false
+        }
+        if recurringOnly, event.recurrence == nil {
+            return false
+        }
+        return true
     }
 }
 
@@ -324,6 +457,23 @@ extension CalendarEvent {
         return parts.joined(separator: ", ")
     }
 
+    /// BC-EVT-020 (spec 1.10 "Share as text"): a short, human-readable plain-text summary
+    /// suitable for `ShareLink`/Messages/Mail — never event notes, matching spec 0.13 privacy
+    /// guidance for anything that could leave the device via a general-purpose share sheet.
+    func shareSummaryText(calendarName: String) -> String {
+        var lines = [title, timeRangeText(), calendarName]
+        if let location {
+            lines.append(location)
+        }
+        if let urlString {
+            lines.append(urlString)
+        }
+        if recurrence != nil {
+            lines.append("Repeats")
+        }
+        return lines.joined(separator: "\n")
+    }
+
     /// Start date as it should be displayed in `displayCalendar`'s time zone.
     ///
     /// Floating events re-anchor their stored wall-clock components into the viewing zone, so
@@ -350,6 +500,32 @@ extension CalendarEvent {
         startDate < interval.end && endDate > interval.start
     }
 
+    /// This event's start time as it would read in a different time zone (BC-TZ-001, spec
+    /// 1.17 "dual-time display"). `nil` for all-day/floating events, where a secondary-zone
+    /// reading doesn't apply — an all-day event has no clock time, and a floating event reads
+    /// the same everywhere by definition.
+    func startTime(displayedIn timeZoneIdentifier: String) -> String? {
+        guard timeType == .timed, let zone = TimeZone(identifier: timeZoneIdentifier) else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.timeZone = zone
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter.string(from: startDate)
+    }
+
+    /// This event's own time-of-day combined with a different calendar date — used when
+    /// dragging an event to a different day in week view (BC-VIEW-012, spec 1.7), where only
+    /// the date should change, never the time.
+    func movedPreservingTimeOfDay(to newDate: Date, calendar: Calendar = .current) -> Date {
+        let timeComponents = calendar.dateComponents([.hour, .minute, .second], from: startDate)
+        var targetComponents = calendar.dateComponents([.year, .month, .day], from: newDate)
+        targetComponents.hour = timeComponents.hour
+        targetComponents.minute = timeComponents.minute
+        targetComponents.second = timeComponents.second
+        return calendar.date(from: targetComponents) ?? startDate
+    }
+
     func durationComponents(in calendar: Calendar) -> DateComponents {
         if isAllDay {
             let start = calendar.startOfDay(for: startDate)
@@ -369,6 +545,42 @@ extension CalendarEvent {
         formatter.dateStyle = .medium
         formatter.timeStyle = .none
         return formatter.string(from: date)
+    }
+}
+
+extension RecurrenceException {
+    /// Whether this exception was recorded for the occurrence starting at `occurrenceStart`
+    /// (BC-REC-010). Timed/floating events compare instants at whole-second granularity —
+    /// the date was captured once when the exception was created and is now being compared
+    /// against a freshly regenerated candidate; all-day events compare local calendar dates,
+    /// matching how `CalendarEvent` itself splits instant vs. local-date storage.
+    func matches(occurrenceStart: Date, event: CalendarEvent) -> Bool {
+        if event.isAllDay {
+            guard let originalOccurrenceLocalDate else { return false }
+            return originalOccurrenceLocalDate == event.localDateString(for: occurrenceStart)
+        }
+
+        guard let originalOccurrenceStart else { return false }
+        return abs(originalOccurrenceStart.timeIntervalSince(occurrenceStart)) < 1
+    }
+}
+
+extension CalendarEvent {
+    /// Builds a standalone "seed" event representing a single occurrence of this recurring
+    /// series, ready to be handed to the editor and saved through the normal
+    /// `saveEvent(from:)` path (BC-REC-010, "This Event" edit scope). Saving it either creates
+    /// a new replacement (first edit of this occurrence) or updates the existing one (editing
+    /// an already-modified occurrence again) — `saveEvent` looks the row up by `draft.id`, and
+    /// the seed's freshly-minted id won't match any existing event the first time around.
+    func seedForOccurrenceEdit(occurrenceStartDate: Date, occurrenceEndDate: Date) -> CalendarEvent {
+        var seed = self
+        seed.id = UUID()
+        seed.startDate = occurrenceStartDate
+        seed.endDate = occurrenceEndDate
+        seed.recurrence = nil
+        seed.recurrenceMasterID = id
+        seed.recurrenceOriginalStart = occurrenceStartDate
+        return seed
     }
 }
 

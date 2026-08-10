@@ -11,7 +11,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v005_create_search_index",
         "v006_create_event_extensions",
         "v007_create_sync_and_settings",
-        "v008_add_deletion_snapshot"
+        "v008_add_deletion_snapshot",
+        "v009_extend_search_index",
+        "v010_add_raw_ics_metadata"
     ]
 
     private let fileURLOverride: URL?
@@ -36,7 +38,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 events: try fetchEvents(in: db),
                 pendingMutations: try fetchPendingMutations(in: db),
                 deletedEventTombstones: try fetchDeletedEventTombstones(in: db),
-                settings: try fetchSettings(in: db)
+                settings: try fetchSettings(in: db),
+                recurrenceExceptions: try fetchRecurrenceExceptions(in: db)
             )
         }
     }
@@ -46,6 +49,37 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         try databaseQueue.write { db in
             try replaceDatabase(database, in: db)
         }
+    }
+
+    /// BC-SRCH-001: an indexed FTS5 prefix-per-word query across title/notes/location/calendar
+    /// name/URL host — the recall step. Exact ranking is intentionally left to the caller,
+    /// which already holds full event data in memory and can apply spec 1.13's precise
+    /// tie-breaking rules more directly than translating them into SQL.
+    func searchEventIDs(matching query: String) throws -> [UUID] {
+        let ftsQuery = Self.sanitizedFTSQuery(query)
+        guard !ftsQuery.isEmpty else { return [] }
+
+        let databaseQueue = try openDatabase()
+        return try databaseQueue.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT event_id FROM event_search WHERE event_search MATCH ?",
+                arguments: [ftsQuery]
+            )
+            return rows.compactMap { UUID(uuidString: $0["event_id"]) }
+        }
+    }
+
+    /// Turns free-text user input into an FTS5 query: each whitespace-separated token becomes
+    /// a quoted prefix match, ANDed together by FTS5's default query syntax. Quoting each token
+    /// as a phrase (`"token"*`) sidesteps FTS5's special-character query syntax (`-`, `:`, `(`,
+    /// unbalanced `"`, etc.) — none of it is meant to be available to a calendar search box.
+    static func sanitizedFTSQuery(_ query: String) -> String {
+        query
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .map { "\"\($0.replacingOccurrences(of: "\"", with: "\"\""))\"*" }
+            .joined(separator: " ")
     }
 
     private func openDatabase() throws -> DatabaseQueue {
@@ -283,6 +317,30 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             try db.execute(sql: "ALTER TABLE deleted_objects ADD COLUMN deletion_synced_at TEXT")
         }
 
+        // BC-SRCH-001, spec 1.13: index calendar name and URL host too, in addition to the
+        // original title/notes/location columns. FTS5 virtual tables can't have columns added
+        // in place, so this drops and recreates the (previously unqueried, so no data to lose)
+        // table under the same name.
+        migrator.registerMigration("v009_extend_search_index") { db in
+            try db.execute(sql: "DROP TABLE event_search")
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE event_search USING fts5(
+                    event_id UNINDEXED,
+                    title,
+                    notes,
+                    location_name,
+                    calendar_name,
+                    url_host
+                )
+                """)
+        }
+
+        // BC-ICS-001, spec 1.18: preserve unrecognized ICS properties from import so a later
+        // export is non-destructive.
+        migrator.registerMigration("v010_add_raw_ics_metadata") { db in
+            try db.execute(sql: "ALTER TABLE events ADD COLUMN raw_ics_properties TEXT")
+        }
+
         return migrator
     }
 
@@ -303,9 +361,11 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             try insert(calendar: calendar, in: db)
         }
 
+        let calendarNamesByID = Dictionary(uniqueKeysWithValues: database.calendars.map { ($0.id, $0.name) })
+
         for event in database.events {
             try insert(event: event, in: db)
-            try insertSearchRow(for: event, in: db)
+            try insertSearchRow(for: event, calendarName: calendarNamesByID[event.calendarID], in: db)
 
             for reminder in event.reminders {
                 try insert(reminder: reminder, eventID: event.id, in: db)
@@ -322,6 +382,10 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
         for tombstone in database.deletedEventTombstones {
             try insert(tombstone: tombstone, in: db)
+        }
+
+        for exception in database.recurrenceExceptions {
+            try insert(exception: exception, in: db)
         }
 
         try upsertSettings(database.settings, in: db)
@@ -379,9 +443,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                     event_type, start_instant, end_instant, start_local_date, end_local_date_exclusive,
                     original_timezone_id, availability, status, privacy, color_override,
                     recurrence_master_id, recurrence_original_start, is_recurrence_master,
-                    sync_status, created_at, updated_at, deleted_at
+                    sync_status, created_at, updated_at, deleted_at, raw_ics_properties
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
             arguments: [
                 event.id.uuidString,
@@ -401,17 +465,18 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 startLocalDate,
                 endLocalDateExclusive,
                 event.timeZoneIdentifier,
-                "busy",
+                event.availability.rawValue,
                 "confirmed",
                 "default",
                 nil,
-                nil,
-                nil,
+                event.recurrenceMasterID?.uuidString,
+                event.recurrenceOriginalStart.map(encodeInstant),
                 event.recurrence == nil ? 0 : 1,
                 event.providerMetadata.syncStatus.databaseValue,
                 encodeInstant(event.createdAt),
                 encodeInstant(event.updatedAt),
-                event.providerMetadata.deletedAt.map(encodeInstant)
+                event.providerMetadata.deletedAt.map(encodeInstant),
+                event.providerMetadata.rawICSProperties
             ]
         )
     }
@@ -452,22 +517,32 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 recurrence.frequency.rawValue,
                 max(recurrence.interval, 1),
                 encodeIntegerArray(recurrence.weekdays.sorted().map(\.rawValue)),
-                nil,
+                encodeIntegerArray(recurrence.daysOfMonth.sorted()),
                 nil,
                 Weekday.monday.rawValue,
                 endValues.count,
                 endValues.untilInstant,
                 endValues.untilLocalDate,
-                nil,
+                encodeIntegerArray(recurrence.setPositions.sorted()),
                 nil
             ]
         )
     }
 
-    private func insertSearchRow(for event: CalendarEvent, in db: Database) throws {
+    private func insertSearchRow(for event: CalendarEvent, calendarName: String?, in db: Database) throws {
         try db.execute(
-            sql: "INSERT INTO event_search (event_id, title, notes, location_name) VALUES (?, ?, ?, ?)",
-            arguments: [event.id.uuidString, event.title, event.notes, event.location]
+            sql: """
+                INSERT INTO event_search (event_id, title, notes, location_name, calendar_name, url_host)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+            arguments: [
+                event.id.uuidString,
+                event.title,
+                event.notes,
+                event.location,
+                calendarName,
+                event.urlString.flatMap { URL(string: $0)?.host }
+            ]
         )
     }
 
@@ -502,6 +577,46 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 tombstone.deletionSyncedAt.map(encodeInstant)
             ]
         )
+    }
+
+    private func insert(exception: RecurrenceException, in db: Database) throws {
+        try db.execute(
+            sql: """
+                INSERT INTO event_recurrence_exceptions (
+                    id, master_event_id, original_occurrence_start, original_occurrence_local_date,
+                    exception_type, replacement_event_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+            arguments: [
+                exception.id.uuidString,
+                exception.masterEventID.uuidString,
+                exception.originalOccurrenceStart.map(encodeInstant),
+                exception.originalOccurrenceLocalDate,
+                exception.exceptionType.rawValue,
+                exception.replacementEventID?.uuidString
+            ]
+        )
+    }
+
+    private func fetchRecurrenceExceptions(in db: Database) throws -> [RecurrenceException] {
+        let rows = try Row.fetchAll(db, sql: "SELECT * FROM event_recurrence_exceptions")
+        return rows.compactMap { row in
+            guard let id = UUID(uuidString: row["id"]),
+                  let masterEventID = UUID(uuidString: row["master_event_id"]),
+                  let exceptionType = RecurrenceExceptionType(rawValue: row["exception_type"]) else {
+                return nil
+            }
+
+            return RecurrenceException(
+                id: id,
+                masterEventID: masterEventID,
+                originalOccurrenceStart: decodeInstant(row["original_occurrence_start"]),
+                originalOccurrenceLocalDate: row["original_occurrence_local_date"],
+                exceptionType: exceptionType,
+                replacementEventID: (row["replacement_event_id"] as String?).flatMap(UUID.init(uuidString:))
+            )
+        }
     }
 
     private func fetchCalendars(in db: Database) throws -> [BetterCalendar] {
@@ -589,10 +704,14 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 providerObjectID: row["provider_object_id"],
                 providerVersion: row["provider_version"],
                 syncStatus: SyncStatus(databaseValue: row["sync_status"]),
-                deletedAt: decodeInstant(row["deleted_at"])
+                deletedAt: decodeInstant(row["deleted_at"]),
+                rawICSProperties: row["raw_ics_properties"]
             ),
             createdAt: decodeInstant(row["created_at"]) ?? .now,
-            updatedAt: decodeInstant(row["updated_at"]) ?? .now
+            updatedAt: decodeInstant(row["updated_at"]) ?? .now,
+            availability: EventAvailability(rawValue: row["availability"]) ?? .busy,
+            recurrenceMasterID: (row["recurrence_master_id"] as String?).flatMap(UUID.init(uuidString:)),
+            recurrenceOriginalStart: decodeInstant(row["recurrence_original_start"])
         )
     }
 
@@ -623,6 +742,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
         let weekdayValues = decodeIntegerArray(row["days_of_week"]) ?? []
         let weekdays = Set(weekdayValues.compactMap(Weekday.init(rawValue:)))
+        let daysOfMonth = decodeIntegerArray(row["days_of_month"]) ?? []
+        let setPositions = decodeIntegerArray(row["set_positions"]) ?? []
 
         let end: RecurrenceEnd
         if let count: Int = row["count"] {
@@ -640,6 +761,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             frequency: frequency,
             interval: max(row["interval"] as Int, 1),
             weekdays: weekdays,
+            daysOfMonth: daysOfMonth,
+            setPositions: setPositions,
             end: end
         )
     }

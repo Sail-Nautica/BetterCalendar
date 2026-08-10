@@ -70,6 +70,20 @@ struct SettingsScreen: View {
                     Toggle("Reduce Calendar Animation", isOn: boolBinding(\.reduceCalendarAnimation))
                 }
 
+                Section("Time Zone") {
+                    NavigationLink {
+                        TimeZoneSearchView(selection: secondaryTimeZoneBinding)
+                    } label: {
+                        LabeledContent("Secondary Time Zone", value: store.settings.secondaryTimeZoneIdentifier ?? "None")
+                    }
+
+                    if store.settings.secondaryTimeZoneIdentifier != nil {
+                        Button("Clear Secondary Time Zone", role: .destructive) {
+                            store.updateSettings { $0.secondaryTimeZoneIdentifier = nil }
+                        }
+                    }
+                }
+
                 Section("Notifications") {
                     Stepper(
                         "All-Day Reminder Time: \(formattedHour(store.settings.allDayReminderHour))",
@@ -137,6 +151,13 @@ struct SettingsScreen: View {
                 Text("This permanently deletes every local calendar and event on this device. This cannot be undone.")
             }
         }
+    }
+
+    private var secondaryTimeZoneBinding: Binding<String> {
+        Binding(
+            get: { store.settings.secondaryTimeZoneIdentifier ?? TimeZone.current.identifier },
+            set: { newValue in store.updateSettings { $0.secondaryTimeZoneIdentifier = newValue } }
+        )
     }
 
     private var defaultCalendarBinding: Binding<UUID> {

@@ -229,6 +229,31 @@ final class DomainModelTests: XCTestCase {
         XCTAssertEqual(decoded.settings, .defaultSettings)
     }
 
+    // BC-EVT-020
+    func testShareSummaryTextIncludesTitleTimeCalendarLocationAndRecurrenceButNeverNotes() {
+        var event = TestData.event(
+            title: "Calculus Lecture",
+            location: "Mason Hall",
+            notes: "Private notes that should never be shared",
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .never)
+        )
+        event.urlString = "https://example.com/join"
+
+        let summary = event.shareSummaryText(calendarName: "School")
+
+        XCTAssertTrue(summary.contains("Calculus Lecture"))
+        XCTAssertTrue(summary.contains("School"))
+        XCTAssertTrue(summary.contains("Mason Hall"))
+        XCTAssertTrue(summary.contains("https://example.com/join"))
+        XCTAssertTrue(summary.contains("Repeats"))
+        XCTAssertFalse(summary.contains("Private notes"))
+    }
+
+    // BC-EVT-020
+    func testDefaultAvailabilityIsBusy() {
+        XCTAssertEqual(TestData.event().availability, .busy)
+    }
+
     func testCalendarDatabaseCodableRoundTrips() throws {
         let database = TestData.database(
             events: [
@@ -242,5 +267,24 @@ final class DomainModelTests: XCTestCase {
         let decoded = try JSONDecoder().decode(LocalCalendarDatabase.self, from: data)
 
         XCTAssertEqual(decoded, database)
+    }
+
+    // BC-PRIV-001: spec 0.13's analytics allow-list, verbatim. `AnalyticsEvent` is a closed enum
+    // specifically so this list can only grow via a reviewed code change to the enum itself,
+    // never a free-form string at a call site.
+    func testAnalyticsEventAllowListMatchesSpecExactly() {
+        let specAllowList: Set<String> = [
+            "calendar_view_opened",
+            "event_creation_started",
+            "event_saved",
+            "event_deleted",
+            "search_performed",
+            "notification_permission_result",
+            "ics_import_result",
+        ]
+
+        let implementedEvents = Set(PrivacyLog.AnalyticsEvent.allCases.map(\.rawValue))
+
+        XCTAssertEqual(implementedEvents, specAllowList)
     }
 }
