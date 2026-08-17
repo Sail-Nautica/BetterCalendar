@@ -1,16 +1,28 @@
 import SwiftUI
 
+#if canImport(UIKit)
+import UIKit
+#endif
+
 struct CalendarScreen: View {
     let store: BetterCalendarStore
     @Binding var viewMode: CalendarViewMode
 
-    @State private var selectedDate = Date.now
+    @State private var selectedDate: Date
     @State private var selectedOccurrence: CalendarOccurrence?
     @State private var editingEvent: CalendarEvent?
     @State private var isAddingEvent = false
     @State private var newEventStartDate = Date.now
     @State private var isShowingCalendars = false
     @State private var isChoosingDate = false
+    @State private var isShowingSettings = false
+
+    init(store: BetterCalendarStore, viewMode: Binding<CalendarViewMode>) {
+        self.store = store
+        self._viewMode = viewMode
+        // BC-VIEW-010 (spec 1.2): resume on the last-selected date across relaunch.
+        self._selectedDate = State(initialValue: store.settings.lastSelectedDate ?? .now)
+    }
 
     var body: some View {
         NavigationStack {
@@ -51,7 +63,8 @@ struct CalendarScreen: View {
                         calendars: store.calendars,
                         selectedDate: $selectedDate,
                         onSelect: { selectedOccurrence = $0 },
-                        onCreate: beginAddingEvent
+                        onCreate: beginAddingEvent,
+                        onMove: moveOccurrence
                     )
                 case .month:
                     MonthCalendarView(
@@ -68,6 +81,10 @@ struct CalendarScreen: View {
             .navigationTitle(viewMode.title)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
+                    Button("Settings", systemImage: "gearshape") {
+                        isShowingSettings = true
+                    }
+
                     Button("Calendars", systemImage: "calendar.badge.checkmark") {
                         isShowingCalendars = true
                     }
@@ -86,13 +103,19 @@ struct CalendarScreen: View {
             }
             .sheet(item: $selectedOccurrence) { occurrence in
                 EventDetailsView(
+                    store: store,
                     occurrence: occurrence,
                     calendar: calendar(for: occurrence.event),
                     onEdit: { event in
                         selectedOccurrence = nil
                         editingEvent = event
                     },
+                    onEditOccurrence: { occurrence in
+                        selectedOccurrence = nil
+                        editingEvent = store.eventForEditingOccurrence(occurrence)
+                    },
                     onDelete: store.deleteEvent,
+                    onDeleteOccurrence: store.deleteOccurrence,
                     onDuplicate: { event in
                         store.duplicateEvent(event, startDate: event.startDate)
                     },
@@ -103,8 +126,17 @@ struct CalendarScreen: View {
             .sheet(isPresented: $isShowingCalendars) {
                 CalendarManagerView(store: store)
             }
+            .sheet(isPresented: $isShowingSettings) {
+                SettingsScreen(store: store)
+            }
             .sheet(isPresented: $isChoosingDate) {
                 DatePickerNavigationSheet(selectedDate: $selectedDate, viewMode: viewMode)
+            }
+            .onChange(of: selectedDate) { _, newDate in
+                store.updateLastViewState(date: newDate)
+            }
+            .onAppear {
+                PrivacyLog.track(.calendarViewOpened)
             }
         }
     }
@@ -215,22 +247,6 @@ struct CalendarScreen: View {
     }
 }
 
-enum CalendarViewMode: String, CaseIterable, Identifiable {
-    case day
-    case week
-    case month
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .day: "Day"
-        case .week: "Week"
-        case .month: "Month"
-        }
-    }
-}
-
 private struct DateNavigationStrip: View {
     let selectedDate: Date
     let viewMode: CalendarViewMode
@@ -280,21 +296,39 @@ private struct DayCalendarView: View {
     private let hourHeight: CGFloat = 64
     private let labelWidth: CGFloat = 54
 
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                allDaySection
-                    .padding(.horizontal)
+    // BC-VIEW-012 (spec 1.6 "auto-scroll while dragging near the top or bottom"): rather than
+    // measuring pixel proximity to the viewport edge (which needs coordinate-space plumbing
+    // through every nested card), this keeps the drag's *destination* hour scrolled into view
+    // as it changes — a simpler, more robust way to reach the same "the content follows your
+    // drag" outcome.
+    @State private var lastAutoScrollHour: Int?
 
-                timeline
-                    .padding(.horizontal)
-                    .padding(.bottom, 24)
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    allDaySection
+                        .padding(.horizontal)
+
+                    timeline(scrollProxy: proxy)
+                        .padding(.horizontal)
+                        .padding(.bottom, 24)
+                }
+            }
+            .overlay {
+                if occurrences.isEmpty {
+                    ContentUnavailableView("No events", systemImage: "calendar.badge.plus", description: Text("Tap an hour or use Add Event to plan this day."))
+                }
             }
         }
-        .overlay {
-            if occurrences.isEmpty {
-                ContentUnavailableView("No events", systemImage: "calendar.badge.plus", description: Text("Tap an hour or use Add Event to plan this day."))
-            }
+    }
+
+    private func handleAutoScrollHint(_ estimatedDate: Date, proxy: ScrollViewProxy) {
+        let hour = Calendar.current.component(.hour, from: estimatedDate)
+        guard hour != lastAutoScrollHour else { return }
+        lastAutoScrollHour = hour
+        withAnimation(.easeOut(duration: 0.2)) {
+            proxy.scrollTo("hour-\(hour)", anchor: .center)
         }
     }
 
@@ -339,7 +373,7 @@ private struct DayCalendarView: View {
         }
     }
 
-    private var timeline: some View {
+    private func timeline(scrollProxy: ScrollViewProxy) -> some View {
         ZStack(alignment: .topLeading) {
             timelineGrid
             ForEach(layouts) { layout in
@@ -349,7 +383,8 @@ private struct DayCalendarView: View {
                     hourHeight: hourHeight,
                     onSelect: onSelect,
                     onMove: onMove,
-                    onResize: onResize
+                    onResize: onResize,
+                    onAutoScrollHint: { estimatedDate in handleAutoScrollHint(estimatedDate, proxy: scrollProxy) }
                 )
                 .frame(width: layout.width, height: layout.height)
                 .offset(x: labelWidth + 8 + layout.xOffset, y: layout.yOffset)
@@ -386,6 +421,7 @@ private struct DayCalendarView: View {
                     .accessibilityLabel("Add event at \(hourLabel(hour))")
                 }
                 .frame(height: hourHeight)
+                .id("hour-\(hour)")
             }
         }
     }
@@ -437,6 +473,11 @@ private struct WeekCalendarView: View {
     @Binding var selectedDate: Date
     let onSelect: (CalendarOccurrence) -> Void
     let onCreate: (Date) -> Void
+    /// BC-VIEW-012 (spec 1.7 "drag events between days"): the store's `moveEvent`, called with
+    /// the dragged event and its new start (same time-of-day, new date).
+    let onMove: (CalendarEvent, Date) -> Void
+
+    @State private var dropTargetDay: Date?
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -476,21 +517,47 @@ private struct WeekCalendarView: View {
                                     CompactOccurrenceCard(occurrence: occurrence, calendar: calendar(for: occurrence.event))
                                 }
                                 .buttonStyle(.plain)
+                                .draggable(occurrence.id)
                             }
                         }
                     }
                     .padding(10)
                     .frame(width: 210, alignment: .top)
-                    .background(Calendar.current.isDate(day, inSameDayAs: selectedDate) ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+                    .background(backgroundColor(for: day), in: RoundedRectangle(cornerRadius: 12))
                     .contextMenu {
                         Button("Add Event", systemImage: "plus") {
                             onCreate(defaultStartDate(on: day))
                         }
                     }
+                    .dropDestination(for: String.self) { droppedIDs, _ in
+                        handleDrop(droppedIDs, onto: day)
+                    } isTargeted: { isTargeted in
+                        dropTargetDay = isTargeted ? day : (dropTargetDay == day ? nil : dropTargetDay)
+                    }
                 }
             }
             .padding()
         }
+    }
+
+    private func backgroundColor(for day: Date) -> Color {
+        if dropTargetDay == day {
+            return Color.accentColor.opacity(0.28)
+        }
+        if Calendar.current.isDate(day, inSameDayAs: selectedDate) {
+            return Color.accentColor.opacity(0.12)
+        }
+        return Color.secondary.opacity(0.07)
+    }
+
+    private func handleDrop(_ droppedIDs: [String], onto day: Date) -> Bool {
+        guard let occurrenceID = droppedIDs.first,
+              let occurrence = occurrences.first(where: { $0.id == occurrenceID }) else {
+            return false
+        }
+        let newStartDate = occurrence.event.movedPreservingTimeOfDay(to: day)
+        onMove(occurrence.event, newStartDate)
+        return true
     }
 
     private var days: [Date] {
@@ -723,6 +790,12 @@ private struct TimelineOccurrenceCard: View {
     let onSelect: (CalendarOccurrence) -> Void
     let onMove: (CalendarEvent, Date) -> Void
     let onResize: (CalendarEvent, Date, Date) -> Void
+    /// BC-VIEW-012 (spec 1.6): called with the drag's live estimated destination time so the
+    /// containing scroll view can follow it. Fired from both the move gesture and either
+    /// resize handle.
+    let onAutoScrollHint: (Date) -> Void
+
+    @State private var lastSnappedMinutes: Int?
 
     var body: some View {
         Button {
@@ -777,7 +850,13 @@ private struct TimelineOccurrenceCard: View {
 
     private var moveGesture: some Gesture {
         DragGesture(minimumDistance: 18)
+            .onChanged { value in
+                let minutes = roundedMinutes(forVerticalOffset: value.translation.height)
+                handleSnapFeedback(for: minutes)
+                onAutoScrollHint(occurrence.occurrenceStartDate.addingTimeInterval(TimeInterval(minutes * 60)))
+            }
             .onEnded { value in
+                lastSnappedMinutes = nil
                 let minutes = roundedMinutes(forVerticalOffset: value.translation.height)
                 guard minutes != 0 else { return }
                 onMove(occurrence.event, occurrence.occurrenceStartDate.addingTimeInterval(TimeInterval(minutes * 60)))
@@ -795,7 +874,14 @@ private struct TimelineOccurrenceCard: View {
             }
             .gesture(
                 DragGesture(minimumDistance: 8)
+                    .onChanged { value in
+                        let minutes = roundedMinutes(forVerticalOffset: value.translation.height)
+                        handleSnapFeedback(for: minutes)
+                        let referenceDate = edge == .top ? occurrence.occurrenceStartDate : occurrence.occurrenceEndDate
+                        onAutoScrollHint(referenceDate.addingTimeInterval(TimeInterval(minutes * 60)))
+                    }
                     .onEnded { value in
+                        lastSnappedMinutes = nil
                         let minutes = roundedMinutes(forVerticalOffset: value.translation.height)
                         guard minutes != 0 else { return }
                         if edge == .top {
@@ -809,6 +895,16 @@ private struct TimelineOccurrenceCard: View {
                         }
                     }
             )
+    }
+
+    /// BC-VIEW-012 (spec 1.6 "haptic feedback at 15- or 30-minute boundaries"): fires once per
+    /// newly-reached 15-minute snap increment, not on every pixel of drag movement.
+    private func handleSnapFeedback(for minutes: Int) {
+        guard minutes != lastSnappedMinutes else { return }
+        lastSnappedMinutes = minutes
+        #if canImport(UIKit)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        #endif
     }
 
     private func roundedMinutes(forVerticalOffset offset: CGFloat) -> Int {

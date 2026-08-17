@@ -1,5 +1,5 @@
 import Foundation
-@testable import MyApp
+@testable import Better_Calendar
 
 enum TestData {
     static let calendarID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
@@ -18,7 +18,8 @@ enum TestData {
     static func calendar(
         id: UUID = calendarID,
         name: String = "School",
-        isDefault: Bool = true
+        isDefault: Bool = true,
+        sortOrder: Int = 0
     ) -> BetterCalendar {
         BetterCalendar(
             id: id,
@@ -26,6 +27,7 @@ enum TestData {
             colorName: .betterBlue,
             isVisible: true,
             isDefault: isDefault,
+            sortOrder: sortOrder,
             createdAt: date("2026-09-01T12:00:00Z"),
             updatedAt: date("2026-09-01T12:00:00Z")
         )
@@ -38,7 +40,10 @@ enum TestData {
         startDate: Date = date("2026-09-02T14:00:00Z"),
         endDate: Date = date("2026-09-02T15:00:00Z"),
         isAllDay: Bool = false,
+        timeType: EventTimeType? = nil,
+        timeZoneIdentifier: String = "UTC",
         location: String? = nil,
+        urlString: String? = nil,
         notes: String? = nil,
         recurrence: RecurrenceRule? = nil
     ) -> CalendarEvent {
@@ -48,10 +53,12 @@ enum TestData {
             title: title,
             startDate: startDate,
             endDate: endDate,
-            isAllDay: isAllDay,
-            timeZoneIdentifier: "UTC",
+            // `timeType` wins when supplied; otherwise fall back to the boolean so every
+            // existing call site keeps its previous meaning.
+            timeType: timeType ?? (isAllDay ? .allDay : .timed),
+            timeZoneIdentifier: timeZoneIdentifier,
             location: location,
-            urlString: nil,
+            urlString: urlString,
             notes: notes,
             reminders: [],
             recurrence: recurrence,
@@ -96,6 +103,22 @@ final class StubCalendarRepository: LocalCalendarRepository {
             throw saveError
         }
         savedDatabases.append(database)
+    }
+
+    func searchEventIDs(matching query: String) throws -> [UUID] {
+        let database = try loadResult.get()
+        let lowercasedQuery = query.lowercased()
+        let calendarNamesByID = Dictionary(uniqueKeysWithValues: database.calendars.map { ($0.id, $0.name) })
+
+        return database.events
+            .filter { event in
+                event.title.lowercased().contains(lowercasedQuery)
+                    || (event.notes?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (event.location?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (calendarNamesByID[event.calendarID]?.lowercased().contains(lowercasedQuery) ?? false)
+                    || (event.urlString.flatMap { URL(string: $0)?.host }?.lowercased().contains(lowercasedQuery) ?? false)
+            }
+            .map(\.id)
     }
 }
 

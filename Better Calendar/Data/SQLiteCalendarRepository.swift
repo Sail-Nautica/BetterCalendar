@@ -10,7 +10,10 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v004_create_recurrence",
         "v005_create_search_index",
         "v006_create_event_extensions",
-        "v007_create_sync_and_settings"
+        "v007_create_sync_and_settings",
+        "v008_add_deletion_snapshot",
+        "v009_extend_search_index",
+        "v010_add_raw_ics_metadata"
     ]
 
     private let fileURLOverride: URL?
@@ -34,7 +37,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 calendars: calendars,
                 events: try fetchEvents(in: db),
                 pendingMutations: try fetchPendingMutations(in: db),
-                deletedEventTombstones: try fetchDeletedEventTombstones(in: db)
+                deletedEventTombstones: try fetchDeletedEventTombstones(in: db),
+                settings: try fetchSettings(in: db),
+                recurrenceExceptions: try fetchRecurrenceExceptions(in: db)
             )
         }
     }
@@ -44,6 +49,37 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         try databaseQueue.write { db in
             try replaceDatabase(database, in: db)
         }
+    }
+
+    /// BC-SRCH-001: an indexed FTS5 prefix-per-word query across title/notes/location/calendar
+    /// name/URL host — the recall step. Exact ranking is intentionally left to the caller,
+    /// which already holds full event data in memory and can apply spec 1.13's precise
+    /// tie-breaking rules more directly than translating them into SQL.
+    func searchEventIDs(matching query: String) throws -> [UUID] {
+        let ftsQuery = Self.sanitizedFTSQuery(query)
+        guard !ftsQuery.isEmpty else { return [] }
+
+        let databaseQueue = try openDatabase()
+        return try databaseQueue.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT event_id FROM event_search WHERE event_search MATCH ?",
+                arguments: [ftsQuery]
+            )
+            return rows.compactMap { UUID(uuidString: $0["event_id"]) }
+        }
+    }
+
+    /// Turns free-text user input into an FTS5 query: each whitespace-separated token becomes
+    /// a quoted prefix match, ANDed together by FTS5's default query syntax. Quoting each token
+    /// as a phrase (`"token"*`) sidesteps FTS5's special-character query syntax (`-`, `:`, `(`,
+    /// unbalanced `"`, etc.) — none of it is meant to be available to a calendar search box.
+    static func sanitizedFTSQuery(_ query: String) -> String {
+        query
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .map { "\"\($0.replacingOccurrences(of: "\"", with: "\"\""))\"*" }
+            .joined(separator: " ")
     }
 
     private func openDatabase() throws -> DatabaseQueue {
@@ -273,6 +309,38 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             )
         }
 
+        // Spec 0.12: a soft-deleted event must be recoverable even after a force-quit, not
+        // only via the in-memory Undo closure. This stores a full JSON snapshot of the deleted
+        // event alongside its tombstone, plus when the tombstone was last purge-eligible.
+        migrator.registerMigration("v008_add_deletion_snapshot") { db in
+            try db.execute(sql: "ALTER TABLE deleted_objects ADD COLUMN event_snapshot_json TEXT")
+            try db.execute(sql: "ALTER TABLE deleted_objects ADD COLUMN deletion_synced_at TEXT")
+        }
+
+        // BC-SRCH-001, spec 1.13: index calendar name and URL host too, in addition to the
+        // original title/notes/location columns. FTS5 virtual tables can't have columns added
+        // in place, so this drops and recreates the (previously unqueried, so no data to lose)
+        // table under the same name.
+        migrator.registerMigration("v009_extend_search_index") { db in
+            try db.execute(sql: "DROP TABLE event_search")
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE event_search USING fts5(
+                    event_id UNINDEXED,
+                    title,
+                    notes,
+                    location_name,
+                    calendar_name,
+                    url_host
+                )
+                """)
+        }
+
+        // BC-ICS-001, spec 1.18: preserve unrecognized ICS properties from import so a later
+        // export is non-destructive.
+        migrator.registerMigration("v010_add_raw_ics_metadata") { db in
+            try db.execute(sql: "ALTER TABLE events ADD COLUMN raw_ics_properties TEXT")
+        }
+
         return migrator
     }
 
@@ -289,13 +357,15 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         try db.execute(sql: "DELETE FROM events")
         try db.execute(sql: "DELETE FROM calendars")
 
-        for (index, calendar) in database.calendars.enumerated() {
-            try insert(calendar: calendar, sortOrder: index, in: db)
+        for calendar in database.calendars {
+            try insert(calendar: calendar, in: db)
         }
+
+        let calendarNamesByID = Dictionary(uniqueKeysWithValues: database.calendars.map { ($0.id, $0.name) })
 
         for event in database.events {
             try insert(event: event, in: db)
-            try insertSearchRow(for: event, in: db)
+            try insertSearchRow(for: event, calendarName: calendarNamesByID[event.calendarID], in: db)
 
             for reminder in event.reminders {
                 try insert(reminder: reminder, eventID: event.id, in: db)
@@ -314,13 +384,19 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             try insert(tombstone: tombstone, in: db)
         }
 
+        for exception in database.recurrenceExceptions {
+            try insert(exception: exception, in: db)
+        }
+
+        try upsertSettings(database.settings, in: db)
+
         try db.execute(
             sql: "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) VALUES ('schema_version', ?, ?)",
             arguments: [String(Self.migrationIdentifiers.count), encodeInstant(Date())]
         )
     }
 
-    private func insert(calendar: BetterCalendar, sortOrder: Int, in db: Database) throws {
+    private func insert(calendar: BetterCalendar, in db: Database) throws {
         try db.execute(
             sql: """
                 INSERT INTO calendars (
@@ -341,7 +417,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 0,
                 calendar.isDefault.databaseInt,
                 nil,
-                sortOrder,
+                calendar.sortOrder,
                 encodeInstant(calendar.createdAt),
                 encodeInstant(calendar.updatedAt),
                 nil
@@ -351,7 +427,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
     private func insert(event: CalendarEvent, in db: Database) throws {
         let isAllDay = event.isAllDay
-        let eventType = isAllDay ? "allDay" : "timed"
+        // Floating events persist instants exactly like timed events; the schema's compound
+        // CHECK places no column requirements on the floating branch, so no migration is needed.
+        let eventType = event.timeType.rawValue
         let startInstant = isAllDay ? nil : encodeInstant(event.startDate)
         let endInstant = isAllDay ? nil : encodeInstant(event.endDate)
         let startLocalDate = isAllDay ? localDateString(for: event.startDate, timeZoneIdentifier: event.timeZoneIdentifier) : nil
@@ -365,9 +443,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                     event_type, start_instant, end_instant, start_local_date, end_local_date_exclusive,
                     original_timezone_id, availability, status, privacy, color_override,
                     recurrence_master_id, recurrence_original_start, is_recurrence_master,
-                    sync_status, created_at, updated_at, deleted_at
+                    sync_status, created_at, updated_at, deleted_at, raw_ics_properties
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
             arguments: [
                 event.id.uuidString,
@@ -387,17 +465,18 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 startLocalDate,
                 endLocalDateExclusive,
                 event.timeZoneIdentifier,
-                "busy",
+                event.availability.rawValue,
                 "confirmed",
                 "default",
                 nil,
-                nil,
-                nil,
+                event.recurrenceMasterID?.uuidString,
+                event.recurrenceOriginalStart.map(encodeInstant),
                 event.recurrence == nil ? 0 : 1,
                 event.providerMetadata.syncStatus.databaseValue,
                 encodeInstant(event.createdAt),
                 encodeInstant(event.updatedAt),
-                event.providerMetadata.deletedAt.map(encodeInstant)
+                event.providerMetadata.deletedAt.map(encodeInstant),
+                event.providerMetadata.rawICSProperties
             ]
         )
     }
@@ -438,22 +517,32 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 recurrence.frequency.rawValue,
                 max(recurrence.interval, 1),
                 encodeIntegerArray(recurrence.weekdays.sorted().map(\.rawValue)),
-                nil,
+                encodeIntegerArray(recurrence.daysOfMonth.sorted()),
                 nil,
                 Weekday.monday.rawValue,
                 endValues.count,
                 endValues.untilInstant,
                 endValues.untilLocalDate,
-                nil,
+                encodeIntegerArray(recurrence.setPositions.sorted()),
                 nil
             ]
         )
     }
 
-    private func insertSearchRow(for event: CalendarEvent, in db: Database) throws {
+    private func insertSearchRow(for event: CalendarEvent, calendarName: String?, in db: Database) throws {
         try db.execute(
-            sql: "INSERT INTO event_search (event_id, title, notes, location_name) VALUES (?, ?, ?, ?)",
-            arguments: [event.id.uuidString, event.title, event.notes, event.location]
+            sql: """
+                INSERT INTO event_search (event_id, title, notes, location_name, calendar_name, url_host)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+            arguments: [
+                event.id.uuidString,
+                event.title,
+                event.notes,
+                event.location,
+                calendarName,
+                event.urlString.flatMap { URL(string: $0)?.host }
+            ]
         )
     }
 
@@ -472,14 +561,62 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
     private func insert(tombstone: DeletedEventTombstone, in db: Database) throws {
         try db.execute(
-            sql: "INSERT INTO deleted_objects (id, object_id, object_type, title, deleted_at) VALUES (?, ?, 'event', ?, ?)",
+            sql: """
+                INSERT INTO deleted_objects (
+                    id, object_id, object_type, title, deleted_at,
+                    event_snapshot_json, deletion_synced_at
+                )
+                VALUES (?, ?, 'event', ?, ?, ?, ?)
+                """,
             arguments: [
                 tombstone.id.uuidString,
                 tombstone.eventID.uuidString,
                 tombstone.title,
-                encodeInstant(tombstone.deletedAt)
+                encodeInstant(tombstone.deletedAt),
+                tombstone.eventSnapshotJSON,
+                tombstone.deletionSyncedAt.map(encodeInstant)
             ]
         )
+    }
+
+    private func insert(exception: RecurrenceException, in db: Database) throws {
+        try db.execute(
+            sql: """
+                INSERT INTO event_recurrence_exceptions (
+                    id, master_event_id, original_occurrence_start, original_occurrence_local_date,
+                    exception_type, replacement_event_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+            arguments: [
+                exception.id.uuidString,
+                exception.masterEventID.uuidString,
+                exception.originalOccurrenceStart.map(encodeInstant),
+                exception.originalOccurrenceLocalDate,
+                exception.exceptionType.rawValue,
+                exception.replacementEventID?.uuidString
+            ]
+        )
+    }
+
+    private func fetchRecurrenceExceptions(in db: Database) throws -> [RecurrenceException] {
+        let rows = try Row.fetchAll(db, sql: "SELECT * FROM event_recurrence_exceptions")
+        return rows.compactMap { row in
+            guard let id = UUID(uuidString: row["id"]),
+                  let masterEventID = UUID(uuidString: row["master_event_id"]),
+                  let exceptionType = RecurrenceExceptionType(rawValue: row["exception_type"]) else {
+                return nil
+            }
+
+            return RecurrenceException(
+                id: id,
+                masterEventID: masterEventID,
+                originalOccurrenceStart: decodeInstant(row["original_occurrence_start"]),
+                originalOccurrenceLocalDate: row["original_occurrence_local_date"],
+                exceptionType: exceptionType,
+                replacementEventID: (row["replacement_event_id"] as String?).flatMap(UUID.init(uuidString:))
+            )
+        }
     }
 
     private func fetchCalendars(in db: Database) throws -> [BetterCalendar] {
@@ -492,6 +629,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 colorName: CalendarColorName(hexValue: row["color_hex"]) ?? .betterBlue,
                 isVisible: row.boolValue("is_visible"),
                 isDefault: row.boolValue("is_default"),
+                sortOrder: row["sort_order"],
                 createdAt: decodeInstant(row["created_at"]) ?? .now,
                 updatedAt: decodeInstant(row["updated_at"]) ?? .now
             )
@@ -517,7 +655,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         }
 
         let eventType: String = row["event_type"]
-        let isAllDay = eventType == "allDay"
+        let timeType = EventTimeType(rawValue: eventType) ?? .timed
+        let isAllDay = timeType == .allDay
         let timeZoneIdentifier: String = row["original_timezone_id"] ?? TimeZone.current.identifier
         let startDate: Date
         let endDate: Date
@@ -549,7 +688,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             title: row["title"],
             startDate: startDate,
             endDate: endDate,
-            isAllDay: isAllDay,
+            // Constructed with `timeType` rather than the boolean shim: routing through
+            // `isAllDay:` would collapse a stored floating event into a timed one on load.
+            timeType: timeType,
             timeZoneIdentifier: timeZoneIdentifier,
             location: row["location_name"],
             urlString: row["url"],
@@ -563,10 +704,14 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 providerObjectID: row["provider_object_id"],
                 providerVersion: row["provider_version"],
                 syncStatus: SyncStatus(databaseValue: row["sync_status"]),
-                deletedAt: decodeInstant(row["deleted_at"])
+                deletedAt: decodeInstant(row["deleted_at"]),
+                rawICSProperties: row["raw_ics_properties"]
             ),
             createdAt: decodeInstant(row["created_at"]) ?? .now,
-            updatedAt: decodeInstant(row["updated_at"]) ?? .now
+            updatedAt: decodeInstant(row["updated_at"]) ?? .now,
+            availability: EventAvailability(rawValue: row["availability"]) ?? .busy,
+            recurrenceMasterID: (row["recurrence_master_id"] as String?).flatMap(UUID.init(uuidString:)),
+            recurrenceOriginalStart: decodeInstant(row["recurrence_original_start"])
         )
     }
 
@@ -597,6 +742,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
         let weekdayValues = decodeIntegerArray(row["days_of_week"]) ?? []
         let weekdays = Set(weekdayValues.compactMap(Weekday.init(rawValue:)))
+        let daysOfMonth = decodeIntegerArray(row["days_of_month"]) ?? []
+        let setPositions = decodeIntegerArray(row["set_positions"]) ?? []
 
         let end: RecurrenceEnd
         if let count: Int = row["count"] {
@@ -614,6 +761,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             frequency: frequency,
             interval: max(row["interval"] as Int, 1),
             weekdays: weekdays,
+            daysOfMonth: daysOfMonth,
+            setPositions: setPositions,
             end: end
         )
     }
@@ -650,8 +799,127 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 id: id,
                 eventID: eventID,
                 title: row["title"] ?? "Deleted Event",
-                deletedAt: decodeInstant(row["deleted_at"]) ?? .now
+                deletedAt: decodeInstant(row["deleted_at"]) ?? .now,
+                eventSnapshotJSON: row["event_snapshot_json"],
+                deletionSyncedAt: decodeInstant(row["deletion_synced_at"])
             )
+        }
+    }
+
+    /// One `application_settings` row per key (BC-SET-001, spec 1.20). Optional `AppSettings`
+    /// fields simply have no row when unset; `upsertSettings` deletes the row for a key that
+    /// becomes unset rather than ever issuing a blanket `DELETE`, so it never clobbers a
+    /// forward-compatible key this schema doesn't yet model.
+    private enum SettingsKey: String, CaseIterable {
+        case defaultEventDurationMinutes = "default_event_duration_minutes"
+        case defaultReminderOffset = "default_reminder_offset"
+        case firstWeekday = "first_weekday"
+        case showWeekends = "show_weekends"
+        case timeFormat = "time_format"
+        case defaultCalendarView = "default_calendar_view"
+        case allDayReminderHour = "all_day_reminder_hour"
+        case snapIntervalMinutes = "snap_interval_minutes"
+        case appearance = "appearance"
+        case reduceCalendarAnimation = "reduce_calendar_animation"
+        case hasCompletedOnboarding = "has_completed_onboarding"
+        case lastSelectedTab = "last_selected_tab"
+        case lastSelectedDate = "last_selected_date"
+        case secondaryTimeZoneIdentifier = "secondary_time_zone_identifier"
+    }
+
+    private func fetchSettings(in db: Database) throws -> AppSettings {
+        let rows = try Row.fetchAll(db, sql: "SELECT key, value FROM application_settings")
+        var values: [String: String] = [:]
+        for row in rows {
+            values[row["key"]] = row["value"]
+        }
+
+        var settings = AppSettings.defaultSettings
+
+        if let raw = values[SettingsKey.defaultEventDurationMinutes.rawValue], let minutes = Int(raw) {
+            settings.defaultEventDurationMinutes = minutes
+        }
+        if let raw = values[SettingsKey.defaultReminderOffset.rawValue], let seconds = Int(raw) {
+            settings.defaultReminderOffset = ReminderOffset(relativeOffsetSeconds: seconds)
+        }
+        if let raw = values[SettingsKey.firstWeekday.rawValue], let rawValue = Int(raw) {
+            settings.firstWeekday = Weekday(rawValue: rawValue)
+        }
+        if let raw = values[SettingsKey.showWeekends.rawValue] {
+            settings.showWeekends = raw == "1"
+        }
+        if let raw = values[SettingsKey.timeFormat.rawValue], let value = TimeFormatPreference(rawValue: raw) {
+            settings.timeFormat = value
+        }
+        if let raw = values[SettingsKey.defaultCalendarView.rawValue], let value = CalendarViewMode(rawValue: raw) {
+            settings.defaultCalendarView = value
+        }
+        if let raw = values[SettingsKey.allDayReminderHour.rawValue], let hour = Int(raw) {
+            settings.allDayReminderHour = hour
+        }
+        if let raw = values[SettingsKey.snapIntervalMinutes.rawValue], let minutes = Int(raw) {
+            settings.snapIntervalMinutes = minutes
+        }
+        if let raw = values[SettingsKey.appearance.rawValue], let value = AppearancePreference(rawValue: raw) {
+            settings.appearance = value
+        }
+        if let raw = values[SettingsKey.reduceCalendarAnimation.rawValue] {
+            settings.reduceCalendarAnimation = raw == "1"
+        }
+        if let raw = values[SettingsKey.hasCompletedOnboarding.rawValue] {
+            settings.hasCompletedOnboarding = raw == "1"
+        }
+        if let raw = values[SettingsKey.lastSelectedTab.rawValue], let value = BetterCalendarTab(rawValue: raw) {
+            settings.lastSelectedTab = value
+        }
+        if let raw = values[SettingsKey.lastSelectedDate.rawValue] {
+            settings.lastSelectedDate = decodeInstant(raw)
+        }
+        settings.secondaryTimeZoneIdentifier = values[SettingsKey.secondaryTimeZoneIdentifier.rawValue]
+
+        return settings
+    }
+
+    private func upsertSettings(_ settings: AppSettings, in db: Database) throws {
+        var values: [SettingsKey: String] = [
+            .defaultEventDurationMinutes: String(settings.defaultEventDurationMinutes),
+            .showWeekends: settings.showWeekends.databaseInt.description,
+            .timeFormat: settings.timeFormat.rawValue,
+            .defaultCalendarView: settings.defaultCalendarView.rawValue,
+            .allDayReminderHour: String(settings.allDayReminderHour),
+            .snapIntervalMinutes: String(settings.snapIntervalMinutes),
+            .appearance: settings.appearance.rawValue,
+            .reduceCalendarAnimation: settings.reduceCalendarAnimation.databaseInt.description,
+            .hasCompletedOnboarding: settings.hasCompletedOnboarding.databaseInt.description
+        ]
+
+        if let offsetSeconds = settings.defaultReminderOffset?.relativeOffsetSeconds {
+            values[.defaultReminderOffset] = String(offsetSeconds)
+        }
+        if let firstWeekday = settings.firstWeekday {
+            values[.firstWeekday] = String(firstWeekday.rawValue)
+        }
+        if let lastSelectedTab = settings.lastSelectedTab {
+            values[.lastSelectedTab] = lastSelectedTab.rawValue
+        }
+        if let lastSelectedDate = settings.lastSelectedDate {
+            values[.lastSelectedDate] = encodeInstant(lastSelectedDate)
+        }
+        if let secondaryTimeZoneIdentifier = settings.secondaryTimeZoneIdentifier {
+            values[.secondaryTimeZoneIdentifier] = secondaryTimeZoneIdentifier
+        }
+
+        let now = encodeInstant(Date())
+        for (key, value) in values {
+            try db.execute(
+                sql: "INSERT OR REPLACE INTO application_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                arguments: [key.rawValue, value, now]
+            )
+        }
+
+        let presentKeys = Set(values.keys)
+        for key in SettingsKey.allCases where !presentKeys.contains(key) {
+            try db.execute(sql: "DELETE FROM application_settings WHERE key = ?", arguments: [key.rawValue])
         }
     }
 
