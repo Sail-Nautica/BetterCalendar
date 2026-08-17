@@ -6,27 +6,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Better Calendar is a native SwiftUI iPhone app — an offline-first local calendar (Phase 0/1 of the roadmap in `Instructions/`). There is no backend, no account system, and no external calendar sync yet; everything lives in a local GRDB/SQLite database on-device. See `Instructions/roadmap.md` and `Instructions/phase0_phase1_specification.md` for the full product/technical spec this code implements, and `Instructions/ui_ux_design_document.md` for the screen-by-screen UX spec (screen IDs like `CAL-DAY-01` referenced there correspond to the views under `Better Calendar/Features/`).
 
-The Xcode project is titled `Untitled Project.xcodeproj`, but the app/test product names are `MyApp` / `MyAppTests` (this is what `@testable import MyApp` refers to in tests, and what `xcodebuild -scheme` expects) — do not be thrown by the mismatch between folder name (`Better Calendar/`), project file name, and product name.
+Naming is inconsistent across the project and it will trip you up if you assume any one name applies everywhere. The actual values:
+
+| Thing | Name |
+| --- | --- |
+| Project file | `Better Calendar.xcodeproj` |
+| Shared scheme (`-scheme`) | `MyApp` |
+| App target / product | `Better Calendar` → `Better Calendar.app` |
+| Swift module (`@testable import`) | `Better_Calendar` |
+| Test target / bundle (`-only-testing:`) | `MyAppTests` |
+| Test sources | `Tests/MyAppTests/` |
+
+So the scheme is `MyApp`, the tests are in `MyAppTests`, but the module they import is `Better_Calendar` — there is no module named `MyApp`.
 
 ## Commands
 
 This is an Xcode/SwiftPM project; it must be built and tested with `xcodebuild` on macOS (not available in a Linux dev container).
 
+If `xcodebuild` fails with *"requires Xcode, but active developer directory is a command line tools instance"*, `xcode-select` is pointed at the CLI tools rather than an Xcode install. Either fix it once with `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer` (substitute `Xcode-beta.app` if that is what is installed), or prefix individual commands with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
+
 ```bash
 # Build
-xcodebuild -project "Untitled Project.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' build
+xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' build
 
 # Run all tests
-xcodebuild -project "Untitled Project.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' test
+xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' test
 
 # Run a single test class or method
-xcodebuild -project "Untitled Project.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' test \
+xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' test \
   -only-testing:MyAppTests/CalendarEngineTests
-xcodebuild -project "Untitled Project.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' test \
+xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' test \
   -only-testing:MyAppTests/CalendarEngineTests/testWeeklyRecurrenceExpandsSelectedWeekdaysWithinRange
 ```
 
-The single shared scheme is `MyApp`. Tests live in `Tests/MyAppTests/` and depend on `@testable import MyApp`. There is no lint/format tooling configured in the repo.
+The simulator destinations only work if a matching iOS runtime is installed — check with `xcrun simctl list runtimes`, which can come back empty on a fresh or beta-only Xcode install. When it does, swap in `-destination 'platform=macOS,arch=arm64'`: the target supports macOS and the whole suite runs there, which is the fastest way to get a green signal without downloading a runtime. Use `-destination 'generic/platform=iOS Simulator'` to typecheck the iOS build without needing a booted device.
+
+There is no lint/format tooling configured in the repo.
 
 ## Architecture
 
@@ -54,3 +69,4 @@ The codebase follows a strict one-way layering under `Better Calendar/`: **View 
 - Store mutations must go through `withPersistedMutation` (or an equivalent persist-then-rollback-on-failure pattern) — don't mutate `events`/`calendars` arrays directly from a view or bypass the repository.
 - All-day events are compared/stored via local date components, never UTC midnight instants; timed events carry both a UTC instant and the original IANA time zone identifier. Recurrence and date-range tests in `Tests/MyAppTests/RecurrenceRuleTests.swift` and `CalendarEngineTests.swift` encode these rules — check them before changing date/recurrence logic.
 - Notification scheduling happens *after* a store mutation commits and goes through reconciliation (`LocalNotificationPlanner`), not ad hoc schedule/cancel calls.
+- The app is designed for iPhone, but the target's `SUPPORTED_PLATFORMS` includes `macosx`, so every view must still *compile* for macOS. iOS-only SwiftUI API (`fullScreenCover`, `EditButton`, `.tabViewStyle(.page)`, `.navigationBarTitleDisplayMode`, `.textInputAutocapitalization`, `UIImpactFeedbackGenerator`, anything under `UIKit`) has to sit behind `#if canImport(UIKit)` with a macOS fallback where the behaviour matters. A build that is green on the simulator can still be broken on macOS — see the `onboardingCover` helper in `App/AppRootView.swift` for the pattern.
