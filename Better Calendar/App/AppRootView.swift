@@ -74,7 +74,7 @@ struct AppRootView: View {
         .onChange(of: calendarViewMode) { _, newMode in
             store.updateLastViewState(viewMode: newMode)
         }
-        .fullScreenCover(isPresented: $isShowingOnboarding) {
+        .onboardingCover(isPresented: $isShowingOnboarding) {
             OnboardingView(store: store) {
                 isShowingOnboarding = false
             }
@@ -87,6 +87,22 @@ struct AppRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name.NSSystemTimeZoneDidChange)) { _ in
             store.refreshForSystemTimeChange()
         }
+    }
+}
+
+private extension View {
+    /// BC-ONB-001 is specced as a full-screen first-launch cover, but `fullScreenCover`
+    /// is unavailable on macOS — there the equivalent presentation is a modal sheet.
+    @ViewBuilder
+    func onboardingCover<Content: View>(
+        isPresented: Binding<Bool>,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+#if canImport(UIKit)
+        fullScreenCover(isPresented: isPresented, content: content)
+#else
+        sheet(isPresented: isPresented, content: content)
+#endif
     }
 }
 

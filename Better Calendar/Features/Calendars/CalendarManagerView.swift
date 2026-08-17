@@ -73,9 +73,13 @@ struct CalendarManagerView: View {
             }
             .navigationTitle("Calendars")
             .toolbar {
+#if canImport(UIKit)
+                // Puts the list into edit mode so `.onMove` reordering is reachable. macOS has no
+                // `EditButton`/edit mode; there the rows are drag-reorderable directly.
                 ToolbarItem(placement: .cancellationAction) {
                     EditButton()
                 }
+#endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
                         dismiss()

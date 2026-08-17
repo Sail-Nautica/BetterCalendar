@@ -35,7 +35,11 @@ struct OnboardingView: View {
                         .tag(index)
                 }
             }
+#if canImport(UIKit)
+            // Paged/swipeable onboarding; the `.page` style is unavailable on macOS, where the
+            // default tab style still honours the `currentPage` selection driven by the button below.
             .tabViewStyle(.page(indexDisplayMode: .always))
+#endif
 
             Button(currentPage == pages.count - 1 ? "Get Started" : "Next") {
                 if currentPage == pages.count - 1 {
