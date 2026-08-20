@@ -16,12 +16,12 @@ import Foundation
 /// rewrites every row in the calendar to move one event, which spec 2.19's targets do not
 /// allow.
 ///
-/// M1 lands the type and both consumers. The planners that mint non-trivial transactions
-/// (journal entries, event version rows, idempotency keys, retry status) arrive in M2, so
-/// `journalEntries`/`eventVersions` are deliberately absent here: their row types do not
-/// exist yet, and modelling them as empty placeholders would be worse than adding the stored
-/// properties when M2 adds the types. The *tables* they write to are created by M1's
-/// migrations, because schema is M1's job.
+/// M1 landed the type and both consumers with `journalEntries`/`eventVersions` absent, because
+/// the planners that mint non-trivial transactions arrive in M2. M2 adds both arrays here: the
+/// SQLite consumer inserts them (append-only — never updated or deleted) into `change_journal`
+/// and `event_versions`; the in-memory consumer has no journal/version state to update, so it
+/// leaves them as a no-op. That asymmetry is deliberate — `LocalCalendarDatabase` mirrors what
+/// the UI shows, not the durable history a diagnostics screen or a future provider adapter reads.
 struct EngineTransaction: Equatable {
     /// Entity-level inserts, updates and deletes. Order within the array is not significant;
     /// both consumers impose their own dependency ordering (see ``orderedChanges``).
@@ -29,6 +29,15 @@ struct EngineTransaction: Equatable {
 
     /// Outbox rows enqueued by this transaction (spec 2.10).
     var outboxRows: [PendingMutation] = []
+
+    /// Spec 2.8: append-only journal entries produced by this transaction. Every use case in
+    /// `EventMutationUseCases` writes exactly one, even when the transaction touches several
+    /// tables — a "This Event" edit is one journal entry, not one per row.
+    var journalEntries: [ChangeJournalEntry] = []
+
+    /// Spec 2.9: full-snapshot version rows produced by this transaction. Only committed
+    /// updates write one; a create has no prior version to snapshot against.
+    var eventVersions: [EventVersion] = []
 
     /// Tombstones written by this transaction (spec 2.13). Always accompanies the
     /// corresponding `.deleteEvent` in `entityChanges` — that pairing is the whole reason
@@ -48,6 +57,8 @@ struct EngineTransaction: Equatable {
     var isEmpty: Bool {
         entityChanges.isEmpty
             && outboxRows.isEmpty
+            && journalEntries.isEmpty
+            && eventVersions.isEmpty
             && tombstones.isEmpty
             && removedTombstoneIDs.isEmpty
             && settings == nil
@@ -252,6 +263,14 @@ extension LocalCalendarDatabase {
         // Sorting here means an event whose time changed lands in the same position whether
         // the caller re-read from SQLite or applied the transaction in memory.
         result.events.sort { $0.startDate < $1.startDate }
+
+        // Mirrors `SQLiteCalendarRepository.fetchCalendars`'s `ORDER BY sort_order ASC, name
+        // ASC`. Without this, an in-memory `reorderCalendars` upsert would update every
+        // calendar's `sortOrder` field but leave the array itself in its old order, so the
+        // optimistic in-memory state would disagree with what a fresh load produces.
+        result.calendars.sort { lhs, rhs in
+            lhs.sortOrder == rhs.sortOrder ? lhs.name < rhs.name : lhs.sortOrder < rhs.sortOrder
+        }
 
         return result
     }
