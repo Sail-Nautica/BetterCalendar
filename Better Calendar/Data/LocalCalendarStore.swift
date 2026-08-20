@@ -766,9 +766,10 @@ final class BetterCalendarStore {
         pendingMutations.append(PendingMutation(id: UUID(), objectID: objectID, objectType: objectType, operation: operation, createdAt: .now))
     }
 
-    /// Spec 0.12: "retain soft-deleted data for a cleanup period." The spec gives no exact
-    /// number, so 30 days is used as a reasonable, generous recovery window.
-    private static let tombstoneRetentionInterval: TimeInterval = 30 * 24 * 60 * 60
+    /// Spec 0.12/2.13's retention window. Defined in `EngineRetentionPolicy` so the in-memory
+    /// purge below and the `deleted_objects.purge_after` column the repository writes cannot
+    /// disagree about when a tombstone expires.
+    private static let tombstoneRetentionInterval = EngineRetentionPolicy.tombstoneRetentionInterval
 
     private func purgeExpiredTombstones(now: Date = .now) {
         let expirationCutoff = now.addingTimeInterval(-Self.tombstoneRetentionInterval)
@@ -881,7 +882,21 @@ struct UndoAction {
 
 protocol LocalCalendarRepository {
     func load() throws -> LocalCalendarDatabase
+
+    /// Whole-database replacement, for the bulk paths that genuinely rewrite everything:
+    /// seeding, sample data, import commit and "delete all local data". Spec 2.2 takes the
+    /// per-mutation path off this method and onto ``apply(_:)``.
     func save(_ database: LocalCalendarDatabase) throws
+
+    /// Spec 2.2: apply one `EngineTransaction` atomically.
+    ///
+    /// Implementations must be all-or-nothing. That is what makes spec 2.13's "a tombstone is
+    /// written in the same transaction as the delete" a property of the storage layer rather
+    /// than a rule two call sites have to remember. `SQLiteCalendarRepository` does this with
+    /// one GRDB write transaction and per-row upserts; the flat-file and test repositories,
+    /// which rewrite their whole store on every write anyway, get the same guarantee for free
+    /// via `save(database.applying(transaction))`.
+    func apply(_ transaction: EngineTransaction) throws
     /// BC-SRCH-001 (spec 1.13): candidate event IDs matching `query`, found via an indexed
     /// query rather than loading every event into memory to substring-scan it. No ranking
     /// guarantee beyond "these matched" — the caller (the store, which already holds every
@@ -942,6 +957,15 @@ struct JSONCalendarRepository: LocalCalendarRepository {
         try protectExistingFileBeforeOverwrite(at: fileURL)
         let data = try JSONEncoder.calendarEncoder.encode(database)
         try data.write(to: fileURL, options: [.atomic])
+    }
+
+    /// Read–modify–write against the single JSON file. Atomicity comes from the `.atomic`
+    /// write in `save`: the file is replaced wholesale or not at all, so a transaction can
+    /// never be observed half-applied. There is no incremental path to take here — the
+    /// flat-file format has no rows to update in place.
+    func apply(_ transaction: EngineTransaction) throws {
+        guard !transaction.isEmpty else { return }
+        try save(try load().applying(transaction))
     }
 
     private func databaseURL() throws -> URL {
