@@ -4,6 +4,7 @@ struct CalendarManagerView: View {
     let store: BetterCalendarStore
 
     @Environment(\.dismiss) private var dismiss
+    @State private var isEditing = false
     @State private var newCalendarName = ""
     @State private var newCalendarColor: CalendarColorName = .betterBlue
 
@@ -12,26 +13,32 @@ struct CalendarManagerView: View {
             List {
                 Section("Local Calendars") {
                     ForEach(store.calendars) { calendar in
-                        CalendarManagerRow(calendar: calendar, store: store)
+                        CalendarManagerRow(calendar: calendar, store: store, isEditing: isEditing)
                     }
                     .onMove { source, destination in
                         store.reorderCalendars(fromOffsets: source, toOffset: destination)
                     }
                 }
 
-                Section("Add Calendar") {
-                    TextField("Name", text: $newCalendarName)
-                    Picker("Color", selection: $newCalendarColor) {
-                        ForEach(CalendarColorName.allCases) { colorName in
-                            Text(colorName.rawValue).tag(colorName)
+                // Creating, renaming, recolouring, hiding, defaulting and deleting are all edit
+                // affordances, so they sit behind the same Edit toggle that reveals the reorder
+                // handles rather than cluttering the list you are only reading.
+                if isEditing {
+                    Section("Add Calendar") {
+                        TextField("Name", text: $newCalendarName)
+                        Picker("Color", selection: $newCalendarColor) {
+                            ForEach(CalendarColorName.allCases) { colorName in
+                                Text(colorName.rawValue).tag(colorName)
+                            }
                         }
+                        Button("Create Calendar", systemImage: "plus") {
+                            store.addCalendar(named: newCalendarName, colorName: newCalendarColor)
+                            newCalendarName = ""
+                            newCalendarColor = .betterBlue
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(newCalendarName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-                    Button("Create Calendar", systemImage: "plus") {
-                        store.addCalendar(named: newCalendarName, colorName: newCalendarColor)
-                        newCalendarName = ""
-                        newCalendarColor = .betterBlue
-                    }
-                    .disabled(newCalendarName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
 
                 Section("Recently Deleted") {
@@ -55,6 +62,7 @@ struct CalendarManagerView: View {
                                     store.restoreDeletedEvent(tombstone)
                                 }
                                 .font(.footnote)
+                                .buttonStyle(.borderless)
                                 .disabled(tombstone.eventSnapshotJSON == nil)
                             }
                         }
@@ -71,36 +79,46 @@ struct CalendarManagerView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            .calendarListEditMode($isEditing)
             .navigationTitle("Calendars")
             .toolbar {
-#if canImport(UIKit)
-                // Puts the list into edit mode so `.onMove` reordering is reachable. macOS has no
-                // `EditButton`/edit mode; there the rows are drag-reorderable directly.
+                // A plain `Button` rather than `EditButton`, which does not exist on macOS —
+                // that is why the Edit affordance was missing there entirely. Owning the flag
+                // here is also what lets the same toggle gate the per-row controls.
                 ToolbarItem(placement: .cancellationAction) {
-                    EditButton()
+                    Button(isEditing ? "Done" : "Edit") {
+                        withAnimation {
+                            isEditing.toggle()
+                        }
+                    }
+                    .accessibilityLabel(isEditing ? "Finish editing calendars" : "Edit calendars")
                 }
-#endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
                         dismiss()
                     }
+                    .accessibilityLabel("Close calendars")
                 }
             }
         }
+        // Keeps the sheet a stable size across pushes (e.g. Import / Export).
+        .macSheetFrame()
     }
 }
 
 private struct CalendarManagerRow: View {
     let calendar: BetterCalendar
     let store: BetterCalendarStore
+    let isEditing: Bool
 
     @State private var editedName: String
     @State private var editedColor: CalendarColorName
     @State private var showDeleteConfirmation = false
 
-    init(calendar: BetterCalendar, store: BetterCalendarStore) {
+    init(calendar: BetterCalendar, store: BetterCalendarStore, isEditing: Bool) {
         self.calendar = calendar
         self.store = store
+        self.isEditing = isEditing
         _editedName = State(initialValue: calendar.name)
         _editedColor = State(initialValue: calendar.colorName)
     }
@@ -113,49 +131,67 @@ private struct CalendarManagerRow: View {
                     .frame(width: 12, height: 12)
                     .accessibilityHidden(true)
 
-                TextField("Calendar Name", text: $editedName)
-                    .onSubmit(saveEdits)
+                if isEditing {
+                    TextField("Calendar Name", text: $editedName)
+                        .onSubmit(saveEdits)
 
-                Button(calendar.isVisible ? "Hide" : "Show", systemImage: calendar.isVisible ? "eye" : "eye.slash") {
-                    store.toggleCalendarVisibility(calendar)
+                    Button(calendar.isVisible ? "Hide" : "Show", systemImage: calendar.isVisible ? "eye" : "eye.slash") {
+                        store.toggleCalendarVisibility(calendar)
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(calendar.isVisible ? "Hide \(calendar.name)" : "Show \(calendar.name)")
+                } else {
+                    Text(calendar.name)
+
+                    Spacer(minLength: 8)
                 }
-                .labelStyle(.iconOnly)
-                .accessibilityLabel(calendar.isVisible ? "Hide \(calendar.name)" : "Show \(calendar.name)")
             }
 
-            Text(futureEventCountLabel)
+            // Default and hidden stay legible outside edit mode, where their controls are gone.
+            Text(statusLabel)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
-            HStack {
-                Picker("Color", selection: $editedColor) {
-                    ForEach(CalendarColorName.allCases) { colorName in
-                        Text(colorName.rawValue).tag(colorName)
+            if isEditing {
+                HStack {
+                    Picker("Color", selection: $editedColor) {
+                        ForEach(CalendarColorName.allCases) { colorName in
+                            Text(colorName.rawValue).tag(colorName)
+                        }
                     }
-                }
-                .onChange(of: editedColor) { _, _ in saveEdits() }
+                    .onChange(of: editedColor) { _, _ in saveEdits() }
 
-                Spacer()
+                    Spacer()
 
-                if calendar.isDefault {
-                    Label("Default", systemImage: "checkmark.circle.fill")
+                    if !calendar.isDefault {
+                        Button("Set Default") {
+                            store.setDefaultCalendar(calendar)
+                        }
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Button("Set Default") {
-                        store.setDefaultCalendar(calendar)
+                        .buttonStyle(.borderless)
                     }
-                    .font(.footnote)
                 }
-            }
 
-            Button("Delete Calendar", role: .destructive) {
-                showDeleteConfirmation = true
+                Button("Delete Calendar", role: .destructive) {
+                    showDeleteConfirmation = true
+                }
+                .font(.footnote)
+                .buttonStyle(.borderless)
+                .disabled(calendar.isDefault && store.calendars.count == 1)
             }
-            .font(.footnote)
-            .disabled(calendar.isDefault && store.calendars.count == 1)
         }
         .padding(.vertical, 4)
+        .onChange(of: isEditing) { _, editing in
+            // Leaving edit mode takes the text field with it, so commit whatever was typed but
+            // never submitted; entering picks up any change made elsewhere in the meantime.
+            if editing {
+                editedName = calendar.name
+                editedColor = calendar.colorName
+            } else {
+                saveEdits()
+            }
+        }
         .confirmationDialog("Delete \"\(calendar.name)\"?", isPresented: $showDeleteConfirmation) {
             if let replacement = store.calendars.first(where: { $0.id != calendar.id }) {
                 Button("Move Events to \(replacement.name)") {
@@ -171,15 +207,41 @@ private struct CalendarManagerRow: View {
         }
     }
 
-    private var futureEventCountLabel: String {
+    private var statusLabel: String {
         let count = store.futureEventCount(for: calendar)
-        return count == 1 ? "1 upcoming event" : "\(count) upcoming events"
+        var parts = [count == 1 ? "1 upcoming event" : "\(count) upcoming events"]
+        if calendar.isDefault {
+            parts.append("Default")
+        }
+        if !calendar.isVisible {
+            parts.append("Hidden")
+        }
+        return parts.joined(separator: " · ")
     }
 
     private func saveEdits() {
+        let trimmedName = editedName.trimmingCharacters(in: .whitespacesAndNewlines)
         var updated = calendar
-        updated.name = editedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? calendar.name : editedName
+        updated.name = trimmedName.isEmpty ? calendar.name : trimmedName
         updated.colorName = editedColor
+        guard updated.name != calendar.name || updated.colorName != calendar.colorName else { return }
         store.updateCalendar(updated)
+    }
+}
+
+private extension View {
+    /// Drives the list's edit mode from a plain `Bool` so one flag gates both the row controls
+    /// and `.onMove` reordering. macOS has no `EditMode` — rows there reorder by dragging
+    /// without one — so this is a no-op off iOS.
+    @ViewBuilder
+    func calendarListEditMode(_ isEditing: Binding<Bool>) -> some View {
+#if canImport(UIKit)
+        environment(\.editMode, Binding(
+            get: { isEditing.wrappedValue ? EditMode.active : EditMode.inactive },
+            set: { isEditing.wrappedValue = $0.isEditing }
+        ))
+#else
+        self
+#endif
     }
 }
