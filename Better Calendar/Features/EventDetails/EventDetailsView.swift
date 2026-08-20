@@ -227,6 +227,7 @@ struct EventDetailsView: View {
                 }
             }
         }
+        .macSheetFrame()
     }
 
     private func performScopedAction(applyToThisEventOnly: Bool) {

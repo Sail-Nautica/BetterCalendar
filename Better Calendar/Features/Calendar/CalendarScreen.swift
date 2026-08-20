@@ -16,12 +16,17 @@ struct CalendarScreen: View {
     @State private var isShowingCalendars = false
     @State private var isChoosingDate = false
     @State private var isShowingSettings = false
+    /// Bumped every time the user asks to return to today, so the week view can re-align even
+    /// when `selectedDate` itself does not change (tapping Today while already on today).
+    @State private var todayAlignmentToken = 0
 
     init(store: BetterCalendarStore, viewMode: Binding<CalendarViewMode>) {
         self.store = store
         self._viewMode = viewMode
-        // BC-VIEW-010 (spec 1.2): resume on the last-selected date across relaunch.
-        self._selectedDate = State(initialValue: store.settings.lastSelectedDate ?? .now)
+        // The calendar always opens on the current day. `settings.lastSelectedDate` is still
+        // recorded (BC-VIEW-010, spec 1.2) for anything else that wants the last view state,
+        // but it is deliberately not restored here — launching onto a stale date read as a bug.
+        self._selectedDate = State(initialValue: Date.now)
     }
 
     var body: some View {
@@ -42,7 +47,7 @@ struct CalendarScreen: View {
                     title: navigationTitle,
                     onPrevious: { moveSelection(by: -1) },
                     onNext: { moveSelection(by: 1) },
-                    onToday: { selectedDate = .now },
+                    onToday: { goToToday(alignWeekToToday: true) },
                     onChooseDate: { isChoosingDate = true }
                 )
 
@@ -62,6 +67,7 @@ struct CalendarScreen: View {
                         occurrences: visibleWeekOccurrences,
                         calendars: store.calendars,
                         selectedDate: $selectedDate,
+                        todayAlignmentToken: todayAlignmentToken,
                         onSelect: { selectedOccurrence = $0 },
                         onCreate: beginAddingEvent,
                         onMove: moveOccurrence
@@ -131,6 +137,11 @@ struct CalendarScreen: View {
             }
             .sheet(isPresented: $isChoosingDate) {
                 DatePickerNavigationSheet(selectedDate: $selectedDate, viewMode: viewMode)
+            }
+            .onChange(of: viewMode) { _, _ in
+                // Switching between Day/Week/Month always lands on the current day; the week
+                // view keeps its natural leading edge (the start of the week) on a mode switch.
+                goToToday(alignWeekToToday: false)
             }
             .onChange(of: selectedDate) { _, newDate in
                 store.updateLastViewState(date: newDate)
@@ -207,6 +218,16 @@ struct CalendarScreen: View {
 
         if let date = Calendar.current.date(byAdding: component, value: value, to: selectedDate) {
             selectedDate = date
+        }
+    }
+
+    /// Returns the calendar to the current day. `alignWeekToToday` additionally asks the week
+    /// view to scroll today into its leading column — the Today button does, a view-mode switch
+    /// does not.
+    private func goToToday(alignWeekToToday: Bool) {
+        selectedDate = .now
+        if alignWeekToToday {
+            todayAlignmentToken += 1
         }
     }
 
@@ -471,6 +492,10 @@ private struct WeekCalendarView: View {
     let occurrences: [CalendarOccurrence]
     let calendars: [BetterCalendar]
     @Binding var selectedDate: Date
+    /// Changes whenever the Today button is tapped. Each change scrolls today's column to the
+    /// leading edge of the week — a plain `selectedDate` observation would miss the case where
+    /// Today is tapped while today is already the selected date.
+    let todayAlignmentToken: Int
     let onSelect: (CalendarOccurrence) -> Void
     let onCreate: (Date) -> Void
     /// BC-VIEW-012 (spec 1.7 "drag events between days"): the store's `moveEvent`, called with
@@ -480,6 +505,15 @@ private struct WeekCalendarView: View {
     @State private var dropTargetDay: Date?
 
     var body: some View {
+        ScrollViewReader { proxy in
+            weekStrip
+                .onChange(of: todayAlignmentToken) { _, _ in
+                    alignTodayToLeadingEdge(using: proxy)
+                }
+        }
+    }
+
+    private var weekStrip: some View {
         ScrollView(.horizontal) {
             HStack(alignment: .top, spacing: 12) {
                 ForEach(days, id: \.self) { day in
@@ -534,9 +568,23 @@ private struct WeekCalendarView: View {
                     } isTargeted: { isTargeted in
                         dropTargetDay = isTargeted ? day : (dropTargetDay == day ? nil : dropTargetDay)
                     }
+                    .id(day)
                 }
             }
             .padding()
+        }
+    }
+
+    /// Scrolls the week so the current day sits in the leftmost visible column. If today falls
+    /// late in the week the scroll view clamps at its end, which is as far left as today can go.
+    private func alignTodayToLeadingEdge(using proxy: ScrollViewProxy) {
+        guard let today = days.first(where: { Calendar.current.isDateInToday($0) }) else { return }
+        // Tapping Today can switch the visible week and request this scroll in the same update,
+        // so wait for the new columns to be laid out before reaching for one of them.
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(today, anchor: .leading)
+            }
         }
     }
 

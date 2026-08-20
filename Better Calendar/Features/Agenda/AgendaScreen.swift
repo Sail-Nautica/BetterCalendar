@@ -53,12 +53,19 @@ struct AgendaScreen: View {
                 }
                 .listStyle(.plain)
                 .navigationTitle("Agenda")
+                .onAppear {
+                    // The agenda window opens a week into the past, so an un-scrolled list
+                    // lands the user on last week's events. Wait for the rows to lay out, then
+                    // jump — unanimated, so the agenda simply opens on today rather than
+                    // visibly scrolling there.
+                    DispatchQueue.main.async {
+                        scrollToToday(using: proxy, animated: false)
+                    }
+                }
                 .toolbar {
                     ToolbarItemGroup(placement: .primaryAction) {
                         Button("Today", systemImage: "calendar.circle") {
-                            withAnimation {
-                                proxy.scrollTo(todaySectionID, anchor: .top)
-                            }
+                            scrollToToday(using: proxy, animated: true)
                         }
 
                         Button("Add Event", systemImage: "plus") {
@@ -147,8 +154,20 @@ struct AgendaScreen: View {
         groupedSections.last?.occurrences.last?.id
     }
 
-    private var todaySectionID: Date {
-        Calendar.current.startOfDay(for: .now)
+    /// Scrolls the agenda to today. Days without occurrences get no section at all, so the
+    /// target is resolved against the sections that actually exist rather than assuming a
+    /// section keyed to the start of today is on screen.
+    private func scrollToToday(using proxy: ScrollViewProxy, animated: Bool) {
+        let sectionDates = groupedSections.map(\.date)
+        guard let target = AgendaScrollTarget.todayAnchor(in: sectionDates) else { return }
+
+        if animated {
+            withAnimation {
+                proxy.scrollTo(target, anchor: .top)
+            }
+        } else {
+            proxy.scrollTo(target, anchor: .top)
+        }
     }
 
     private func extendFutureHorizonIfNeeded() {
@@ -166,6 +185,21 @@ struct AgendaScreen: View {
 
     private func calendar(for event: CalendarEvent) -> BetterCalendar? {
         store.calendars.first { $0.id == event.calendarID }
+    }
+}
+
+/// Resolves which agenda section a "jump to today" should land on. Split out of the view so the
+/// rule stays testable: the agenda omits days that have no occurrences (spec 1.9), so today
+/// frequently has no section of its own and a naive scroll to `startOfDay(now)` targets an id
+/// that is not in the list — which reads as the Today button doing nothing.
+enum AgendaScrollTarget {
+    /// - Parameter sectionDates: the agenda's section keys (start-of-day), ascending.
+    /// - Returns: today's section if it exists, otherwise the next day that has events; if every
+    ///   section is in the past, the last one, which is the closest the list can get to today.
+    ///   `nil` only when there are no sections at all.
+    static func todayAnchor(in sectionDates: [Date], now: Date = .now, calendar: Calendar = .current) -> Date? {
+        let startOfToday = calendar.startOfDay(for: now)
+        return sectionDates.first { $0 >= startOfToday } ?? sectionDates.last
     }
 }
 
