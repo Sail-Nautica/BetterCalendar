@@ -95,37 +95,46 @@ final class EngineTransactionTests: XCTestCase {
         }
     }
 
-    // MARK: - Spec 2.14: the incremental path must not clobber version counters
+    // MARK: - Spec 2.14: the version counter round-trips through the incremental path
 
-    /// `version_number` belongs to the concurrency logic M2 adds, not to the row being
-    /// written. An upsert that copied it from the incoming value would silently reset every
-    /// event to version 1 on each save and make optimistic concurrency undetectable.
-    func testUpsertPreservesVersionNumber() throws {
+    /// M1 left `version_number` out of the upsert column list entirely, because
+    /// `CalendarEvent`/`BetterCalendar` carried no such field yet. M2 adds the field, and from
+    /// here on the domain value is authoritative: whatever `versionNumber` the caller (in
+    /// practice, `EventMutationUseCases`, which is the only code that increments it) puts on
+    /// the struct is what lands in the column.
+    func testUpsertWritesTheEventsVersionNumberFromTheDomainValue() throws {
         let fixture = try makeSeededRepository()
         let event = fixture.database.events[0]
 
-        try fixture.writeDatabase { db in
-            try db.execute(sql: "UPDATE events SET version_number = 7 WHERE id = ?", arguments: [event.id.uuidString])
-            try db.execute(sql: "UPDATE calendars SET version_number = 4 WHERE id = ?", arguments: [TestData.calendarID.uuidString])
-        }
-
         var edited = event
         edited.title = "Edited after several versions"
-        try fixture.repository.apply(EngineTransaction(entityChanges: [
-            .upsertEvent(edited),
-            .upsertCalendar(TestData.calendar(name: "Edited"))
-        ]))
+        edited.versionNumber = 7
+        try fixture.repository.apply(EngineTransaction(entityChanges: [.upsertEvent(edited)]))
 
         try fixture.readDatabase { db in
             XCTAssertEqual(
                 try Int.fetchOne(db, sql: "SELECT version_number FROM events WHERE id = ?", arguments: [event.id.uuidString]),
                 7,
-                "an upsert must leave the event's local version counter alone"
+                "an upsert writes the version number carried on the domain value"
             )
+        }
+
+        let reloaded = try XCTUnwrap(try fixture.repository.load().events.first { $0.id == event.id })
+        XCTAssertEqual(reloaded.versionNumber, 7)
+    }
+
+    func testUpsertWritesTheCalendarsVersionNumberFromTheDomainValue() throws {
+        let fixture = try makeSeededRepository()
+
+        var edited = TestData.calendar(name: "Edited")
+        edited.versionNumber = 4
+        try fixture.repository.apply(EngineTransaction(entityChanges: [.upsertCalendar(edited)]))
+
+        try fixture.readDatabase { db in
             XCTAssertEqual(
                 try Int.fetchOne(db, sql: "SELECT version_number FROM calendars WHERE id = ?", arguments: [TestData.calendarID.uuidString]),
                 4,
-                "an upsert must leave the calendar's local version counter alone"
+                "an upsert writes the version number carried on the domain value"
             )
         }
     }

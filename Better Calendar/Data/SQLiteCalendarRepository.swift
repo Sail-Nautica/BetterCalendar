@@ -163,6 +163,17 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 }
             }
 
+            // Spec 2.8/2.9: journal entries before the version rows that reference them —
+            // `event_versions.change_journal_entry_id` is an immediate (non-deferred) foreign
+            // key, and `PRAGMA foreign_keys = ON` checks it per statement, not at commit.
+            for entry in transaction.journalEntries {
+                try insert(journalEntry: entry, in: db)
+            }
+
+            for version in transaction.eventVersions {
+                try insert(eventVersion: version, in: db)
+            }
+
             for mutation in transaction.outboxRows {
                 try upsert(mutation: mutation, in: db)
             }
@@ -816,7 +827,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
     private static let calendarColumns = [
         "id", "provider", "provider_account_id", "provider_calendar_id", "name", "color_hex",
         "is_visible", "is_read_only", "is_default", "time_zone_id", "sort_order",
-        "created_at", "updated_at", "deleted_at"
+        "created_at", "updated_at", "deleted_at", "version_number"
     ]
 
     private static let eventColumns = [
@@ -825,22 +836,17 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "event_type", "start_instant", "end_instant", "start_local_date", "end_local_date_exclusive",
         "original_timezone_id", "availability", "status", "privacy", "color_override",
         "recurrence_master_id", "recurrence_original_start", "is_recurrence_master",
-        "sync_status", "created_at", "updated_at", "deleted_at", "raw_ics_properties"
+        "sync_status", "created_at", "updated_at", "deleted_at", "raw_ics_properties", "version_number"
     ]
-
-    /// `version_number` is written by the concurrency logic in M2, never copied from an
-    /// incoming row, so an upsert must leave it alone. Listing it here rather than omitting
-    /// it from `eventColumns` keeps the "these are the columns of this table" list honest.
-    private static let versionPreservedColumns: Set<String> = ["version_number"]
 
     private static func insertSQL(table: String, columns: [String]) -> String {
         let placeholders = Array(repeating: "?", count: columns.count).joined(separator: ", ")
         return "INSERT INTO \(table) (\(columns.joined(separator: ", "))) VALUES (\(placeholders))"
     }
 
-    private static func upsertSQL(table: String, columns: [String], preserving: Set<String> = []) -> String {
+    private static func upsertSQL(table: String, columns: [String]) -> String {
         let assignments = columns
-            .filter { $0 != "id" && !preserving.contains($0) }
+            .filter { $0 != "id" }
             .map { "\($0) = excluded.\($0)" }
             .joined(separator: ", ")
         return "\(insertSQL(table: table, columns: columns)) ON CONFLICT(id) DO UPDATE SET \(assignments)"
@@ -861,7 +867,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             calendar.sortOrder,
             encodeInstant(calendar.createdAt),
             encodeInstant(calendar.updatedAt),
-            nil
+            nil,
+            calendar.versionNumber
         ]
     }
 
@@ -874,7 +881,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
     private func upsert(calendar: BetterCalendar, in db: Database) throws {
         try db.execute(
-            sql: Self.upsertSQL(table: "calendars", columns: Self.calendarColumns, preserving: Self.versionPreservedColumns),
+            sql: Self.upsertSQL(table: "calendars", columns: Self.calendarColumns),
             arguments: calendarArguments(calendar)
         )
     }
@@ -918,7 +925,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             encodeInstant(event.createdAt),
             encodeInstant(event.updatedAt),
             event.providerMetadata.deletedAt.map(encodeInstant),
-            event.providerMetadata.rawICSProperties
+            event.providerMetadata.rawICSProperties,
+            event.versionNumber
         ]
     }
 
@@ -931,7 +939,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
     private func upsert(event: CalendarEvent, in db: Database) throws {
         try db.execute(
-            sql: Self.upsertSQL(table: "events", columns: Self.eventColumns, preserving: Self.versionPreservedColumns),
+            sql: Self.upsertSQL(table: "events", columns: Self.eventColumns),
             arguments: eventArguments(event)
         )
     }
@@ -1014,18 +1022,13 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             mutation.objectType.rawValue,
             mutation.operation.rawValue,
             encodeInstant(mutation.createdAt),
-            nil,
-            // Spec 2.10 requires a key that is stable across retries of the same logical
-            // mutation. `PendingMutation` gains a real stored `idempotencyKey` in M2; until
-            // then the mutation's own primary key supplies one with exactly the properties
-            // the unique index needs — unique per row, and unchanged when a bulk `save`
-            // rewrites the table, which a freshly minted UUID would not be.
-            mutation.id.uuidString,
-            "pending",
-            0,
-            nil,
-            nil,
-            nil
+            mutation.payload,
+            mutation.idempotencyKey.uuidString,
+            mutation.status.rawValue,
+            mutation.attemptCount,
+            mutation.lastAttemptAt.map(encodeInstant),
+            mutation.nextRetryAt.map(encodeInstant),
+            mutation.changeJournalEntryID?.uuidString
         ]
     }
 
@@ -1036,11 +1039,10 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         )
     }
 
-    /// Note for M2: this rewrites `status`, `attempt_count` and the retry timestamps from the
-    /// values above, which today are always the "freshly enqueued" defaults because
-    /// `PendingMutation` carries no retry state yet. Once M2 adds those stored properties the
-    /// retry bookkeeping must come off the model rather than being reset here — otherwise
-    /// re-enqueuing a mutation would silently rewind its attempt count.
+    /// The retry bookkeeping (`status`, `attempt_count`, the retry timestamps) now comes off
+    /// the model, which is what lets the mutation processor (M3) update it in place — a bare
+    /// re-enqueue of the same row no longer rewinds it, because the caller is the one who read
+    /// the current values before writing this one back.
     private func upsert(mutation: PendingMutation, in db: Database) throws {
         try db.execute(
             sql: Self.upsertSQL(table: "pending_mutations", columns: Self.pendingMutationColumns),
@@ -1082,6 +1084,47 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         try db.execute(
             sql: Self.upsertSQL(table: "deleted_objects", columns: Self.tombstoneColumns),
             arguments: tombstoneArguments(tombstone)
+        )
+    }
+
+    private static let changeJournalColumns = [
+        "id", "entity_type", "entity_id", "operation", "field_diff", "source", "occurred_at", "applied_mutation_id"
+    ]
+
+    /// Insert-only: spec 2.8 makes the journal append-only, so there is deliberately no
+    /// `upsert(journalEntry:)` for a use case to reach for by accident.
+    private func insert(journalEntry: ChangeJournalEntry, in db: Database) throws {
+        try db.execute(
+            sql: Self.insertSQL(table: "change_journal", columns: Self.changeJournalColumns),
+            arguments: [
+                journalEntry.id.uuidString,
+                journalEntry.entityType.rawValue,
+                journalEntry.entityID.uuidString,
+                journalEntry.operation.rawValue,
+                journalEntry.fieldDiff,
+                journalEntry.source.rawValue,
+                encodeInstant(journalEntry.occurredAt),
+                journalEntry.appliedMutationID?.uuidString
+            ]
+        )
+    }
+
+    private static let eventVersionColumns = [
+        "id", "event_id", "version_number", "snapshot_json", "created_at", "change_journal_entry_id"
+    ]
+
+    /// Insert-only: spec 2.9 version rows are history, never edited in place.
+    private func insert(eventVersion: EventVersion, in db: Database) throws {
+        try db.execute(
+            sql: Self.insertSQL(table: "event_versions", columns: Self.eventVersionColumns),
+            arguments: [
+                eventVersion.id.uuidString,
+                eventVersion.eventID.uuidString,
+                eventVersion.versionNumber,
+                eventVersion.snapshotJSON,
+                encodeInstant(eventVersion.createdAt),
+                eventVersion.changeJournalEntryID.uuidString
+            ]
         )
     }
 
@@ -1147,7 +1190,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 isDefault: row.boolValue("is_default"),
                 sortOrder: row["sort_order"],
                 createdAt: decodeInstant(row["created_at"]) ?? .now,
-                updatedAt: decodeInstant(row["updated_at"]) ?? .now
+                updatedAt: decodeInstant(row["updated_at"]) ?? .now,
+                versionNumber: row["version_number"] ?? 1
             )
         }
     }
@@ -1227,7 +1271,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             updatedAt: decodeInstant(row["updated_at"]) ?? .now,
             availability: EventAvailability(rawValue: row["availability"]) ?? .busy,
             recurrenceMasterID: (row["recurrence_master_id"] as String?).flatMap(UUID.init(uuidString:)),
-            recurrenceOriginalStart: decodeInstant(row["recurrence_original_start"])
+            recurrenceOriginalStart: decodeInstant(row["recurrence_original_start"]),
+            versionNumber: row["version_number"] ?? 1
         )
     }
 
@@ -1298,7 +1343,14 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 objectID: objectID,
                 objectType: objectType,
                 operation: operation,
-                createdAt: decodeInstant(row["created_at"]) ?? .now
+                createdAt: decodeInstant(row["created_at"]) ?? .now,
+                payload: row["payload"],
+                idempotencyKey: (row["idempotency_key"] as String?).flatMap(UUID.init(uuidString:)) ?? id,
+                status: (row["status"] as String?).flatMap(MutationStatus.init(rawValue:)) ?? .pending,
+                attemptCount: row["attempt_count"] ?? 0,
+                lastAttemptAt: decodeInstant(row["last_attempt_at"]),
+                nextRetryAt: decodeInstant(row["next_retry_at"]),
+                changeJournalEntryID: (row["change_journal_entry_id"] as String?).flatMap(UUID.init(uuidString:))
             )
         }
     }

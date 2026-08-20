@@ -61,68 +61,65 @@ final class BetterCalendarStore {
         // silently drop a `.floating` lock-to-timezone toggle.
         let resolvedTimeType: EventTimeType = draft.isAllDay ? .allDay : (draft.isLockedToTimeZone ? .floating : .timed)
 
-        let didSave = withPersistedMutation {
-            if let eventID = draft.id, let index = events.firstIndex(where: { $0.id == eventID }) {
-                events[index].title = trimmedTitle
-                events[index].calendarID = draft.calendarID
-                events[index].startDate = draft.startDate
-                events[index].endDate = normalizedEndDate(for: draft)
-                events[index].timeType = resolvedTimeType
-                events[index].timeZoneIdentifier = draft.timeZoneIdentifier
-                events[index].location = draft.location.nilIfBlank
-                events[index].urlString = draft.urlString.nilIfBlank
-                events[index].notes = draft.notes.nilIfBlank
-                events[index].reminders = reminders
-                events[index].recurrence = recurrence
-                events[index].providerMetadata.syncStatus = .pendingUpdate
-                events[index].updatedAt = now
-                recordMutation(objectID: eventID, objectType: .event, operation: .update)
-            } else {
-                // A non-nil `draft.id` here means this is a "This Event" occurrence seed
-                // (BC-REC-010) whose id was pre-minted by `seedForOccurrenceEdit` but doesn't
-                // exist in `events` yet — honour it so the new replacement gets a stable id
-                // rather than a second, throwaway one.
-                let eventID = draft.id ?? UUID()
-                events.append(
-                    CalendarEvent(
-                        id: eventID,
-                        calendarID: draft.calendarID,
-                        title: trimmedTitle,
-                        startDate: draft.startDate,
-                        endDate: normalizedEndDate(for: draft),
-                        timeType: resolvedTimeType,
-                        timeZoneIdentifier: draft.timeZoneIdentifier,
-                        location: draft.location.nilIfBlank,
-                        urlString: draft.urlString.nilIfBlank,
-                        notes: draft.notes.nilIfBlank,
-                        reminders: reminders,
-                        recurrence: recurrence,
-                        providerMetadata: ProviderMetadata.local,
-                        createdAt: now,
-                        updatedAt: now,
-                        recurrenceMasterID: draft.recurrenceMasterID,
-                        recurrenceOriginalStart: draft.recurrenceOriginalStart
-                    )
-                )
-                recordMutation(objectID: eventID, objectType: .event, operation: .create)
+        let outcome: EventMutationUseCases.Outcome
+        if let eventID = draft.id, let existing = events.first(where: { $0.id == eventID }) {
+            outcome = EventMutationUseCases.updateEvent(eventID: eventID, expectedVersionNumber: existing.versionNumber, in: engineContext()) { updated in
+                updated.title = trimmedTitle
+                updated.calendarID = draft.calendarID
+                updated.startDate = draft.startDate
+                updated.endDate = self.normalizedEndDate(for: draft)
+                updated.timeType = resolvedTimeType
+                updated.timeZoneIdentifier = draft.timeZoneIdentifier
+                updated.location = draft.location.nilIfBlank
+                updated.urlString = draft.urlString.nilIfBlank
+                updated.notes = draft.notes.nilIfBlank
+                updated.reminders = reminders
+                updated.recurrence = recurrence
+                updated.providerMetadata.syncStatus = .pendingUpdate
+            }
+        } else {
+            // A non-nil `draft.id` here means this is a "This Event" occurrence seed
+            // (BC-REC-010) whose id was pre-minted by `seedForOccurrenceEdit` but doesn't
+            // exist in `events` yet — honour it so the new replacement gets a stable id
+            // rather than a second, throwaway one.
+            let eventID = draft.id ?? UUID()
+            let newEvent = CalendarEvent(
+                id: eventID,
+                calendarID: draft.calendarID,
+                title: trimmedTitle,
+                startDate: draft.startDate,
+                endDate: normalizedEndDate(for: draft),
+                timeType: resolvedTimeType,
+                timeZoneIdentifier: draft.timeZoneIdentifier,
+                location: draft.location.nilIfBlank,
+                urlString: draft.urlString.nilIfBlank,
+                notes: draft.notes.nilIfBlank,
+                reminders: reminders,
+                recurrence: recurrence,
+                providerMetadata: ProviderMetadata.local,
+                createdAt: now,
+                updatedAt: now,
+                recurrenceMasterID: draft.recurrenceMasterID,
+                recurrenceOriginalStart: draft.recurrenceOriginalStart
+            )
 
-                if let masterID = draft.recurrenceMasterID, let originalStart = draft.recurrenceOriginalStart,
-                   let masterEvent = events.first(where: { $0.id == masterID }) {
-                    recurrenceExceptions.append(
-                        RecurrenceException(
-                            id: UUID(),
-                            masterEventID: masterID,
-                            originalOccurrenceStart: masterEvent.isAllDay ? nil : originalStart,
-                            originalOccurrenceLocalDate: masterEvent.isAllDay ? masterEvent.localDateString(for: originalStart) : nil,
-                            exceptionType: .modified,
-                            replacementEventID: eventID
-                        )
-                    )
-                }
+            var exception: RecurrenceException?
+            if let masterID = draft.recurrenceMasterID, let originalStart = draft.recurrenceOriginalStart,
+               let masterEvent = events.first(where: { $0.id == masterID }) {
+                exception = RecurrenceException(
+                    id: UUID(),
+                    masterEventID: masterID,
+                    originalOccurrenceStart: masterEvent.isAllDay ? nil : originalStart,
+                    originalOccurrenceLocalDate: masterEvent.isAllDay ? masterEvent.localDateString(for: originalStart) : nil,
+                    exceptionType: .modified,
+                    replacementEventID: eventID
+                )
             }
 
-            sortEvents()
+            outcome = EventMutationUseCases.createEvent(newEvent, exception: exception, in: engineContext())
         }
+
+        let didSave = perform(outcome)
 
         if didSave {
             PrivacyLog.track(.eventSaved)
@@ -136,30 +133,16 @@ final class BetterCalendarStore {
     }
 
     func deleteEvent(_ event: CalendarEvent) {
-        let didDelete = withPersistedMutation {
-            events.removeAll { $0.id == event.id }
-            deletedEventTombstones.append(
-                DeletedEventTombstone(
-                    id: UUID(),
-                    eventID: event.id,
-                    title: event.title,
-                    deletedAt: .now,
-                    eventSnapshotJSON: event.encodedSnapshotJSON(),
-                    deletionSyncedAt: nil
-                )
-            )
-            recordMutation(objectID: event.id, objectType: .event, operation: .delete)
-            undoAction = UndoAction(message: "Deleted \"\(event.title)\"", actionTitle: "Undo") { [weak self] in
-                self?.withPersistedMutation {
-                    self?.events.append(event)
-                    self?.sortEvents()
-                    self?.deletedEventTombstones.removeAll { $0.eventID == event.id }
-                }
-            }
-        }
-        if didDelete {
-            PrivacyLog.track(.eventDeleted)
-            notificationScheduler.cancelNotifications(for: [event.id])
+        let tombstoneID = UUID()
+        let outcome = EventMutationUseCases.deleteEvent(eventID: event.id, expectedVersionNumber: event.versionNumber, tombstoneID: tombstoneID, in: engineContext())
+        guard perform(outcome) else { return }
+
+        PrivacyLog.track(.eventDeleted)
+        notificationScheduler.cancelNotifications(for: [event.id])
+        undoAction = UndoAction(message: "Deleted \"\(event.title)\"", actionTitle: "Undo") { [weak self] in
+            guard let self else { return }
+            let restoreOutcome = EventMutationUseCases.restoreTombstone(event, tombstoneID: tombstoneID, in: self.engineContext(source: .undo))
+            _ = self.perform(restoreOutcome)
         }
     }
 
@@ -185,24 +168,26 @@ final class BetterCalendarStore {
             replacementEventID: nil
         )
 
-        let didDelete = withPersistedMutation {
-            if let existingReplacement {
-                events.removeAll { $0.id == existingReplacement.id }
-            }
-            recurrenceExceptions.append(exception)
-            recordMutation(objectID: masterEvent.id, objectType: .event, operation: .update)
-            undoAction = UndoAction(message: "Deleted this occurrence of \"\(masterEvent.title)\"", actionTitle: "Undo") { [weak self] in
-                self?.withPersistedMutation {
-                    self?.recurrenceExceptions.removeAll { $0.id == exception.id }
-                    if let existingReplacement {
-                        self?.events.append(existingReplacement)
-                        self?.sortEvents()
-                    }
-                }
-            }
-        }
-        if didDelete, let existingReplacement {
+        let outcome = EventMutationUseCases.cancelOccurrence(
+            masterEventID: masterEvent.id,
+            exception: exception,
+            removingReplacementEventID: existingReplacement?.id,
+            in: engineContext()
+        )
+        guard perform(outcome) else { return }
+
+        if let existingReplacement {
             notificationScheduler.cancelNotifications(for: [existingReplacement.id])
+        }
+        undoAction = UndoAction(message: "Deleted this occurrence of \"\(masterEvent.title)\"", actionTitle: "Undo") { [weak self] in
+            guard let self else { return }
+            let restoreOutcome = EventMutationUseCases.restoreOccurrence(
+                masterEventID: masterEvent.id,
+                exceptionID: exception.id,
+                restoringReplacement: existingReplacement,
+                in: self.engineContext(source: .undo)
+            )
+            _ = self.perform(restoreOutcome)
         }
     }
 
@@ -244,58 +229,39 @@ final class BetterCalendarStore {
             restoredEvent.calendarID = fallbackID
         }
 
-        return withPersistedMutation {
-            events.append(restoredEvent)
-            sortEvents()
-            deletedEventTombstones.removeAll { $0.id == tombstone.id }
-            recordMutation(objectID: restoredEvent.id, objectType: .event, operation: .create)
-        }
+        let outcome = EventMutationUseCases.restoreTombstone(restoredEvent, tombstoneID: tombstone.id, in: engineContext())
+        return perform(outcome)
     }
 
     func moveEvent(_ event: CalendarEvent, to newStartDate: Date) {
-        guard let index = events.firstIndex(where: { $0.id == event.id }) else { return }
-        let originalEvent = events[index]
+        guard let originalEvent = events.first(where: { $0.id == event.id }) else { return }
 
-        withPersistedMutation {
-            guard let index = events.firstIndex(where: { $0.id == event.id }) else { return }
-            events[index].startDate = newStartDate
-            events[index].endDate = newStartDate.addingTimeInterval(max(originalEvent.duration, 15 * 60))
-            events[index].updatedAt = .now
-            events[index].providerMetadata.syncStatus = .pendingUpdate
-            recordMutation(objectID: event.id, objectType: .event, operation: .update)
-            sortEvents()
-            undoAction = UndoAction(message: "Moved \"\(event.title)\"", actionTitle: "Undo") { [weak self] in
-                guard let self else { return }
-                self.withPersistedMutation {
-                    guard let currentIndex = self.events.firstIndex(where: { $0.id == originalEvent.id }) else { return }
-                    self.events[currentIndex] = originalEvent
-                    self.sortEvents()
-                }
+        let outcome = EventMutationUseCases.moveEvent(eventID: event.id, to: newStartDate, expectedVersionNumber: originalEvent.versionNumber, in: engineContext())
+        guard perform(outcome) else { return }
+
+        undoAction = UndoAction(message: "Moved \"\(event.title)\"", actionTitle: "Undo") { [weak self] in
+            guard let self, let current = self.events.first(where: { $0.id == originalEvent.id }) else { return }
+            let restoreOutcome = EventMutationUseCases.updateEvent(eventID: originalEvent.id, expectedVersionNumber: current.versionNumber, in: self.engineContext(source: .undo)) { updated in
+                updated.startDate = originalEvent.startDate
+                updated.endDate = originalEvent.endDate
             }
+            _ = self.perform(restoreOutcome)
         }
     }
 
     func resizeEvent(_ event: CalendarEvent, startDate: Date, endDate: Date) {
-        guard endDate > startDate,
-              let index = events.firstIndex(where: { $0.id == event.id }) else { return }
-        let originalEvent = events[index]
+        guard endDate > startDate, let originalEvent = events.first(where: { $0.id == event.id }) else { return }
 
-        withPersistedMutation {
-            guard let index = events.firstIndex(where: { $0.id == event.id }) else { return }
-            events[index].startDate = startDate
-            events[index].endDate = endDate
-            events[index].updatedAt = .now
-            events[index].providerMetadata.syncStatus = .pendingUpdate
-            recordMutation(objectID: event.id, objectType: .event, operation: .update)
-            sortEvents()
-            undoAction = UndoAction(message: "Resized \"\(event.title)\"", actionTitle: "Undo") { [weak self] in
-                guard let self else { return }
-                self.withPersistedMutation {
-                    guard let currentIndex = self.events.firstIndex(where: { $0.id == originalEvent.id }) else { return }
-                    self.events[currentIndex] = originalEvent
-                    self.sortEvents()
-                }
+        let outcome = EventMutationUseCases.resizeEvent(eventID: event.id, startDate: startDate, endDate: endDate, expectedVersionNumber: originalEvent.versionNumber, in: engineContext())
+        guard perform(outcome) else { return }
+
+        undoAction = UndoAction(message: "Resized \"\(event.title)\"", actionTitle: "Undo") { [weak self] in
+            guard let self, let current = self.events.first(where: { $0.id == originalEvent.id }) else { return }
+            let restoreOutcome = EventMutationUseCases.updateEvent(eventID: originalEvent.id, expectedVersionNumber: current.versionNumber, in: self.engineContext(source: .undo)) { updated in
+                updated.startDate = originalEvent.startDate
+                updated.endDate = originalEvent.endDate
             }
+            _ = self.perform(restoreOutcome)
         }
     }
 
@@ -303,46 +269,21 @@ final class BetterCalendarStore {
     /// Distinct from `moveEvent`, which changes an event's *time*.
     @discardableResult
     func moveEventToCalendar(_ event: CalendarEvent, calendarID: UUID) -> Bool {
-        guard let index = events.firstIndex(where: { $0.id == event.id }), calendarID != event.calendarID else { return false }
+        guard let originalEvent = events.first(where: { $0.id == event.id }), calendarID != event.calendarID else { return false }
 
-        return withPersistedMutation {
-            events[index].calendarID = calendarID
-            events[index].updatedAt = .now
-            recordMutation(objectID: event.id, objectType: .event, operation: .update)
-        }
+        let outcome = EventMutationUseCases.moveEventToCalendar(eventID: event.id, calendarID: calendarID, expectedVersionNumber: originalEvent.versionNumber, in: engineContext())
+        return perform(outcome)
     }
 
     func duplicateEvent(_ event: CalendarEvent, startDate: Date? = nil, includeRecurrence: Bool = false) {
-        let duplicateStartDate = startDate ?? event.startDate
-        let duplicateEndDate = duplicateStartDate.addingTimeInterval(max(event.duration, event.isAllDay ? 24 * 60 * 60 : 15 * 60))
-        let now = Date.now
+        let newEventID = UUID()
+        let outcome = EventMutationUseCases.duplicateEvent(event, newEventID: newEventID, startDate: startDate, includeRecurrence: includeRecurrence, in: engineContext())
+        guard perform(outcome) else { return }
 
-        withPersistedMutation {
-            let duplicate = CalendarEvent(
-                id: UUID(),
-                calendarID: event.calendarID,
-                title: "Copy of \(event.title)",
-                startDate: duplicateStartDate,
-                endDate: duplicateEndDate,
-                isAllDay: event.isAllDay,
-                timeZoneIdentifier: event.timeZoneIdentifier,
-                location: event.location,
-                urlString: event.urlString,
-                notes: event.notes,
-                reminders: event.reminders.map { EventReminder(id: UUID(), offset: $0.offset) },
-                recurrence: includeRecurrence ? event.recurrence : nil,
-                providerMetadata: ProviderMetadata.local,
-                createdAt: now,
-                updatedAt: now
-            )
-            events.append(duplicate)
-            recordMutation(objectID: duplicate.id, objectType: .event, operation: .create)
-            sortEvents()
-            undoAction = UndoAction(message: "Duplicated \"\(event.title)\"", actionTitle: "Undo") { [weak self] in
-                self?.withPersistedMutation {
-                    self?.events.removeAll { $0.id == duplicate.id }
-                }
-            }
+        undoAction = UndoAction(message: "Duplicated \"\(event.title)\"", actionTitle: "Undo") { [weak self] in
+            guard let self, let duplicate = self.events.first(where: { $0.id == newEventID }) else { return }
+            let deleteOutcome = EventMutationUseCases.deleteEvent(eventID: newEventID, expectedVersionNumber: duplicate.versionNumber, in: self.engineContext(source: .undo))
+            _ = self.perform(deleteOutcome)
         }
     }
 
@@ -350,41 +291,47 @@ final class BetterCalendarStore {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
 
-        withPersistedMutation {
-            let calendar = BetterCalendar(
-                id: UUID(),
-                name: trimmedName,
-                colorName: colorName,
-                isVisible: true,
-                isDefault: calendars.isEmpty,
-                sortOrder: calendars.count,
-                createdAt: .now,
-                updatedAt: .now
-            )
-            calendars.append(calendar)
-            recordMutation(objectID: calendar.id, objectType: .calendar, operation: .create)
-            ensureDefaultCalendar()
-        }
+        let calendar = BetterCalendar(
+            id: UUID(),
+            name: trimmedName,
+            colorName: colorName,
+            isVisible: true,
+            isDefault: calendars.isEmpty,
+            sortOrder: calendars.count,
+            createdAt: .now,
+            updatedAt: .now
+        )
+        _ = performCalendarTransaction(changes: [.upsertCalendar(calendar)], journalEntityID: calendar.id, journalOperation: .create, outboxOperation: .create)
     }
 
     func updateCalendar(_ calendar: BetterCalendar) {
         guard let index = calendars.firstIndex(where: { $0.id == calendar.id }) else { return }
-        withPersistedMutation {
-            calendars[index] = calendar
-            calendars[index].updatedAt = .now
-            recordMutation(objectID: calendar.id, objectType: .calendar, operation: .update)
-            ensureDefaultCalendar()
-        }
+
+        var updated = calendar
+        updated.updatedAt = .now
+        updated.versionNumber = calendars[index].versionNumber + 1
+
+        var candidateCalendars = calendars
+        candidateCalendars[index] = updated
+        let changes = [EntityChange.upsertCalendar(updated)] + defaultCalendarCorrections(for: candidateCalendars)
+
+        _ = performCalendarTransaction(changes: changes, journalEntityID: calendar.id, journalOperation: .update, outboxOperation: .update)
     }
 
     func setDefaultCalendar(_ calendar: BetterCalendar) {
-        withPersistedMutation {
-            for index in calendars.indices {
-                calendars[index].isDefault = calendars[index].id == calendar.id
-                calendars[index].updatedAt = .now
-            }
-            recordMutation(objectID: calendar.id, objectType: .calendar, operation: .update)
+        var changes: [EntityChange] = []
+        for existing in calendars {
+            let shouldBeDefault = existing.id == calendar.id
+            guard existing.isDefault != shouldBeDefault else { continue }
+            var copy = existing
+            copy.isDefault = shouldBeDefault
+            copy.updatedAt = .now
+            copy.versionNumber += 1
+            changes.append(.upsertCalendar(copy))
         }
+        guard !changes.isEmpty else { return }
+
+        _ = performCalendarTransaction(changes: changes, journalEntityID: calendar.id, journalOperation: .update, outboxOperation: .update)
     }
 
     /// Reorders calendars per a drag gesture's `.onMove` offsets/destination (spec 1.3), then
@@ -393,22 +340,29 @@ final class BetterCalendarStore {
     ///
     /// This is a manual reimplementation of `Array.move(fromOffsets:toOffset:)` — that method
     /// is a SwiftUI extension, and the Data layer must not import SwiftUI.
+    ///
+    /// Pure reordering housekeeping, not a journaled "logical user action" of its own (spec
+    /// 2.8's vocabulary has no natural single entity id for "the whole list was reshuffled") —
+    /// it goes straight through the transaction pipeline with no journal entry or outbox row.
     func reorderCalendars(fromOffsets source: IndexSet, toOffset destination: Int) {
-        withPersistedMutation {
-            var reordered = calendars
-            let itemsToMove = source.map { reordered[$0] }
-            for index in source.sorted(by: >) {
-                reordered.remove(at: index)
-            }
-            let adjustedDestination = destination - source.filter { $0 < destination }.count
-            reordered.insert(contentsOf: itemsToMove, at: adjustedDestination)
-
-            calendars = reordered
-            for index in calendars.indices {
-                calendars[index].sortOrder = index
-                calendars[index].updatedAt = .now
-            }
+        var reordered = calendars
+        let itemsToMove = source.map { reordered[$0] }
+        for index in source.sorted(by: >) {
+            reordered.remove(at: index)
         }
+        let adjustedDestination = destination - source.filter { $0 < destination }.count
+        reordered.insert(contentsOf: itemsToMove, at: adjustedDestination)
+
+        var changes: [EntityChange] = []
+        for (index, calendar) in reordered.enumerated() where calendar.sortOrder != index {
+            var copy = calendar
+            copy.sortOrder = index
+            copy.updatedAt = .now
+            changes.append(.upsertCalendar(copy))
+        }
+        guard !changes.isEmpty else { return }
+
+        _ = withPersistedMutation(EngineTransaction(entityChanges: changes))
     }
 
     /// Count of this calendar's not-yet-past events, expanding recurrence within a bounded
@@ -431,54 +385,71 @@ final class BetterCalendarStore {
 
     func toggleCalendarVisibility(_ calendar: BetterCalendar) {
         guard let index = calendars.firstIndex(where: { $0.id == calendar.id }) else { return }
-        withPersistedMutation {
-            calendars[index].isVisible.toggle()
-            calendars[index].updatedAt = .now
-            recordMutation(objectID: calendar.id, objectType: .calendar, operation: .update)
-        }
+
+        var updated = calendars[index]
+        updated.isVisible.toggle()
+        updated.updatedAt = .now
+        updated.versionNumber += 1
+
+        _ = performCalendarTransaction(changes: [.upsertCalendar(updated)], journalEntityID: calendar.id, journalOperation: .update, outboxOperation: .update)
     }
 
     func deleteCalendar(_ calendar: BetterCalendar, moveEventsTo replacementID: UUID?) {
         guard !calendar.isDefault || replacementID != nil else { return }
-        withPersistedMutation {
-            let affectedEvents = events.filter { $0.calendarID == calendar.id }
 
-            if let replacementID {
-                for index in events.indices where events[index].calendarID == calendar.id {
-                    events[index].calendarID = replacementID
-                    events[index].updatedAt = .now
-                    recordMutation(objectID: events[index].id, objectType: .event, operation: .update)
-                }
-            } else {
-                events.removeAll { $0.calendarID == calendar.id }
-                for event in affectedEvents {
-                    deletedEventTombstones.append(
-                        DeletedEventTombstone(
-                            id: UUID(),
-                            eventID: event.id,
-                            title: event.title,
-                            deletedAt: .now,
-                            eventSnapshotJSON: event.encodedSnapshotJSON(),
-                            deletionSyncedAt: nil
-                        )
-                    )
-                    recordMutation(objectID: event.id, objectType: .event, operation: .delete)
-                }
+        let affectedEvents = events.filter { $0.calendarID == calendar.id }
+        let now = Date.now
+        var changes: [EntityChange] = []
+        var journalEntries: [ChangeJournalEntry] = []
+        var outboxRows: [PendingMutation] = []
+        var tombstones: [DeletedEventTombstone] = []
+
+        if let replacementID {
+            for event in affectedEvents {
+                var updated = event
+                updated.calendarID = replacementID
+                updated.updatedAt = now
+                updated.versionNumber += 1
+                changes.append(.upsertEvent(updated))
+
+                let entry = ChangeJournalEntry(id: UUID(), entityType: .event, entityID: event.id, operation: .update, fieldDiff: FieldDiff.compute(from: event, to: updated), source: .userEdit, occurredAt: now, appliedMutationID: nil)
+                journalEntries.append(entry)
+                outboxRows.append(PendingMutation(id: UUID(), objectID: event.id, objectType: .event, operation: .update, createdAt: now, payload: updated.encodedSnapshotJSON(), changeJournalEntryID: entry.id))
             }
+        } else {
+            for event in affectedEvents {
+                changes.append(.deleteEvent(event.id))
+                tombstones.append(
+                    DeletedEventTombstone(id: UUID(), eventID: event.id, title: event.title, deletedAt: now, eventSnapshotJSON: event.encodedSnapshotJSON(), deletionSyncedAt: nil)
+                )
 
-            calendars.removeAll { $0.id == calendar.id }
-            recordMutation(objectID: calendar.id, objectType: .calendar, operation: .delete)
-            ensureDefaultCalendar()
+                let entry = ChangeJournalEntry(id: UUID(), entityType: .event, entityID: event.id, operation: .delete, fieldDiff: FieldDiff.compute(from: event, to: Optional<CalendarEvent>.none), source: .userEdit, occurredAt: now, appliedMutationID: nil)
+                journalEntries.append(entry)
+                outboxRows.append(PendingMutation(id: UUID(), objectID: event.id, objectType: .event, operation: .delete, createdAt: now, payload: event.encodedSnapshotJSON(), changeJournalEntryID: entry.id))
+            }
         }
+
+        changes.append(.deleteCalendar(calendar.id))
+        let calendarEntry = ChangeJournalEntry(id: UUID(), entityType: .calendar, entityID: calendar.id, operation: .delete, fieldDiff: nil, source: .userEdit, occurredAt: now, appliedMutationID: nil)
+        journalEntries.append(calendarEntry)
+        outboxRows.append(PendingMutation(id: UUID(), objectID: calendar.id, objectType: .calendar, operation: .delete, createdAt: now, changeJournalEntryID: calendarEntry.id))
+
+        let remainingCalendars = calendars.filter { $0.id != calendar.id }
+        changes.append(contentsOf: defaultCalendarCorrections(for: remainingCalendars))
+
+        _ = withPersistedMutation(EngineTransaction(entityChanges: changes, outboxRows: outboxRows, journalEntries: journalEntries, tombstones: tombstones))
     }
 
     /// Applies a settings change through the same persist-then-rollback-on-failure path as
-    /// every other mutation (BC-SET-001, spec 1.20).
+    /// every other mutation (BC-SET-001, spec 1.20). Settings are not part of the change
+    /// journal's entity vocabulary (spec 2.8 covers event/calendar/reminder/recurrence rows),
+    /// so this carries no journal entry or outbox row — just the transactional apply-and-roll-
+    /// back-on-failure guarantee every mutation gets.
     @discardableResult
     func updateSettings(_ mutate: (inout AppSettings) -> Void) -> Bool {
-        withPersistedMutation {
-            mutate(&settings)
-        }
+        var updated = settings
+        mutate(&updated)
+        return withPersistedMutation(EngineTransaction(settings: updated))
     }
 
     /// Persists the pieces of view state spec 1.2 requires survive relaunch (BC-VIEW-010).
@@ -506,9 +477,12 @@ final class BetterCalendarStore {
     /// the same operation): wipes back to a single fresh default calendar with no events,
     /// tombstones, or pending mutations. Settings are preserved — a full settings reset is a
     /// bigger destructive step than this control promises.
+    ///
+    /// A wholesale wipe, not a "logical user action" the journal tracks — it stays on the bulk
+    /// `save(_:)` path rather than the incremental transaction pipeline.
     @discardableResult
     func deleteAllLocalData() -> Bool {
-        withPersistedMutation {
+        withBulkMutation {
             calendars = [BetterCalendar.localDefault()]
             events = []
             pendingMutations = []
@@ -521,7 +495,7 @@ final class BetterCalendarStore {
     @discardableResult
     func loadSampleData() -> Bool {
         let sample = LocalCalendarDatabase.seed
-        return withPersistedMutation {
+        return withBulkMutation {
             for sampleCalendar in sample.calendars where !calendars.contains(where: { $0.name == sampleCalendar.name }) {
                 calendars.append(sampleCalendar)
             }
@@ -721,14 +695,8 @@ final class BetterCalendarStore {
             return ImportSummary(importedCount: 0, skippedCount: skippedCount, failedCount: summary.failedCount, events: [])
         }
 
-        let didSave = withPersistedMutation {
-            for event in newEvents {
-                events.append(event)
-                recordMutation(objectID: event.id, objectType: .event, operation: .create)
-            }
-            recurrenceExceptions.append(contentsOf: newExceptions)
-            sortEvents()
-        }
+        let outcome = EventMutationUseCases.importCommit(events: newEvents, exceptions: newExceptions, in: engineContext(source: .importICS))
+        let didSave = perform(outcome)
 
         if didSave {
             PrivacyLog.track(.icsImportResult, metadata: "imported=\(newEvents.count) skipped=\(skippedCount) failed=\(summary.failedCount)")
@@ -746,24 +714,84 @@ final class BetterCalendarStore {
         commitImport(previewImportICS(text))
     }
 
+    private func engineContext(source: JournalSource = .userEdit) -> EventMutationUseCases.Context {
+        EventMutationUseCases.Context(database: database, source: source)
+    }
+
+    /// Dispatches a use case's result: `.applied` goes through the normal transaction pipeline,
+    /// `.duplicate` is a no-op success (spec 2.10/2.11 — the effect already exists), and
+    /// `.conflicted` surfaces as a failed mutation exactly like a persistence failure does.
     @discardableResult
-    private func withPersistedMutation(_ mutate: () -> Void) -> Bool {
+    private func perform(_ outcome: EventMutationUseCases.Outcome) -> Bool {
+        switch outcome {
+        case .applied(let transaction):
+            return withPersistedMutation(transaction)
+        case .duplicate:
+            return true
+        case .conflicted:
+            lastError = "This event changed since it was last loaded. Your change was not saved."
+            return false
+        }
+    }
+
+    /// Spec 2.2: applies one `EngineTransaction` — in memory first (optimistic update), then
+    /// through the repository — rolling the in-memory state back to what it was if persistence
+    /// fails. This is the incremental counterpart of `withBulkMutation` below; every event and
+    /// per-entity calendar mutation goes through this one.
+    @discardableResult
+    private func withPersistedMutation(_ transaction: EngineTransaction) -> Bool {
+        guard !transaction.isEmpty else { return true }
+
         let previousDatabase = database
-        let previousUndoAction = undoAction
+        apply(previousDatabase.applying(transaction))
 
-        mutate()
-
-        guard persist() else {
+        guard persist(transaction) else {
             apply(previousDatabase)
-            undoAction = previousUndoAction
             return false
         }
 
         return true
     }
 
-    private func recordMutation(objectID: UUID, objectType: MutationObjectType, operation: MutationOperation) {
-        pendingMutations.append(PendingMutation(id: UUID(), objectID: objectID, objectType: objectType, operation: operation, createdAt: .now))
+    /// The pre-Phase-2 persist-then-rollback-on-failure shape, kept for the handful of paths
+    /// that still genuinely rewrite the whole database rather than one entity's worth of it:
+    /// wipe, sample-data merge, and (indirectly, via `save(_:)`) the flat-file repository.
+    @discardableResult
+    private func withBulkMutation(_ mutate: () -> Void) -> Bool {
+        let previousDatabase = database
+        mutate()
+
+        guard persist() else {
+            apply(previousDatabase)
+            return false
+        }
+
+        return true
+    }
+
+    private func performCalendarTransaction(
+        changes: [EntityChange],
+        journalEntityID: UUID,
+        journalOperation: JournalOperation,
+        outboxOperation: MutationOperation
+    ) -> Bool {
+        let entry = ChangeJournalEntry(id: UUID(), entityType: .calendar, entityID: journalEntityID, operation: journalOperation, fieldDiff: nil, source: .userEdit, occurredAt: .now, appliedMutationID: nil)
+        let mutation = PendingMutation(id: UUID(), objectID: journalEntityID, objectType: .calendar, operation: outboxOperation, createdAt: .now, changeJournalEntryID: entry.id)
+        return withPersistedMutation(EngineTransaction(entityChanges: changes, outboxRows: [mutation], journalEntries: [entry]))
+    }
+
+    /// Builds `.upsertCalendar` changes for whichever calendar needs `isDefault` set so exactly
+    /// one calendar in `candidateCalendars` ends up marked default. Empty when the invariant
+    /// already holds — the common case, since every mutation that could break it (deleting the
+    /// default calendar, clearing `isDefault` via `updateCalendar`) is rare.
+    private func defaultCalendarCorrections(for candidateCalendars: [BetterCalendar]) -> [EntityChange] {
+        guard !candidateCalendars.contains(where: \.isDefault), var target = candidateCalendars.first else {
+            return []
+        }
+        target.isDefault = true
+        target.updatedAt = .now
+        target.versionNumber += 1
+        return [.upsertCalendar(target)]
     }
 
     /// Spec 0.12/2.13's retention window. Defined in `EngineRetentionPolicy` so the in-memory
@@ -773,11 +801,10 @@ final class BetterCalendarStore {
 
     private func purgeExpiredTombstones(now: Date = .now) {
         let expirationCutoff = now.addingTimeInterval(-Self.tombstoneRetentionInterval)
-        guard deletedEventTombstones.contains(where: { $0.deletedAt < expirationCutoff }) else { return }
+        let expiredIDs = deletedEventTombstones.filter { $0.deletedAt < expirationCutoff }.map(\.id)
+        guard !expiredIDs.isEmpty else { return }
 
-        withPersistedMutation {
-            deletedEventTombstones.removeAll { $0.deletedAt < expirationCutoff }
-        }
+        _ = withPersistedMutation(EngineTransaction(removedTombstoneIDs: expiredIDs))
     }
 
     private func ensureDefaultCalendar() {
@@ -857,9 +884,23 @@ final class BetterCalendarStore {
         recurrenceExceptions = database.recurrenceExceptions
     }
 
+    /// Whole-database bulk persist, for `withBulkMutation`.
     private func persist() -> Bool {
         do {
             try repository.save(database)
+            lastError = nil
+            reconcileNotifications()
+            return true
+        } catch {
+            lastError = "Calendar changes could not be saved locally."
+            return false
+        }
+    }
+
+    /// Incremental persist, for `withPersistedMutation(_:)`.
+    private func persist(_ transaction: EngineTransaction) -> Bool {
+        do {
+            try repository.apply(transaction)
             lastError = nil
             reconcileNotifications()
             return true
@@ -884,8 +925,8 @@ protocol LocalCalendarRepository {
     func load() throws -> LocalCalendarDatabase
 
     /// Whole-database replacement, for the bulk paths that genuinely rewrite everything:
-    /// seeding, sample data, import commit and "delete all local data". Spec 2.2 takes the
-    /// per-mutation path off this method and onto ``apply(_:)``.
+    /// seeding, sample data, and "delete all local data". Spec 2.2 takes the per-mutation path
+    /// off this method and onto ``apply(_:)``.
     func save(_ database: LocalCalendarDatabase) throws
 
     /// Spec 2.2: apply one `EngineTransaction` atomically.

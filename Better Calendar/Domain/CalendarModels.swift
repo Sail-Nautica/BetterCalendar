@@ -64,6 +64,8 @@ struct BetterCalendar: Identifiable, Hashable {
     var sortOrder: Int
     var createdAt: Date
     var updatedAt: Date
+    /// Spec 2.14: local optimistic-concurrency counter, mirroring `CalendarEvent.versionNumber`.
+    var versionNumber: Int = 1
 
     static func localDefault(now: Date = .now) -> BetterCalendar {
         BetterCalendar(
@@ -81,7 +83,7 @@ struct BetterCalendar: Identifiable, Hashable {
 
 extension BetterCalendar: Codable {
     private enum CodingKeys: String, CodingKey {
-        case id, name, colorName, isVisible, isDefault, sortOrder, createdAt, updatedAt
+        case id, name, colorName, isVisible, isDefault, sortOrder, createdAt, updatedAt, versionNumber
     }
 
     /// Decodes tolerantly so calendars written before `sortOrder` existed still load,
@@ -96,6 +98,7 @@ extension BetterCalendar: Codable {
         sortOrder = try container.decodeIfPresent(Int.self, forKey: .sortOrder) ?? 0
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        versionNumber = try container.decodeIfPresent(Int.self, forKey: .versionNumber) ?? 1
     }
 
     func encode(to encoder: Encoder) throws {
@@ -108,6 +111,7 @@ extension BetterCalendar: Codable {
         try container.encode(sortOrder, forKey: .sortOrder)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(updatedAt, forKey: .updatedAt)
+        try container.encode(versionNumber, forKey: .versionNumber)
     }
 }
 
@@ -267,6 +271,11 @@ struct CalendarEvent: Identifiable, Codable, Hashable {
     /// existing replacement when re-editing the same occurrence and to match the
     /// `RecurrenceException` that hides the master's slot at that date.
     var recurrenceOriginalStart: Date?
+    /// Spec 2.14: local optimistic-concurrency counter, independent of `providerVersion`. Every
+    /// existing construction site gets `1` ("never edited") for free via the default; the
+    /// mutation use cases in `Data/Engine/EventMutationUseCases.swift` are the only code that
+    /// ever passes a different value.
+    var versionNumber: Int = 1
 
     /// Compatibility accessor over `timeType`, so the many existing call sites that think in
     /// terms of a boolean keep working.
@@ -302,6 +311,7 @@ extension CalendarEvent {
         case recurrence, providerMetadata, createdAt, updatedAt
         case recurrenceMasterID, recurrenceOriginalStart
         case availability
+        case versionNumber
     }
 
     /// Decodes tolerantly so databases written before `timeType` existed still load.
@@ -330,6 +340,7 @@ extension CalendarEvent {
         recurrenceMasterID = try container.decodeIfPresent(UUID.self, forKey: .recurrenceMasterID)
         recurrenceOriginalStart = try container.decodeIfPresent(Date.self, forKey: .recurrenceOriginalStart)
         availability = try container.decodeIfPresent(EventAvailability.self, forKey: .availability) ?? .busy
+        versionNumber = try container.decodeIfPresent(Int.self, forKey: .versionNumber) ?? 1
 
         if let decodedTimeType = try container.decodeIfPresent(EventTimeType.self, forKey: .timeType) {
             timeType = decodedTimeType
@@ -361,6 +372,7 @@ extension CalendarEvent {
         try container.encodeIfPresent(recurrenceMasterID, forKey: .recurrenceMasterID)
         try container.encodeIfPresent(recurrenceOriginalStart, forKey: .recurrenceOriginalStart)
         try container.encode(availability, forKey: .availability)
+        try container.encode(versionNumber, forKey: .versionNumber)
     }
 
     /// Boolean-shaped initializer preserving the pre-`timeType` signature.
@@ -667,12 +679,100 @@ enum RecurrenceEnd: Codable, Hashable {
     }
 }
 
-struct PendingMutation: Identifiable, Codable, Hashable {
+/// Spec 2.10's outbox row. `objectID`/`objectType`/`operation` are the Phase 0 fields every
+/// call site already constructs; the rest are the Phase 2 additions layered on top.
+struct PendingMutation: Identifiable, Hashable {
     var id: UUID
     var objectID: UUID
     var objectType: MutationObjectType
     var operation: MutationOperation
     var createdAt: Date
+    /// JSON snapshot of the entity this mutation carries, for a future provider adapter to
+    /// resend without re-reading the database. `nil` is a legal, common case in Phase 2: there
+    /// is no provider yet to consume it.
+    var payload: String?
+    /// Spec 2.10/2.11: minted once when a mutation is first enqueued and never regenerated on
+    /// retry — that stability is what makes "apply the same idempotency key twice" a no-op
+    /// instead of a duplicate. Defaults to `id` so every existing construction site (which only
+    /// ever calls this with one `id` per logical mutation) gets a key with the same stability
+    /// property for free.
+    var idempotencyKey: UUID
+    var status: MutationStatus
+    var attemptCount: Int
+    var lastAttemptAt: Date?
+    var nextRetryAt: Date?
+    /// Spec 2.10: the journal entry this mutation was enqueued alongside. `nil` only for rows
+    /// written before this column existed.
+    var changeJournalEntryID: UUID?
+
+    init(
+        id: UUID,
+        objectID: UUID,
+        objectType: MutationObjectType,
+        operation: MutationOperation,
+        createdAt: Date,
+        payload: String? = nil,
+        idempotencyKey: UUID? = nil,
+        status: MutationStatus = .pending,
+        attemptCount: Int = 0,
+        lastAttemptAt: Date? = nil,
+        nextRetryAt: Date? = nil,
+        changeJournalEntryID: UUID? = nil
+    ) {
+        self.id = id
+        self.objectID = objectID
+        self.objectType = objectType
+        self.operation = operation
+        self.createdAt = createdAt
+        self.payload = payload
+        self.idempotencyKey = idempotencyKey ?? id
+        self.status = status
+        self.attemptCount = attemptCount
+        self.lastAttemptAt = lastAttemptAt
+        self.nextRetryAt = nextRetryAt
+        self.changeJournalEntryID = changeJournalEntryID
+    }
+}
+
+extension PendingMutation: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case id, objectID, objectType, operation, createdAt
+        case payload, idempotencyKey, status, attemptCount, lastAttemptAt, nextRetryAt, changeJournalEntryID
+    }
+
+    /// Decodes tolerantly so mutations written before the Phase 2 columns existed still load —
+    /// `idempotencyKey` falls back to `id`, matching what `init` does for a fresh value.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        objectID = try container.decode(UUID.self, forKey: .objectID)
+        objectType = try container.decode(MutationObjectType.self, forKey: .objectType)
+        operation = try container.decode(MutationOperation.self, forKey: .operation)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        payload = try container.decodeIfPresent(String.self, forKey: .payload)
+        idempotencyKey = try container.decodeIfPresent(UUID.self, forKey: .idempotencyKey) ?? id
+        status = try container.decodeIfPresent(MutationStatus.self, forKey: .status) ?? .pending
+        attemptCount = try container.decodeIfPresent(Int.self, forKey: .attemptCount) ?? 0
+        lastAttemptAt = try container.decodeIfPresent(Date.self, forKey: .lastAttemptAt)
+        nextRetryAt = try container.decodeIfPresent(Date.self, forKey: .nextRetryAt)
+        changeJournalEntryID = try container.decodeIfPresent(UUID.self, forKey: .changeJournalEntryID)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(objectID, forKey: .objectID)
+        try container.encode(objectType, forKey: .objectType)
+        try container.encode(operation, forKey: .operation)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encodeIfPresent(payload, forKey: .payload)
+        try container.encode(idempotencyKey, forKey: .idempotencyKey)
+        try container.encode(status, forKey: .status)
+        try container.encode(attemptCount, forKey: .attemptCount)
+        try container.encodeIfPresent(lastAttemptAt, forKey: .lastAttemptAt)
+        try container.encodeIfPresent(nextRetryAt, forKey: .nextRetryAt)
+        try container.encodeIfPresent(changeJournalEntryID, forKey: .changeJournalEntryID)
+    }
 }
 
 enum MutationObjectType: String, Codable {
@@ -684,6 +784,15 @@ enum MutationOperation: String, Codable {
     case create
     case update
     case delete
+}
+
+/// Spec 2.10's outbox status machine.
+enum MutationStatus: String, Codable, Hashable, CaseIterable {
+    case pending
+    case inFlight
+    case applied
+    case failed
+    case conflicted
 }
 
 /// A single recurring occurrence that no longer follows its master's rule unmodified
