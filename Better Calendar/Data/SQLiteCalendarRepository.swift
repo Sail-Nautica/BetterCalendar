@@ -13,8 +13,51 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v007_create_sync_and_settings",
         "v008_add_deletion_snapshot",
         "v009_extend_search_index",
-        "v010_add_raw_ics_metadata"
+        "v010_add_raw_ics_metadata",
+        "v011_create_change_journal",
+        "v012_create_event_versions",
+        "v013_extend_pending_mutations",
+        "v014_extend_deleted_objects",
+        "v015_add_version_numbers",
+        "v016_add_engine_indexes",
+        "v017_rebuild_search_index"
     ]
+
+    /// Spec 2.17: a checksum over the migration set, stored alongside the applied migration
+    /// count so a partial or tampered-with migration history is detectable on next launch.
+    ///
+    /// FNV-1a rather than `Hashable`: Swift seeds `Hasher` per process, so a stored
+    /// `hashValue` would mismatch on every relaunch and report corruption that isn't there.
+    /// This needs to be stable across processes, OS versions and architectures, and it is a
+    /// corruption tripwire rather than a security boundary, so a non-cryptographic hash with
+    /// a fixed specification is the right tool.
+    static func migrationChecksum(through appliedCount: Int) -> String {
+        let identifiers = migrationIdentifiers.prefix(max(appliedCount, 0)).joined(separator: "\n")
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in Array(identifiers.utf8) {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return String(format: "fnv1a64:%016llx", hash)
+    }
+
+    /// The result of comparing `schema_metadata` against the migration set this build ships.
+    /// M1 records the values and exposes the comparison; spec 2.18's "halt into recovery
+    /// mode" policy that consumes it is M3's launch-recovery sequence.
+    enum SchemaMetadataStatus: Equatable {
+        /// Stored version and checksum agree with this build's migration set.
+        case consistent(appliedMigrationCount: Int)
+        /// A database written by an older build, with a checksum matching that build's prefix
+        /// of the migration set. Migrating forward is safe.
+        case behind(appliedMigrationCount: Int)
+        /// A database written by a *newer* build than this one. Downgrade is not supported.
+        case ahead(appliedMigrationCount: Int)
+        /// The stored checksum does not match the identifiers claimed to have been applied —
+        /// a partial or rewritten migration history.
+        case checksumMismatch(appliedMigrationCount: Int, storedChecksum: String?)
+        /// No `schema_metadata` rows at all, i.e. a pre-v007 database.
+        case missing
+    }
 
     private let fileURLOverride: URL?
     private let fileManager: FileManager
@@ -44,11 +87,117 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         }
     }
 
+    /// Whole-database replacement. Spec 2.2 removes this from the per-mutation path — see
+    /// `apply(_:)` — but it remains the right shape for the bulk operations that genuinely do
+    /// rewrite everything: first-run seeding, "delete all local data", sample-data loading and
+    /// the flat-file repository's own format.
     func save(_ database: LocalCalendarDatabase) throws {
         let databaseQueue = try openDatabase()
         try databaseQueue.write { db in
             try replaceDatabase(database, in: db)
         }
+    }
+
+    /// Spec 2.2: apply one transaction's worth of change, incrementally, inside a single
+    /// SQLite write transaction.
+    ///
+    /// GRDB's `write` wraps the block in `BEGIN`/`COMMIT` and rolls back on any thrown error,
+    /// so either every row in the transaction lands or none does. That is what spec 2.13's
+    /// "written in the same transaction as the delete" requires, and it is why the tombstone
+    /// travels inside `EngineTransaction` rather than being written by a follow-up call.
+    func apply(_ transaction: EngineTransaction) throws {
+        guard !transaction.isEmpty else { return }
+
+        let databaseQueue = try openDatabase()
+        try databaseQueue.write { db in
+            for change in transaction.orderedChanges {
+                switch change {
+                case .upsertCalendar(let calendar):
+                    let previousName = try String.fetchOne(
+                        db,
+                        sql: "SELECT name FROM calendars WHERE id = ?",
+                        arguments: [calendar.id.uuidString]
+                    )
+                    try upsert(calendar: calendar, in: db)
+                    // The FTS index denormalises the calendar name (BC-SRCH-001), so a rename
+                    // has to be pushed into every row that copied it. Guarded on an actual
+                    // change: `event_id` is UNINDEXED, so this predicate is a scan.
+                    if let previousName, previousName != calendar.name {
+                        try db.execute(
+                            sql: """
+                                UPDATE event_search SET calendar_name = ?
+                                WHERE event_id IN (SELECT id FROM events WHERE calendar_id = ?)
+                                """,
+                            arguments: [calendar.name, calendar.id.uuidString]
+                        )
+                    }
+
+                case .deleteCalendar(let id):
+                    // `events.calendar_id` cascades, but `event_search` is an FTS5 virtual
+                    // table with no foreign keys of its own — its rows have to be swept
+                    // explicitly, before the cascade removes the events that identify them.
+                    try db.execute(
+                        sql: "DELETE FROM event_search WHERE event_id IN (SELECT id FROM events WHERE calendar_id = ?)",
+                        arguments: [id.uuidString]
+                    )
+                    try db.execute(sql: "DELETE FROM calendars WHERE id = ?", arguments: [id.uuidString])
+
+                case .upsertEvent(let event):
+                    try upsert(event: event, in: db)
+                    let calendarName = try String.fetchOne(
+                        db,
+                        sql: "SELECT name FROM calendars WHERE id = ?",
+                        arguments: [event.calendarID.uuidString]
+                    )
+                    try replaceEventChildRows(for: event, calendarName: calendarName, in: db)
+
+                case .deleteEvent(let id):
+                    try db.execute(sql: "DELETE FROM event_search WHERE event_id = ?", arguments: [id.uuidString])
+                    try db.execute(sql: "DELETE FROM events WHERE id = ?", arguments: [id.uuidString])
+
+                case .upsertRecurrenceException(let exception):
+                    try upsert(exception: exception, in: db)
+
+                case .deleteRecurrenceException(let id):
+                    try db.execute(sql: "DELETE FROM event_recurrence_exceptions WHERE id = ?", arguments: [id.uuidString])
+                }
+            }
+
+            for mutation in transaction.outboxRows {
+                try upsert(mutation: mutation, in: db)
+            }
+
+            for tombstone in transaction.tombstones {
+                try upsert(tombstone: tombstone, in: db)
+            }
+
+            for tombstoneID in transaction.removedTombstoneIDs {
+                try db.execute(sql: "DELETE FROM deleted_objects WHERE id = ?", arguments: [tombstoneID.uuidString])
+            }
+
+            if let settings = transaction.settings {
+                try upsertSettings(settings, in: db)
+            }
+        }
+    }
+
+    /// Reminders, the recurrence rule and the search row are wholly owned by their event and
+    /// carry no identity a caller can hold onto, so replacing an event replaces them outright
+    /// rather than diffing them row by row.
+    private func replaceEventChildRows(for event: CalendarEvent, calendarName: String?, in db: Database) throws {
+        try db.execute(sql: "DELETE FROM event_reminders WHERE event_id = ?", arguments: [event.id.uuidString])
+        try db.execute(sql: "DELETE FROM event_recurrence_rules WHERE event_id = ?", arguments: [event.id.uuidString])
+        try db.execute(sql: "DELETE FROM event_search WHERE event_id = ?", arguments: [event.id.uuidString])
+
+        for reminder in event.reminders {
+            try insert(reminder: reminder, eventID: event.id, in: db)
+        }
+
+        if let recurrence = event.recurrence, recurrence.frequency != .never {
+            try insert(recurrence: recurrence, event: event, in: db)
+        }
+
+        try insertSearchRow(for: event, calendarName: calendarName, in: db)
     }
 
     /// BC-SRCH-001: an indexed FTS5 prefix-per-word query across title/notes/location/calendar
@@ -93,7 +242,38 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
         let databaseQueue = try DatabaseQueue(path: fileURL.path, configuration: configuration)
         try Self.makeMigrator().migrate(databaseQueue)
+
+        // Spec 2.17: stamp the applied migration count and checksum after the set actually
+        // ran. `migrate` is transactional per migration, so reaching this line means every
+        // identifier in the list is applied.
+        //
+        // Read before writing. `openDatabase` runs on every repository call — including each
+        // `searchEventIDs` keystroke — and an unconditional write here would put a write
+        // transaction on the path of operations that only read. After the first launch on a
+        // given build the stored values already agree and there is nothing to do.
+        let isUpToDate = try databaseQueue.read { db in
+            try Self.schemaMetadataStatus(in: db) == .consistent(appliedMigrationCount: Self.migrationIdentifiers.count)
+        }
+        if !isUpToDate {
+            try databaseQueue.write { db in
+                try Self.writeSchemaMetadata(in: db)
+            }
+        }
+
         return databaseQueue
+    }
+
+    /// Reads the stored schema metadata without migrating, for spec 2.18's launch-time
+    /// verification step. Opens the file directly rather than through `openDatabase`, whose
+    /// whole job is to migrate and re-stamp.
+    func schemaMetadataStatus() throws -> SchemaMetadataStatus {
+        let fileURL = try databaseURL()
+        guard fileManager.fileExists(atPath: fileURL.path) else { return .missing }
+
+        let databaseQueue = try DatabaseQueue(path: fileURL.path)
+        return try databaseQueue.read { db in
+            try Self.schemaMetadataStatus(in: db)
+        }
     }
 
     private func databaseURL() throws -> URL {
@@ -341,9 +521,243 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             try db.execute(sql: "ALTER TABLE events ADD COLUMN raw_ics_properties TEXT")
         }
 
+        // Spec 2.8: the append-only change journal. Deliberately carries no foreign key on
+        // `entity_id` — the journal has to outlive the row it describes, which is exactly the
+        // case a `delete` entry records. `applied_mutation_id` links back to the outbox row
+        // that carried the change once it is applied (spec 2.10), and stays NULL until then.
+        migrator.registerMigration("v011_create_change_journal") { db in
+            try db.execute(sql: """
+                CREATE TABLE change_journal (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    operation TEXT NOT NULL CHECK (operation IN ('create', 'update', 'delete')),
+                    field_diff TEXT,
+                    source TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    applied_mutation_id TEXT
+                )
+                """)
+            try db.execute(sql: "CREATE INDEX change_journal_entity_idx ON change_journal(entity_id, occurred_at)")
+            try db.execute(sql: "CREATE INDEX change_journal_occurred_at_idx ON change_journal(occurred_at)")
+        }
+
+        // Spec 2.9: full-snapshot version history. Like the journal it has no foreign key to
+        // `events` — history whose rows vanish when the event is deleted is not history. The
+        // foreign key to `change_journal` is safe in the other direction precisely because
+        // the journal is append-only, and it enforces spec 2.9's requirement that every
+        // version row be attributable to the journal entry that produced it.
+        migrator.registerMigration("v012_create_event_versions") { db in
+            try db.execute(sql: """
+                CREATE TABLE event_versions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    event_id TEXT NOT NULL,
+                    version_number INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    change_journal_entry_id TEXT NOT NULL REFERENCES change_journal(id)
+                )
+                """)
+            try db.execute(sql: "CREATE UNIQUE INDEX event_versions_event_version_idx ON event_versions(event_id, version_number)")
+            try db.execute(sql: "CREATE INDEX event_versions_event_created_idx ON event_versions(event_id, created_at)")
+        }
+
+        // Spec 2.10: extend the Phase 0 outbox into a retryable, idempotent queue.
+        //
+        // `idempotency_key` cannot be declared UNIQUE inline: SQLite's ALTER TABLE ADD COLUMN
+        // rejects UNIQUE and PRIMARY KEY constraints, so the uniqueness spec 2.11 depends on
+        // is enforced by a separate unique index. Existing rows are backfilled with distinct
+        // keys rather than left NULL, so the index applies to the whole table and a Phase 1
+        // database that force-quit mid-mutation still has a replayable outbox.
+        migrator.registerMigration("v013_extend_pending_mutations") { db in
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN payload TEXT")
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN idempotency_key TEXT")
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN last_attempt_at TEXT")
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN next_retry_at TEXT")
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN change_journal_entry_id TEXT")
+
+            // A UUID-shaped random key per existing row. `randomblob`/`hex` is the only
+            // source of uniqueness SQLite offers here; the result is not a conforming v4
+            // UUID (the version and variant nibbles are random too) but it round-trips
+            // through `UUID(uuidString:)`, which is all the outbox requires of it.
+            try db.execute(sql: """
+                UPDATE pending_mutations
+                SET idempotency_key =
+                    substr(hex(randomblob(4)), 1, 8) || '-' ||
+                    substr(hex(randomblob(2)), 1, 4) || '-' ||
+                    substr(hex(randomblob(2)), 1, 4) || '-' ||
+                    substr(hex(randomblob(2)), 1, 4) || '-' ||
+                    substr(hex(randomblob(6)), 1, 12)
+                WHERE idempotency_key IS NULL
+                """)
+            try db.execute(sql: "CREATE UNIQUE INDEX pending_mutations_idempotency_key_idx ON pending_mutations(idempotency_key)")
+            try db.execute(sql: "CREATE INDEX pending_mutations_status_idx ON pending_mutations(status, next_retry_at)")
+        }
+
+        // Spec 2.13: tombstones gain a cause and an explicit purge deadline.
+        //
+        // `purge_after` is backfilled from `deleted_at` with `strftime` rather than left for
+        // the app to compute on read, so the retention deadline is a stored fact that a
+        // future purge job can index. The format string reproduces `encodeInstant`'s
+        // ISO-8601-with-milliseconds shape exactly — `datetime()` would return a
+        // space-separated string that `decodeInstant` cannot parse.
+        migrator.registerMigration("v014_extend_deleted_objects") { db in
+            try db.execute(sql: "ALTER TABLE deleted_objects ADD COLUMN deleted_by TEXT NOT NULL DEFAULT 'userEdit'")
+            try db.execute(sql: "ALTER TABLE deleted_objects ADD COLUMN purge_after TEXT")
+
+            let retentionDays = Int(EngineRetentionPolicy.tombstoneRetentionInterval / 86_400)
+            try db.execute(
+                sql: """
+                    UPDATE deleted_objects
+                    SET purge_after = strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at, ?)
+                    WHERE purge_after IS NULL
+                    """,
+                arguments: ["+\(retentionDays) days"]
+            )
+            try db.execute(sql: "CREATE INDEX deleted_objects_purge_after_idx ON deleted_objects(purge_after)")
+        }
+
+        // Spec 2.14: local optimistic-concurrency counters, independent of the provider
+        // `provider_version`/ETag column reserved in Phase 0. Existing rows start at version
+        // 1 rather than 0 so "never edited" and "edited once" are distinguishable from the
+        // first update onward.
+        migrator.registerMigration("v015_add_version_numbers") { db in
+            try db.execute(sql: "ALTER TABLE events ADD COLUMN version_number INTEGER NOT NULL DEFAULT 1")
+            try db.execute(sql: "ALTER TABLE calendars ADD COLUMN version_number INTEGER NOT NULL DEFAULT 1")
+        }
+
+        // Spec 2.6/2.19: the covering index for the interval query conflict detection runs on
+        // every create, move and resize. Phase 1's `events_timed_range_idx` is partial on
+        // `event_type = 'timed'` and does not lead with `calendar_id`, so a per-calendar
+        // range scan could not use it.
+        migrator.registerMigration("v016_add_engine_indexes") { db in
+            try db.execute(sql: "CREATE INDEX events_calendar_range_idx ON events(calendar_id, start_instant, end_instant)")
+            try db.execute(sql: "CREATE INDEX events_recurrence_master_idx ON events(recurrence_master_id) WHERE recurrence_master_id IS NOT NULL")
+            // Seed the metadata rows for the benefit of anything that migrates a queue
+            // directly without going through `openDatabase` — the migration tests do exactly
+            // that. Counted through *this* migration rather than through the whole list, so
+            // that a future v017 failing and rolling back cannot leave metadata claiming it
+            // succeeded.
+            try Self.writeSchemaMetadata(in: db, appliedCount: Self.appliedCount(through: "v016_add_engine_indexes"))
+        }
+
+        // Repairs the search index for anyone upgrading from a pre-v009 database.
+        //
+        // `v009` dropped and recreated `event_search` to add two columns, on the reasoning
+        // that the table had never been queried so there was nothing to lose. That was true
+        // in Phase 1 for an unobvious reason: every mutation went through `replaceDatabase`,
+        // which rebuilt the whole index as a side effect, so the empty table refilled itself
+        // the first time the user touched anything. Spec 2.2's incremental write path removes
+        // that accident, and without this migration an upgraded database would search an
+        // index that is empty until each individual event happens to be edited.
+        //
+        // Written in Swift rather than as `INSERT ... SELECT` because `url_host` needs real
+        // URL parsing to match what `insertSearchRow` stores for every subsequently-saved
+        // event; an index whose rows disagree about what a column means is worse than none.
+        migrator.registerMigration("v017_rebuild_search_index") { db in
+            try db.execute(sql: "DELETE FROM event_search")
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT e.id AS id, e.title AS title, e.notes AS notes,
+                       e.location_name AS location_name, e.url AS url, c.name AS calendar_name
+                FROM events e
+                LEFT JOIN calendars c ON c.id = e.calendar_id
+                WHERE e.deleted_at IS NULL
+                """)
+
+            for row in rows {
+                let urlString: String? = row["url"]
+                try db.execute(
+                    sql: """
+                        INSERT INTO event_search (event_id, title, notes, location_name, calendar_name, url_host)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        row["id"] as String,
+                        row["title"] as String?,
+                        row["notes"] as String?,
+                        row["location_name"] as String?,
+                        row["calendar_name"] as String?,
+                        urlString.flatMap { URL(string: $0)?.host }
+                    ]
+                )
+            }
+        }
+
         return migrator
     }
 
+    /// The number of migrations up to and including `identifier`.
+    static func appliedCount(through identifier: String) -> Int {
+        guard let index = migrationIdentifiers.firstIndex(of: identifier) else {
+            return migrationIdentifiers.count
+        }
+        return index + 1
+    }
+
+    /// Records the applied migration count and its checksum (spec 2.17).
+    ///
+    /// The authoritative call site is after a successful `migrate`, not inside a migration: a
+    /// checksum written once by `v016` would describe the migration set as it stood when v016
+    /// shipped, and would report a false mismatch for every build that adds a v017. The
+    /// stored value has to track the set actually applied, which only the caller of `migrate`
+    /// knows.
+    static func writeSchemaMetadata(in db: Database, appliedCount: Int = migrationIdentifiers.count) throws {
+        let now = encodeInstant(Date())
+        try db.execute(
+            sql: "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) VALUES ('schema_version', ?, ?)",
+            arguments: [String(appliedCount), now]
+        )
+        try db.execute(
+            sql: "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) VALUES ('migration_checksum', ?, ?)",
+            arguments: [migrationChecksum(through: appliedCount), now]
+        )
+    }
+
+    /// Compares stored `schema_metadata` against this build's migration set (spec 2.17), for
+    /// the launch-time verification spec 2.18 step 2 performs. Read-only: deciding what to do
+    /// about a mismatch is the caller's business.
+    static func schemaMetadataStatus(in db: Database) throws -> SchemaMetadataStatus {
+        guard try db.tableExists("schema_metadata") else { return .missing }
+
+        let rows = try Row.fetchAll(db, sql: "SELECT key, value FROM schema_metadata")
+        var values: [String: String] = [:]
+        for row in rows {
+            values[row["key"]] = row["value"]
+        }
+
+        guard let versionString = values["schema_version"], let appliedCount = Int(versionString) else {
+            return .missing
+        }
+
+        // Databases written before v016 have a `schema_version` but no checksum. That is a
+        // known-good older shape, not corruption.
+        guard let storedChecksum = values["migration_checksum"] else {
+            return appliedCount >= migrationIdentifiers.count ? .consistent(appliedMigrationCount: appliedCount) : .behind(appliedMigrationCount: appliedCount)
+        }
+
+        guard appliedCount <= migrationIdentifiers.count else {
+            return .ahead(appliedMigrationCount: appliedCount)
+        }
+
+        guard storedChecksum == migrationChecksum(through: appliedCount) else {
+            return .checksumMismatch(appliedMigrationCount: appliedCount, storedChecksum: storedChecksum)
+        }
+
+        return appliedCount == migrationIdentifiers.count
+            ? .consistent(appliedMigrationCount: appliedCount)
+            : .behind(appliedMigrationCount: appliedCount)
+    }
+
+    /// Deletes and re-inserts every entity table.
+    ///
+    /// `change_journal` and `event_versions` are deliberately *not* in the sweep below. Spec
+    /// 2.8 makes the journal append-only — "never mutated or deleted except by an explicit,
+    /// logged retention policy" — so a bulk save must leave the history of how the database
+    /// got here intact, and spec 2.9 says the same of version rows. Erasing local data on
+    /// purpose is a different operation, and it belongs to M3's recovery work rather than
+    /// falling out of a save.
     private func replaceDatabase(_ database: LocalCalendarDatabase, in db: Database) throws {
         try db.execute(sql: "DELETE FROM event_search")
         try db.execute(sql: "DELETE FROM event_tags")
@@ -389,43 +803,83 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         }
 
         try upsertSettings(database.settings, in: db)
+        try Self.writeSchemaMetadata(in: db)
+    }
 
-        try db.execute(
-            sql: "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) VALUES ('schema_version', ?, ?)",
-            arguments: [String(Self.migrationIdentifiers.count), encodeInstant(Date())]
-        )
+    // MARK: - Row writers
+    //
+    // Column lists and argument builders are declared once and shared by the plain-INSERT
+    // (bulk replace) and UPSERT (incremental `apply`) paths. Keeping a 29-column list in two
+    // hand-maintained SQL literals is precisely where a column silently stops being persisted,
+    // so the SQL for both shapes is generated from the same array instead.
+
+    private static let calendarColumns = [
+        "id", "provider", "provider_account_id", "provider_calendar_id", "name", "color_hex",
+        "is_visible", "is_read_only", "is_default", "time_zone_id", "sort_order",
+        "created_at", "updated_at", "deleted_at"
+    ]
+
+    private static let eventColumns = [
+        "id", "calendar_id", "provider", "provider_object_id", "provider_version",
+        "title", "notes", "location_name", "location_latitude", "location_longitude", "url",
+        "event_type", "start_instant", "end_instant", "start_local_date", "end_local_date_exclusive",
+        "original_timezone_id", "availability", "status", "privacy", "color_override",
+        "recurrence_master_id", "recurrence_original_start", "is_recurrence_master",
+        "sync_status", "created_at", "updated_at", "deleted_at", "raw_ics_properties"
+    ]
+
+    /// `version_number` is written by the concurrency logic in M2, never copied from an
+    /// incoming row, so an upsert must leave it alone. Listing it here rather than omitting
+    /// it from `eventColumns` keeps the "these are the columns of this table" list honest.
+    private static let versionPreservedColumns: Set<String> = ["version_number"]
+
+    private static func insertSQL(table: String, columns: [String]) -> String {
+        let placeholders = Array(repeating: "?", count: columns.count).joined(separator: ", ")
+        return "INSERT INTO \(table) (\(columns.joined(separator: ", "))) VALUES (\(placeholders))"
+    }
+
+    private static func upsertSQL(table: String, columns: [String], preserving: Set<String> = []) -> String {
+        let assignments = columns
+            .filter { $0 != "id" && !preserving.contains($0) }
+            .map { "\($0) = excluded.\($0)" }
+            .joined(separator: ", ")
+        return "\(insertSQL(table: table, columns: columns)) ON CONFLICT(id) DO UPDATE SET \(assignments)"
+    }
+
+    private func calendarArguments(_ calendar: BetterCalendar) -> StatementArguments {
+        [
+            calendar.id.uuidString,
+            EventProvider.betterCalendar.databaseValue,
+            nil,
+            calendar.id.uuidString,
+            calendar.name,
+            calendar.colorName.hexValue,
+            calendar.isVisible.databaseInt,
+            0,
+            calendar.isDefault.databaseInt,
+            nil,
+            calendar.sortOrder,
+            encodeInstant(calendar.createdAt),
+            encodeInstant(calendar.updatedAt),
+            nil
+        ]
     }
 
     private func insert(calendar: BetterCalendar, in db: Database) throws {
         try db.execute(
-            sql: """
-                INSERT INTO calendars (
-                    id, provider, provider_account_id, provider_calendar_id, name, color_hex,
-                    is_visible, is_read_only, is_default, time_zone_id, sort_order,
-                    created_at, updated_at, deleted_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-            arguments: [
-                calendar.id.uuidString,
-                EventProvider.betterCalendar.databaseValue,
-                nil,
-                calendar.id.uuidString,
-                calendar.name,
-                calendar.colorName.hexValue,
-                calendar.isVisible.databaseInt,
-                0,
-                calendar.isDefault.databaseInt,
-                nil,
-                calendar.sortOrder,
-                encodeInstant(calendar.createdAt),
-                encodeInstant(calendar.updatedAt),
-                nil
-            ]
+            sql: Self.insertSQL(table: "calendars", columns: Self.calendarColumns),
+            arguments: calendarArguments(calendar)
         )
     }
 
-    private func insert(event: CalendarEvent, in db: Database) throws {
+    private func upsert(calendar: BetterCalendar, in db: Database) throws {
+        try db.execute(
+            sql: Self.upsertSQL(table: "calendars", columns: Self.calendarColumns, preserving: Self.versionPreservedColumns),
+            arguments: calendarArguments(calendar)
+        )
+    }
+
+    private func eventArguments(_ event: CalendarEvent) -> StatementArguments {
         let isAllDay = event.isAllDay
         // Floating events persist instants exactly like timed events; the schema's compound
         // CHECK places no column requirements on the floating branch, so no migration is needed.
@@ -435,49 +889,50 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         let startLocalDate = isAllDay ? localDateString(for: event.startDate, timeZoneIdentifier: event.timeZoneIdentifier) : nil
         let endLocalDateExclusive = isAllDay ? localDateString(for: event.endDate, timeZoneIdentifier: event.timeZoneIdentifier) : nil
 
+        return [
+            event.id.uuidString,
+            event.calendarID.uuidString,
+            event.providerMetadata.provider.databaseValue,
+            event.providerMetadata.providerObjectID,
+            event.providerMetadata.providerVersion,
+            event.title,
+            event.notes,
+            event.location,
+            nil,
+            nil,
+            event.urlString,
+            eventType,
+            startInstant,
+            endInstant,
+            startLocalDate,
+            endLocalDateExclusive,
+            event.timeZoneIdentifier,
+            event.availability.rawValue,
+            "confirmed",
+            "default",
+            nil,
+            event.recurrenceMasterID?.uuidString,
+            event.recurrenceOriginalStart.map(encodeInstant),
+            event.recurrence == nil ? 0 : 1,
+            event.providerMetadata.syncStatus.databaseValue,
+            encodeInstant(event.createdAt),
+            encodeInstant(event.updatedAt),
+            event.providerMetadata.deletedAt.map(encodeInstant),
+            event.providerMetadata.rawICSProperties
+        ]
+    }
+
+    private func insert(event: CalendarEvent, in db: Database) throws {
         try db.execute(
-            sql: """
-                INSERT INTO events (
-                    id, calendar_id, provider, provider_object_id, provider_version,
-                    title, notes, location_name, location_latitude, location_longitude, url,
-                    event_type, start_instant, end_instant, start_local_date, end_local_date_exclusive,
-                    original_timezone_id, availability, status, privacy, color_override,
-                    recurrence_master_id, recurrence_original_start, is_recurrence_master,
-                    sync_status, created_at, updated_at, deleted_at, raw_ics_properties
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-            arguments: [
-                event.id.uuidString,
-                event.calendarID.uuidString,
-                event.providerMetadata.provider.databaseValue,
-                event.providerMetadata.providerObjectID,
-                event.providerMetadata.providerVersion,
-                event.title,
-                event.notes,
-                event.location,
-                nil,
-                nil,
-                event.urlString,
-                eventType,
-                startInstant,
-                endInstant,
-                startLocalDate,
-                endLocalDateExclusive,
-                event.timeZoneIdentifier,
-                event.availability.rawValue,
-                "confirmed",
-                "default",
-                nil,
-                event.recurrenceMasterID?.uuidString,
-                event.recurrenceOriginalStart.map(encodeInstant),
-                event.recurrence == nil ? 0 : 1,
-                event.providerMetadata.syncStatus.databaseValue,
-                encodeInstant(event.createdAt),
-                encodeInstant(event.updatedAt),
-                event.providerMetadata.deletedAt.map(encodeInstant),
-                event.providerMetadata.rawICSProperties
-            ]
+            sql: Self.insertSQL(table: "events", columns: Self.eventColumns),
+            arguments: eventArguments(event)
+        )
+    }
+
+    private func upsert(event: CalendarEvent, in db: Database) throws {
+        try db.execute(
+            sql: Self.upsertSQL(table: "events", columns: Self.eventColumns, preserving: Self.versionPreservedColumns),
+            arguments: eventArguments(event)
         )
     }
 
@@ -546,56 +1001,117 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         )
     }
 
+    private static let pendingMutationColumns = [
+        "id", "object_id", "object_type", "operation", "created_at",
+        "payload", "idempotency_key", "status", "attempt_count",
+        "last_attempt_at", "next_retry_at", "change_journal_entry_id"
+    ]
+
+    private func pendingMutationArguments(_ mutation: PendingMutation) -> StatementArguments {
+        [
+            mutation.id.uuidString,
+            mutation.objectID.uuidString,
+            mutation.objectType.rawValue,
+            mutation.operation.rawValue,
+            encodeInstant(mutation.createdAt),
+            nil,
+            // Spec 2.10 requires a key that is stable across retries of the same logical
+            // mutation. `PendingMutation` gains a real stored `idempotencyKey` in M2; until
+            // then the mutation's own primary key supplies one with exactly the properties
+            // the unique index needs — unique per row, and unchanged when a bulk `save`
+            // rewrites the table, which a freshly minted UUID would not be.
+            mutation.id.uuidString,
+            "pending",
+            0,
+            nil,
+            nil,
+            nil
+        ]
+    }
+
     private func insert(mutation: PendingMutation, in db: Database) throws {
         try db.execute(
-            sql: "INSERT INTO pending_mutations (id, object_id, object_type, operation, created_at) VALUES (?, ?, ?, ?, ?)",
-            arguments: [
-                mutation.id.uuidString,
-                mutation.objectID.uuidString,
-                mutation.objectType.rawValue,
-                mutation.operation.rawValue,
-                encodeInstant(mutation.createdAt)
-            ]
+            sql: Self.insertSQL(table: "pending_mutations", columns: Self.pendingMutationColumns),
+            arguments: pendingMutationArguments(mutation)
         )
+    }
+
+    /// Note for M2: this rewrites `status`, `attempt_count` and the retry timestamps from the
+    /// values above, which today are always the "freshly enqueued" defaults because
+    /// `PendingMutation` carries no retry state yet. Once M2 adds those stored properties the
+    /// retry bookkeeping must come off the model rather than being reset here — otherwise
+    /// re-enqueuing a mutation would silently rewind its attempt count.
+    private func upsert(mutation: PendingMutation, in db: Database) throws {
+        try db.execute(
+            sql: Self.upsertSQL(table: "pending_mutations", columns: Self.pendingMutationColumns),
+            arguments: pendingMutationArguments(mutation)
+        )
+    }
+
+    private static let tombstoneColumns = [
+        "id", "object_id", "object_type", "title", "deleted_at",
+        "event_snapshot_json", "deletion_synced_at", "deleted_by", "purge_after"
+    ]
+
+    private func tombstoneArguments(_ tombstone: DeletedEventTombstone) -> StatementArguments {
+        [
+            tombstone.id.uuidString,
+            tombstone.eventID.uuidString,
+            EngineEntityType.event.rawValue,
+            tombstone.title,
+            encodeInstant(tombstone.deletedAt),
+            tombstone.eventSnapshotJSON,
+            tombstone.deletionSyncedAt.map(encodeInstant),
+            // `deletedBy` and the purge deadline become stored fields on the tombstone type
+            // in M3, when `DeletedEventTombstone` generalises to `DeletedObjectTombstone`.
+            // Writing the spec 2.13 defaults now means the columns are never NULL, so the
+            // purge job M3 adds can index `purge_after` rather than coalescing around holes.
+            TombstoneCause.userEdit.rawValue,
+            encodeInstant(EngineRetentionPolicy.purgeDate(forTombstoneDeletedAt: tombstone.deletedAt))
+        ]
     }
 
     private func insert(tombstone: DeletedEventTombstone, in db: Database) throws {
         try db.execute(
-            sql: """
-                INSERT INTO deleted_objects (
-                    id, object_id, object_type, title, deleted_at,
-                    event_snapshot_json, deletion_synced_at
-                )
-                VALUES (?, ?, 'event', ?, ?, ?, ?)
-                """,
-            arguments: [
-                tombstone.id.uuidString,
-                tombstone.eventID.uuidString,
-                tombstone.title,
-                encodeInstant(tombstone.deletedAt),
-                tombstone.eventSnapshotJSON,
-                tombstone.deletionSyncedAt.map(encodeInstant)
-            ]
+            sql: Self.insertSQL(table: "deleted_objects", columns: Self.tombstoneColumns),
+            arguments: tombstoneArguments(tombstone)
         )
+    }
+
+    private func upsert(tombstone: DeletedEventTombstone, in db: Database) throws {
+        try db.execute(
+            sql: Self.upsertSQL(table: "deleted_objects", columns: Self.tombstoneColumns),
+            arguments: tombstoneArguments(tombstone)
+        )
+    }
+
+    private static let recurrenceExceptionColumns = [
+        "id", "master_event_id", "original_occurrence_start", "original_occurrence_local_date",
+        "exception_type", "replacement_event_id"
+    ]
+
+    private func recurrenceExceptionArguments(_ exception: RecurrenceException) -> StatementArguments {
+        [
+            exception.id.uuidString,
+            exception.masterEventID.uuidString,
+            exception.originalOccurrenceStart.map(encodeInstant),
+            exception.originalOccurrenceLocalDate,
+            exception.exceptionType.rawValue,
+            exception.replacementEventID?.uuidString
+        ]
     }
 
     private func insert(exception: RecurrenceException, in db: Database) throws {
         try db.execute(
-            sql: """
-                INSERT INTO event_recurrence_exceptions (
-                    id, master_event_id, original_occurrence_start, original_occurrence_local_date,
-                    exception_type, replacement_event_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-            arguments: [
-                exception.id.uuidString,
-                exception.masterEventID.uuidString,
-                exception.originalOccurrenceStart.map(encodeInstant),
-                exception.originalOccurrenceLocalDate,
-                exception.exceptionType.rawValue,
-                exception.replacementEventID?.uuidString
-            ]
+            sql: Self.insertSQL(table: "event_recurrence_exceptions", columns: Self.recurrenceExceptionColumns),
+            arguments: recurrenceExceptionArguments(exception)
+        )
+    }
+
+    private func upsert(exception: RecurrenceException, in db: Database) throws {
+        try db.execute(
+            sql: Self.upsertSQL(table: "event_recurrence_exceptions", columns: Self.recurrenceExceptionColumns),
+            arguments: recurrenceExceptionArguments(exception)
         )
     }
 

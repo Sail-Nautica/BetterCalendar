@@ -9,6 +9,19 @@ struct LocalCalendarDatabase: Equatable {
     var settings: AppSettings = .defaultSettings
     var recurrenceExceptions: [RecurrenceException] = []
 
+    /// The version of *this snapshot format* — the JSON envelope `JSONCalendarRepository`
+    /// writes and `LocalCalendarDatabase.init(from:)` decodes tolerantly.
+    ///
+    /// This is deliberately **not** the SQLite schema version. The two numbers count
+    /// different things and have drifted apart by design: the relational schema is versioned
+    /// by `SQLiteCalendarRepository.migrationIdentifiers`, whose count (16 as of Phase 2 M1)
+    /// is what gets stamped into the `schema_metadata` table and checksummed per spec 2.17.
+    /// The snapshot format is versioned here, and has needed no incompatible change since
+    /// Phase 0 because every field added since has been decoded with `decodeIfPresent`.
+    ///
+    /// `SQLiteCalendarRepository.load()` stamps this value onto the databases it returns for
+    /// exactly that reason: it is describing the in-memory value it just built, not the
+    /// migration state of the file it read.
     static let currentSchemaVersion = 1
 }
 

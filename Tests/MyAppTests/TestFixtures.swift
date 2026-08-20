@@ -88,6 +88,9 @@ final class StubCalendarRepository: LocalCalendarRepository {
     var loadResult: Result<LocalCalendarDatabase, Error>
     var saveError: Error?
     private(set) var savedDatabases: [LocalCalendarDatabase] = []
+    /// Transactions passed to `apply`, in order, so a test can assert on the *shape* of a
+    /// mutation (spec 2.2) and not only on the database that came out the other end.
+    private(set) var appliedTransactions: [EngineTransaction] = []
 
     init(loadResult: Result<LocalCalendarDatabase, Error> = .success(TestData.database()), saveError: Error? = nil) {
         self.loadResult = loadResult
@@ -103,6 +106,18 @@ final class StubCalendarRepository: LocalCalendarRepository {
             throw saveError
         }
         savedDatabases.append(database)
+    }
+
+    /// Folds the transaction into the stub's own state so a later `load()` observes it, which
+    /// is what makes the stub behave like a real repository across a save/reload cycle.
+    func apply(_ transaction: EngineTransaction) throws {
+        if let saveError {
+            throw saveError
+        }
+        let updated = try loadResult.get().applying(transaction)
+        appliedTransactions.append(transaction)
+        savedDatabases.append(updated)
+        loadResult = .success(updated)
     }
 
     func searchEventIDs(matching query: String) throws -> [UUID] {
