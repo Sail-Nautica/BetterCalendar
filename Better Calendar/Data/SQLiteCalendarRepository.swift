@@ -287,6 +287,16 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         }
     }
 
+    /// Spec 2.18 step 4: SQLite's own structural integrity check, run after step 3's
+    /// migrations — via `openDatabase()`, so a database that still needs migrating gets that
+    /// done first rather than being checked in a stale shape.
+    func integrityCheckPassed() throws -> Bool {
+        let databaseQueue = try openDatabase()
+        return try databaseQueue.read { db in
+            try String.fetchOne(db, sql: "PRAGMA integrity_check") == "ok"
+        }
+    }
+
     private func databaseURL() throws -> URL {
         if let fileURLOverride {
             return fileURLOverride
@@ -1055,32 +1065,28 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "event_snapshot_json", "deletion_synced_at", "deleted_by", "purge_after"
     ]
 
-    private func tombstoneArguments(_ tombstone: DeletedEventTombstone) -> StatementArguments {
+    private func tombstoneArguments(_ tombstone: DeletedObjectTombstone) -> StatementArguments {
         [
             tombstone.id.uuidString,
-            tombstone.eventID.uuidString,
-            EngineEntityType.event.rawValue,
+            tombstone.entityID.uuidString,
+            tombstone.entityType.rawValue,
             tombstone.title,
             encodeInstant(tombstone.deletedAt),
             tombstone.eventSnapshotJSON,
             tombstone.deletionSyncedAt.map(encodeInstant),
-            // `deletedBy` and the purge deadline become stored fields on the tombstone type
-            // in M3, when `DeletedEventTombstone` generalises to `DeletedObjectTombstone`.
-            // Writing the spec 2.13 defaults now means the columns are never NULL, so the
-            // purge job M3 adds can index `purge_after` rather than coalescing around holes.
-            TombstoneCause.userEdit.rawValue,
-            encodeInstant(EngineRetentionPolicy.purgeDate(forTombstoneDeletedAt: tombstone.deletedAt))
+            tombstone.deletedBy.rawValue,
+            encodeInstant(tombstone.purgeAfter)
         ]
     }
 
-    private func insert(tombstone: DeletedEventTombstone, in db: Database) throws {
+    private func insert(tombstone: DeletedObjectTombstone, in db: Database) throws {
         try db.execute(
             sql: Self.insertSQL(table: "deleted_objects", columns: Self.tombstoneColumns),
             arguments: tombstoneArguments(tombstone)
         )
     }
 
-    private func upsert(tombstone: DeletedEventTombstone, in db: Database) throws {
+    private func upsert(tombstone: DeletedObjectTombstone, in db: Database) throws {
         try db.execute(
             sql: Self.upsertSQL(table: "deleted_objects", columns: Self.tombstoneColumns),
             arguments: tombstoneArguments(tombstone)
@@ -1355,19 +1361,23 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         }
     }
 
-    private func fetchDeletedEventTombstones(in db: Database) throws -> [DeletedEventTombstone] {
+    private func fetchDeletedEventTombstones(in db: Database) throws -> [DeletedObjectTombstone] {
         let rows = try Row.fetchAll(db, sql: "SELECT * FROM deleted_objects WHERE object_type = 'event' ORDER BY deleted_at ASC")
         return rows.compactMap { row in
             guard let id = UUID(uuidString: row["id"]),
                   let eventID = UUID(uuidString: row["object_id"]) else {
                 return nil
             }
+            let deletedAt = decodeInstant(row["deleted_at"]) ?? .now
 
-            return DeletedEventTombstone(
+            return DeletedObjectTombstone(
                 id: id,
-                eventID: eventID,
+                entityType: EngineEntityType(rawValue: row["object_type"]) ?? .event,
+                entityID: eventID,
                 title: row["title"] ?? "Deleted Event",
-                deletedAt: decodeInstant(row["deleted_at"]) ?? .now,
+                deletedAt: deletedAt,
+                deletedBy: (row["deleted_by"] as String?).flatMap(TombstoneCause.init(rawValue:)) ?? .userEdit,
+                purgeAfter: decodeInstant(row["purge_after"]) ?? EngineRetentionPolicy.purgeDate(forTombstoneDeletedAt: deletedAt),
                 eventSnapshotJSON: row["event_snapshot_json"],
                 deletionSyncedAt: decodeInstant(row["deletion_synced_at"])
             )
