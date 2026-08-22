@@ -25,7 +25,10 @@ enum EventMutationUseCases {
         case applied(EngineTransaction)
         /// Spec 2.10/2.11: a mutation with this `idempotencyKey` is already `pending` or
         /// `applied` in the outbox. Replaying it is a no-op that still counts as success —
-        /// the effect it wanted already exists (or will shortly).
+        /// the effect it wanted already exists (or will shortly). Spec 2.13/BC-ENG-006's
+        /// resurrection guard reuses this same case: a delayed create/update for an entity
+        /// that already has a tombstone is likewise "nothing to do, already handled" — the
+        /// delete that produced the tombstone always wins.
         case duplicate
         /// Spec 2.14: `expectedVersionNumber` did not match the entity's current stored
         /// version, so the write is rejected rather than silently overwriting a newer one.
@@ -47,6 +50,7 @@ enum EventMutationUseCases {
         in context: Context
     ) -> Outcome {
         if let outcome = existingOutcome(forIdempotencyKey: idempotencyKey, in: context.database) { return outcome }
+        if hasLiveTombstone(forEntityID: event.id, in: context.database) { return .duplicate }
 
         var changes: [EntityChange] = [.upsertEvent(event)]
         if let exception {
@@ -78,6 +82,10 @@ enum EventMutationUseCases {
         mutate: (inout CalendarEvent) -> Void
     ) -> Outcome {
         if let outcome = existingOutcome(forIdempotencyKey: idempotencyKey, in: context.database) { return outcome }
+        // Checked before "does it exist": a delayed update replaying against an event that was
+        // since deleted must report success (BC-ENG-006), not the generic not-found conflict
+        // below — those are different situations even though neither has an event to update.
+        if hasLiveTombstone(forEntityID: eventID, in: context.database) { return .duplicate }
         guard let previous = context.database.events.first(where: { $0.id == eventID }) else {
             return .conflicted(currentVersionNumber: 0)
         }
@@ -170,6 +178,7 @@ enum EventMutationUseCases {
         eventID: UUID,
         expectedVersionNumber: Int,
         tombstoneID: UUID = UUID(),
+        deletedBy: TombstoneCause = .userEdit,
         idempotencyKey: UUID = UUID(),
         in context: Context
     ) -> Outcome {
@@ -182,11 +191,13 @@ enum EventMutationUseCases {
             return .conflicted(currentVersionNumber: previous.versionNumber)
         }
 
-        let tombstone = DeletedEventTombstone(
+        let tombstone = DeletedObjectTombstone(
             id: tombstoneID,
-            eventID: previous.id,
+            entityType: .event,
+            entityID: previous.id,
             title: previous.title,
             deletedAt: context.now,
+            deletedBy: deletedBy,
             eventSnapshotJSON: previous.encodedSnapshotJSON(),
             deletionSyncedAt: nil
         )
@@ -362,14 +373,21 @@ enum EventMutationUseCases {
         in context: Context
     ) -> Outcome {
         if let outcome = existingOutcome(forIdempotencyKey: idempotencyKey, in: context.database) { return outcome }
-        guard !events.isEmpty else { return .applied(.empty) }
 
-        var changes: [EntityChange] = events.map { .upsertEvent($0) }
-        changes.append(contentsOf: exceptions.map { .upsertRecurrenceException($0) })
+        // Spec 2.13/BC-ENG-006: skip (not fail) any event whose id already has a live
+        // tombstone, rather than resurrecting it — the rest of the batch still commits.
+        let tombstonedIDs = Set(context.database.deletedEventTombstones.map(\.entityID))
+        let eventsToImport = events.filter { !tombstonedIDs.contains($0.id) }
+        guard !eventsToImport.isEmpty else { return .applied(.empty) }
+        let importedIDs = Set(eventsToImport.map(\.id))
+        let exceptionsToImport = exceptions.filter { importedIDs.contains($0.masterEventID) }
+
+        var changes: [EntityChange] = eventsToImport.map { .upsertEvent($0) }
+        changes.append(contentsOf: exceptionsToImport.map { .upsertRecurrenceException($0) })
 
         var journalEntries: [ChangeJournalEntry] = []
         var mutations: [PendingMutation] = []
-        for event in events {
+        for event in eventsToImport {
             let entry = journalEntry(
                 entityType: .event,
                 entityID: event.id,
@@ -393,6 +411,13 @@ enum EventMutationUseCases {
             $0.idempotencyKey == key && ($0.status == .pending || $0.status == .applied)
         }
         return alreadyEnqueued ? .duplicate : nil
+    }
+
+    /// Spec 2.13/BC-ENG-006's resurrection guard: an entity with a tombstone still present in
+    /// `database` hasn't been purged yet, so per spec 2.13's retention semantics it is still
+    /// authoritative — the delete it records always wins over a delayed create/update.
+    private static func hasLiveTombstone(forEntityID entityID: UUID, in database: LocalCalendarDatabase) -> Bool {
+        database.deletedEventTombstones.contains { $0.entityID == entityID }
     }
 
     private static func journalEntry(

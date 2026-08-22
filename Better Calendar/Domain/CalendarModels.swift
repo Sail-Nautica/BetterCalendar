@@ -815,16 +815,103 @@ enum RecurrenceExceptionType: String, Codable, Hashable {
     case cancelled
 }
 
-struct DeletedEventTombstone: Identifiable, Codable, Hashable {
+/// Spec 2.13's generalized tombstone. Named `DeletedEventTombstone` through M1/M2 because only
+/// events were ever tombstoned; M3 generalizes it to the full spec shape while keeping every
+/// M1/M2 call site compiling unchanged — see the back-compat `eventID` accessor/initializer and
+/// the `DeletedEventTombstone` typealias below.
+struct DeletedObjectTombstone: Identifiable, Hashable {
     var id: UUID
-    var eventID: UUID
+    var entityType: EngineEntityType
+    var entityID: UUID
     var title: String
     var deletedAt: Date
+    /// Spec 2.13: why this object was deleted — what lets a later replay distinguish a
+    /// mutation that *should* be suppressed (BC-ENG-006) from one that is merely late.
+    var deletedBy: TombstoneCause
+    /// Spec 2.13: the retention deadline, stored rather than computed on read so it agrees
+    /// with `deleted_objects.purge_after` and can be indexed by a future purge job.
+    var purgeAfter: Date
     /// Full JSON snapshot of the deleted event, enough to reconstruct it (spec 0.12). Optional
     /// so tombstones written before this field existed still decode.
     var eventSnapshotJSON: String?
     var deletionSyncedAt: Date?
+
+    /// The spec 2.13 shape.
+    init(
+        id: UUID,
+        entityType: EngineEntityType = .event,
+        entityID: UUID,
+        title: String,
+        deletedAt: Date,
+        deletedBy: TombstoneCause = .userEdit,
+        purgeAfter: Date? = nil,
+        eventSnapshotJSON: String? = nil,
+        deletionSyncedAt: Date? = nil
+    ) {
+        self.id = id
+        self.entityType = entityType
+        self.entityID = entityID
+        self.title = title
+        self.deletedAt = deletedAt
+        self.deletedBy = deletedBy
+        self.purgeAfter = purgeAfter ?? EngineRetentionPolicy.purgeDate(forTombstoneDeletedAt: deletedAt)
+        self.eventSnapshotJSON = eventSnapshotJSON
+        self.deletionSyncedAt = deletionSyncedAt
+    }
 }
+
+extension DeletedObjectTombstone {
+    /// The pre-M3 shape every M1/M2 call site uses: no `entityType`/`deletedBy`/`purgeAfter`,
+    /// `eventID:` instead of `entityID:`. Declared in an extension so it doesn't suppress the
+    /// designated initializer above.
+    init(id: UUID, eventID: UUID, title: String, deletedAt: Date, eventSnapshotJSON: String?, deletionSyncedAt: Date?) {
+        self.init(id: id, entityType: .event, entityID: eventID, title: title, deletedAt: deletedAt, eventSnapshotJSON: eventSnapshotJSON, deletionSyncedAt: deletionSyncedAt)
+    }
+
+    var eventID: UUID {
+        get { entityID }
+        set { entityID = newValue }
+    }
+}
+
+extension DeletedObjectTombstone: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case id, entityType
+        case entityID = "eventID"
+        case title, deletedAt, deletedBy, purgeAfter, eventSnapshotJSON, deletionSyncedAt
+    }
+
+    /// Decodes tolerantly so tombstones written before `entityType`/`deletedBy`/`purgeAfter`
+    /// existed still load, and keeps the JSON key `eventID` rather than renaming it to
+    /// `entityID` — the persisted snapshot format survives the Swift-level rename.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        entityType = try container.decodeIfPresent(EngineEntityType.self, forKey: .entityType) ?? .event
+        entityID = try container.decode(UUID.self, forKey: .entityID)
+        title = try container.decode(String.self, forKey: .title)
+        deletedAt = try container.decode(Date.self, forKey: .deletedAt)
+        deletedBy = try container.decodeIfPresent(TombstoneCause.self, forKey: .deletedBy) ?? .userEdit
+        purgeAfter = try container.decodeIfPresent(Date.self, forKey: .purgeAfter) ?? EngineRetentionPolicy.purgeDate(forTombstoneDeletedAt: deletedAt)
+        eventSnapshotJSON = try container.decodeIfPresent(String.self, forKey: .eventSnapshotJSON)
+        deletionSyncedAt = try container.decodeIfPresent(Date.self, forKey: .deletionSyncedAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(entityType, forKey: .entityType)
+        try container.encode(entityID, forKey: .entityID)
+        try container.encode(title, forKey: .title)
+        try container.encode(deletedAt, forKey: .deletedAt)
+        try container.encode(deletedBy, forKey: .deletedBy)
+        try container.encode(purgeAfter, forKey: .purgeAfter)
+        try container.encodeIfPresent(eventSnapshotJSON, forKey: .eventSnapshotJSON)
+        try container.encodeIfPresent(deletionSyncedAt, forKey: .deletionSyncedAt)
+    }
+}
+
+typealias DeletedEventTombstone = DeletedObjectTombstone
 
 struct EventDraft: Equatable {
     var id: UUID?

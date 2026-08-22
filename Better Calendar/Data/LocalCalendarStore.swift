@@ -33,20 +33,26 @@ final class BetterCalendarStore {
             .sorted { $0.startDate < $1.startDate }
     }
 
+    /// Spec 2.18's ten-step launch sequence — see `LaunchRecovery`'s doc comment for exactly
+    /// which steps live there versus here.
     func load() {
-        do {
-            let database = try repository.load()
-            apply(database)
-            ensureDefaultCalendar()
-            lastError = nil
-            purgeExpiredTombstones()
-            reconcileNotifications()
-        } catch {
-            let fallback = LocalCalendarDatabase.seed
-            apply(fallback)
+        let outcome = LaunchRecovery.run(repository: repository)
+        apply(outcome.database)
+        ensureDefaultCalendar()
+
+        if outcome.usedFallbackSeed {
             lastError = "Calendar data could not be loaded. Sample local data is being shown while the existing file is left available for recovery."
-            reconcileNotifications()
+        } else if outcome.needsRecoveryPrompt {
+            lastError = "Calendar data may be corrupted. Existing data is being kept while recovery options are prepared."
+        } else {
+            lastError = nil
         }
+
+        // Step 9: bumping this here, unconditionally, is cheap insurance against the device's
+        // time zone having changed while the app was suspended — `refreshForSystemTimeChange()`
+        // already does the same thing reactively for a live TZ-change notification.
+        environmentRevision += 1
+        reconcileNotifications()
     }
 
     func saveEvent(from draft: EventDraft) -> Bool {
@@ -420,7 +426,7 @@ final class BetterCalendarStore {
             for event in affectedEvents {
                 changes.append(.deleteEvent(event.id))
                 tombstones.append(
-                    DeletedEventTombstone(id: UUID(), eventID: event.id, title: event.title, deletedAt: now, eventSnapshotJSON: event.encodedSnapshotJSON(), deletionSyncedAt: nil)
+                    DeletedObjectTombstone(id: UUID(), entityType: .event, entityID: event.id, title: event.title, deletedAt: now, deletedBy: .calendarDeletion, eventSnapshotJSON: event.encodedSnapshotJSON(), deletionSyncedAt: nil)
                 )
 
                 let entry = ChangeJournalEntry(id: UUID(), entityType: .event, entityID: event.id, operation: .delete, fieldDiff: FieldDiff.compute(from: event, to: Optional<CalendarEvent>.none), source: .userEdit, occurredAt: now, appliedMutationID: nil)
