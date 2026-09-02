@@ -76,7 +76,7 @@ enum RecurrenceSplitter {
     ) -> Outcome {
         switch scope {
         case .thisEventOnly:
-            return planThisEventOnlyDelete(master: master, occurrenceKey: occurrenceKey, idempotencyKey: idempotencyKey, in: context)
+            return planThisEventOnlyDelete(master: master, occurrenceKey: occurrenceKey, expectedVersionNumber: expectedVersionNumber, idempotencyKey: idempotencyKey, in: context)
         case .allEvents:
             return wrap(EventMutationUseCases.deleteEvent(eventID: master.id, expectedVersionNumber: expectedVersionNumber, tombstoneID: tombstoneID, deletedBy: .userEdit, idempotencyKey: idempotencyKey, in: context))
         case .thisAndFuture:
@@ -128,11 +128,12 @@ enum RecurrenceSplitter {
     private static func planThisEventOnlyDelete(
         master: CalendarEvent,
         occurrenceKey: OccurrenceKey,
+        expectedVersionNumber: Int,
         idempotencyKey: UUID,
         in context: EventMutationUseCases.Context
     ) -> Outcome {
         if let replacement = existingReplacement(forMasterID: master.id, occurrenceStart: occurrenceKey.originalStart, in: context.database) {
-            return wrap(EventMutationUseCases.deleteEvent(eventID: replacement.id, expectedVersionNumber: replacement.versionNumber, idempotencyKey: idempotencyKey, in: context))
+            return wrap(EventMutationUseCases.deleteEvent(eventID: replacement.id, expectedVersionNumber: expectedVersionNumber, idempotencyKey: idempotencyKey, in: context))
         }
 
         let exception = RecurrenceException(
@@ -282,12 +283,25 @@ enum RecurrenceSplitter {
         let splitAtExceptions = relevantExceptions.filter { $0.matches(occurrenceStart: occurrenceKey.originalStart, event: master) }
         let laterExceptions = relevantExceptions.filter { !isBefore($0, splitPoint: occurrenceKey.originalStart, event: master) && !$0.matches(occurrenceStart: occurrenceKey.originalStart, event: master) }
 
+        // A transferred exception's own `replacementEventID` still carries `recurrenceMasterID`
+        // pointing at the old (now truncated) master. Left alone, `resolveSeries(for:)` would
+        // resolve that replacement back to the wrong half of the split the next time it's
+        // selected for an All Events/This and Future action, so its series metadata moves to
+        // the new master right alongside the exception it belongs to.
+        let transferredReplacements: [CalendarEvent] = laterExceptions.compactMap { exception in
+            guard let replacementID = exception.replacementEventID,
+                  var replacement = context.database.events.first(where: { $0.id == replacementID }) else { return nil }
+            replacement.recurrenceMasterID = newMaster.id
+            return replacement
+        }
+
         var changes: [EntityChange] = [.upsertEvent(truncatedMaster), .upsertEvent(newMaster)]
         changes.append(contentsOf: laterExceptions.map {
             var transferred = $0
             transferred.masterEventID = newMaster.id
             return .upsertRecurrenceException(transferred)
         })
+        changes.append(contentsOf: transferredReplacements.map { .upsertEvent($0) })
         // The occurrence being split on is folded directly into the new master's own first
         // occurrence — its exception (and any standalone replacement it pointed at) is retired
         // rather than transferred, since the new master's content (from `edits`) already is

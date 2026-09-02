@@ -336,6 +336,111 @@ final class RecurrenceMatrixTests: XCTestCase {
         XCTAssertEqual(beforeDates.count, 3, "Sep 1-3 stay with the truncated master")
     }
 
+    /// A transferred exception's own replacement event still carried `recurrenceMasterID`
+    /// pointing at the truncated original master, so `BetterCalendarStore.resolveSeries(for:)`
+    /// would resolve it back to the wrong half of the split the next time it was selected for
+    /// an All Events/This and Future action. The replacement's series metadata must move to the
+    /// new master right alongside the exception it belongs to.
+    func testThisAndFutureEditReparentsTheTransferredExceptionsReplacementEvent() throws {
+        let fixture = try makeSeededRepository(recurrence: dailyTenOccurrences)
+        let master = fixture.database.events[0]
+        let splitStart = TestData.date("2026-09-05T14:00:00Z")
+        let key = OccurrenceKey(recurrenceMasterID: master.id, originalStart: splitStart)
+        let afterDate = TestData.date("2026-09-08T14:00:00Z")
+
+        var replacement = TestData.event(id: UUID(), title: "Rescheduled", startDate: TestData.date("2026-09-08T15:00:00Z"), endDate: TestData.date("2026-09-08T16:00:00Z"))
+        replacement.recurrenceMasterID = master.id
+        replacement.recurrenceOriginalStart = afterDate
+        let afterException = RecurrenceException(id: UUID(), masterEventID: master.id, originalOccurrenceStart: afterDate, originalOccurrenceLocalDate: nil, exceptionType: .modified, replacementEventID: replacement.id)
+        try fixture.insert(events: [replacement])
+        try fixture.insert(exceptions: [afterException])
+
+        let outcome = RecurrenceSplitter.planEdit(scope: .thisAndFuture, master: master, occurrenceKey: key, expectedVersionNumber: master.versionNumber, in: try fixture.context()) { _ in }
+        guard case .applied(let result) = outcome else { return XCTFail("expected .applied, got \(outcome)") }
+        try fixture.repository.apply(result.transaction)
+
+        let reloaded = try fixture.repository.load()
+        let newMaster = try XCTUnwrap(reloaded.events.first { $0.id != master.id && $0.id != replacement.id })
+
+        let transferredException = try XCTUnwrap(reloaded.recurrenceExceptions.first { $0.id == afterException.id })
+        XCTAssertEqual(transferredException.masterEventID, newMaster.id)
+
+        let reparentedReplacement = try XCTUnwrap(reloaded.events.first { $0.id == replacement.id })
+        XCTAssertEqual(reparentedReplacement.recurrenceMasterID, newMaster.id, "the transferred exception's own replacement must follow it to the new master")
+    }
+
+    // MARK: - Store-level expectedVersionNumber threading (editSeries/deleteSeries)
+
+    /// The planner-level tests above all pass `expectedVersionNumber` explicitly, so they never
+    /// exercised how `BetterCalendarStore.editSeries`/`deleteSeries` compute it in the first
+    /// place. `.thisEventOnly` must check whichever entity it will actually write — the existing
+    /// standalone replacement once one exists — not always the master, which never bumps for a
+    /// This Event edit and so drifts out of step with the replacement's own version.
+    @MainActor
+    func testEditSeriesThisEventOnlyChecksTheReplacementsOwnVersionNotTheMasters() throws {
+        let start = TestData.date("2026-09-07T14:00:00Z")
+        let master = TestData.event(
+            title: "Standup",
+            startDate: start,
+            endDate: start.addingTimeInterval(30 * 60),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(3))
+        )
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [master])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+        let range = DateInterval(start: TestData.date("2026-09-01T00:00:00Z"), end: TestData.date("2026-10-01T00:00:00Z"))
+        let secondOccurrenceStart = TestData.date("2026-09-14T14:00:00Z")
+
+        func occurrence() throws -> CalendarOccurrence {
+            try XCTUnwrap(store.visibleOccurrences(in: range).first { $0.occurrenceStartDate == secondOccurrenceStart })
+        }
+
+        XCTAssertTrue(store.editSeries(try occurrence(), scope: .thisEventOnly) { $0.title = "v1" })
+        // This second edit lands on the replacement created above. It happens to pass even under
+        // the pre-fix code, since the master (never bumped by a This Event edit) and the
+        // brand-new replacement are still both at version 1 here.
+        XCTAssertTrue(store.editSeries(try occurrence(), scope: .thisEventOnly) { $0.title = "v2" })
+        let replacementAfterSecondEdit = try XCTUnwrap(store.events.first { $0.recurrenceMasterID == master.id })
+        XCTAssertEqual(replacementAfterSecondEdit.versionNumber, 2, "This Event bumps the replacement's version, not the master's")
+
+        // The master is still at version 1 here. Checking *its* version for this third edit
+        // (rather than the replacement's, now at 2) would reject a perfectly current caller.
+        XCTAssertTrue(store.editSeries(try occurrence(), scope: .thisEventOnly) { $0.title = "v3" }, "a version check against the replacement's own current version must succeed")
+        XCTAssertNil(store.lastError)
+        XCTAssertEqual(store.events.first { $0.recurrenceMasterID == master.id }?.title, "v3")
+    }
+
+    /// Delete counterpart: a `deleteSeries(.thisEventOnly)` call built against a stale replacement
+    /// version must be rejected as a conflict rather than deleting whatever the replacement has
+    /// since become.
+    @MainActor
+    func testDeleteSeriesThisEventOnlyRejectsAStaleExpectedVersionForAnAlreadyModifiedOccurrence() throws {
+        let start = TestData.date("2026-09-07T14:00:00Z")
+        let master = TestData.event(
+            title: "Standup",
+            startDate: start,
+            endDate: start.addingTimeInterval(30 * 60),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(3))
+        )
+        let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [master])))
+        let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
+        let range = DateInterval(start: TestData.date("2026-09-01T00:00:00Z"), end: TestData.date("2026-10-01T00:00:00Z"))
+        let secondOccurrenceStart = TestData.date("2026-09-14T14:00:00Z")
+
+        func occurrence() throws -> CalendarOccurrence {
+            try XCTUnwrap(store.visibleOccurrences(in: range).first { $0.occurrenceStartDate == secondOccurrenceStart })
+        }
+
+        XCTAssertTrue(store.editSeries(try occurrence(), scope: .thisEventOnly) { $0.title = "v1" })
+        // Captured before a second edit moves the replacement on to version 2 — simulating a
+        // caller (e.g. a delete confirmation still on screen) acting on now-stale information.
+        let staleOccurrence = try occurrence()
+        XCTAssertTrue(store.editSeries(try occurrence(), scope: .thisEventOnly) { $0.title = "v2" })
+
+        XCTAssertFalse(store.deleteSeries(staleOccurrence, scope: .thisEventOnly), "a delete based on a stale replacement version must be rejected, not silently applied against whatever is current")
+        XCTAssertNotNil(store.lastError)
+        XCTAssertEqual(store.events.first { $0.recurrenceMasterID == master.id }?.title, "v2", "the newer replacement must survive an out-of-date delete")
+    }
+
     // MARK: - Helpers
 
     /// Expands `event` over a window comfortably wider than any date this file's fixtures use.
