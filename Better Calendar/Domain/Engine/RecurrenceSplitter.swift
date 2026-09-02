@@ -30,6 +30,10 @@ enum RecurrenceSplitter {
         case applied(Result)
         case duplicate
         case conflicted(currentVersionNumber: Int)
+        /// Spec 3.10, mirroring `EventMutationUseCases.Outcome.rejected`: a scope edit is still
+        /// an edit, and a read-only calendar refuses one wholesale rather than splitting a
+        /// series it does not own.
+        case rejected(CapabilityViolation)
     }
 
     // MARK: - Edit
@@ -385,6 +389,8 @@ enum RecurrenceSplitter {
             return .duplicate
         case .conflicted(let currentVersionNumber):
             return .conflicted(currentVersionNumber: currentVersionNumber)
+        case .rejected(let violation):
+            return .rejected(violation)
         }
     }
 }

@@ -67,6 +67,45 @@ struct BetterCalendar: Identifiable, Hashable {
     /// Spec 2.14: local optimistic-concurrency counter, mirroring `CalendarEvent.versionNumber`.
     var versionNumber: Int = 1
 
+    // MARK: - Provider identity (spec 3.6)
+    //
+    // Every field below is appended after `versionNumber` and defaulted, so the memberwise
+    // initializer keeps working unchanged at all four existing construction sites. The
+    // `calendars` table has carried `provider`, `provider_account_id`, `provider_calendar_id`,
+    // `is_read_only`, and `time_zone_id` since `v001` — `SQLiteCalendarRepository` simply
+    // hardcoded them. These are what let it stop.
+
+    /// Who owns the data (spec 0.6's ownership model). Orthogonal to `connectionMethod`: a
+    /// Google calendar is `.google` whether we reach it through the device or, from Phase 5,
+    /// through the Google API directly. See ADR 0004.
+    var provider: EventProvider = .betterCalendar
+    /// How Better Calendar reaches this calendar. See ADR 0004.
+    var connectionMethod: ConnectionMethod = .local
+    /// `EKSource` identifier, once a device calendar is mirrored.
+    var providerAccountID: String?
+    /// `EKCalendar.calendarIdentifier`. For a local calendar this stays the local `id`, matching
+    /// what the repository has always written.
+    var providerCalendarID: String?
+    /// `EKSource.title` ("iCloud", "Gmail", …), for the attribution required by BC-EK-018.
+    var accountName: String?
+    /// Set only when the calendar's color is not one of the six design tokens — device calendars
+    /// carry arbitrary RGB. `nil` means "render `colorName`." See ADR 0004.
+    var colorHex: String?
+    /// Spec 3.10: enforced at the model layer by `EventMutationUseCases`, not merely in the UI.
+    var isReadOnly: Bool = false
+    var timeZoneIdentifier: String?
+    var capabilities: CalendarCapabilities = .localDefaults
+
+    /// The single question every mutation path actually asks. Read-only is the coarse switch the
+    /// user sees; `capabilities` is the fine-grained truth a provider reports.
+    var allowsEventEditing: Bool {
+        !isReadOnly && capabilities.allowsContentModifications
+    }
+
+    var allowsEventCreation: Bool {
+        !isReadOnly && capabilities.allowsEventCreation
+    }
+
     static func localDefault(now: Date = .now) -> BetterCalendar {
         BetterCalendar(
             id: UUID(),
@@ -84,6 +123,8 @@ struct BetterCalendar: Identifiable, Hashable {
 extension BetterCalendar: Codable {
     private enum CodingKeys: String, CodingKey {
         case id, name, colorName, isVisible, isDefault, sortOrder, createdAt, updatedAt, versionNumber
+        case provider, connectionMethod, providerAccountID, providerCalendarID, accountName
+        case colorHex, isReadOnly, timeZoneIdentifier, capabilities
     }
 
     /// Decodes tolerantly so calendars written before `sortOrder` existed still load,
@@ -99,6 +140,18 @@ extension BetterCalendar: Codable {
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
         versionNumber = try container.decodeIfPresent(Int.self, forKey: .versionNumber) ?? 1
+        // Spec 3.6: a calendar written before provider identity existed decodes as exactly what
+        // it was — a local, writable, Better Calendar-owned calendar. Same tolerance the
+        // `sortOrder` and `versionNumber` additions above already established.
+        provider = try container.decodeIfPresent(EventProvider.self, forKey: .provider) ?? .betterCalendar
+        connectionMethod = try container.decodeIfPresent(ConnectionMethod.self, forKey: .connectionMethod) ?? .local
+        providerAccountID = try container.decodeIfPresent(String.self, forKey: .providerAccountID)
+        providerCalendarID = try container.decodeIfPresent(String.self, forKey: .providerCalendarID)
+        accountName = try container.decodeIfPresent(String.self, forKey: .accountName)
+        colorHex = try container.decodeIfPresent(String.self, forKey: .colorHex)
+        isReadOnly = try container.decodeIfPresent(Bool.self, forKey: .isReadOnly) ?? false
+        timeZoneIdentifier = try container.decodeIfPresent(String.self, forKey: .timeZoneIdentifier)
+        capabilities = try container.decodeIfPresent(CalendarCapabilities.self, forKey: .capabilities) ?? .localDefaults
     }
 
     func encode(to encoder: Encoder) throws {
@@ -112,6 +165,130 @@ extension BetterCalendar: Codable {
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(updatedAt, forKey: .updatedAt)
         try container.encode(versionNumber, forKey: .versionNumber)
+        try container.encode(provider, forKey: .provider)
+        try container.encode(connectionMethod, forKey: .connectionMethod)
+        try container.encodeIfPresent(providerAccountID, forKey: .providerAccountID)
+        try container.encodeIfPresent(providerCalendarID, forKey: .providerCalendarID)
+        try container.encodeIfPresent(accountName, forKey: .accountName)
+        try container.encodeIfPresent(colorHex, forKey: .colorHex)
+        try container.encode(isReadOnly, forKey: .isReadOnly)
+        try container.encodeIfPresent(timeZoneIdentifier, forKey: .timeZoneIdentifier)
+        try container.encode(capabilities, forKey: .capabilities)
+    }
+}
+
+/// Spec 3.7: how Better Calendar reaches a calendar, kept deliberately orthogonal to
+/// `EventProvider` (who owns the data). Conflating the two is what produces the duplicate
+/// connection the roadmap warns about — the same Google account reached through the device and
+/// through the Google API is one provider and two connection methods, not two providers.
+/// See ADR 0004.
+enum ConnectionMethod: String, Codable, Hashable, CaseIterable, Identifiable {
+    /// A Better Calendar-owned calendar; no provider round trip.
+    case local
+    /// Reached through EventKit (Phase 3).
+    case device
+    /// Reached through a provider API. Defined here so Phase 5 inherits the column rather than
+    /// migrating it, exactly as Phase 0 reserved `ProviderMetadata` before any provider existed.
+    /// Nothing in Phase 3 ever produces this value.
+    case direct
+
+    var id: String { rawValue }
+}
+
+/// Spec 3.10: what a calendar actually permits, as its provider reports it. Distinct from
+/// `isReadOnly`, which is the single coarse flag the UI shows: a calendar can be writable in
+/// general yet refuse a specific availability value, and Phase 3's EventKit adapter will report
+/// exactly that.
+///
+/// Defaults are the permissive local-calendar answers, so every pre-Phase-3 calendar — and every
+/// calendar the user creates in this app — behaves precisely as it did before this type existed.
+struct CalendarCapabilities: Codable, Hashable {
+    var allowsContentModifications: Bool
+    var allowsEventCreation: Bool
+    var allowedAvailabilities: [EventAvailability]
+    var supportsRecurrence: Bool
+    var supportsReminders: Bool
+    var isSubscribed: Bool
+    var isImmutable: Bool
+
+    static let localDefaults = CalendarCapabilities(
+        allowsContentModifications: true,
+        allowsEventCreation: true,
+        allowedAvailabilities: EventAvailability.allCases,
+        supportsRecurrence: true,
+        supportsReminders: true,
+        isSubscribed: false,
+        isImmutable: false
+    )
+
+    /// The capability set for a calendar Better Calendar may read but never write — a subscribed
+    /// feed, a birthday calendar, or a shared calendar the user only has read access to.
+    static let readOnly = CalendarCapabilities(
+        allowsContentModifications: false,
+        allowsEventCreation: false,
+        allowedAvailabilities: EventAvailability.allCases,
+        supportsRecurrence: true,
+        supportsReminders: false,
+        isSubscribed: false,
+        isImmutable: true
+    )
+
+    /// Decodes tolerantly for the same reason `BetterCalendar` does — a capabilities blob written
+    /// by an older build, or by a provider that reported fewer fields, still loads.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = CalendarCapabilities.localDefaults
+        allowsContentModifications = try container.decodeIfPresent(Bool.self, forKey: .allowsContentModifications) ?? defaults.allowsContentModifications
+        allowsEventCreation = try container.decodeIfPresent(Bool.self, forKey: .allowsEventCreation) ?? defaults.allowsEventCreation
+        allowedAvailabilities = try container.decodeIfPresent([EventAvailability].self, forKey: .allowedAvailabilities) ?? defaults.allowedAvailabilities
+        supportsRecurrence = try container.decodeIfPresent(Bool.self, forKey: .supportsRecurrence) ?? defaults.supportsRecurrence
+        supportsReminders = try container.decodeIfPresent(Bool.self, forKey: .supportsReminders) ?? defaults.supportsReminders
+        isSubscribed = try container.decodeIfPresent(Bool.self, forKey: .isSubscribed) ?? defaults.isSubscribed
+        isImmutable = try container.decodeIfPresent(Bool.self, forKey: .isImmutable) ?? defaults.isImmutable
+    }
+
+    init(
+        allowsContentModifications: Bool,
+        allowsEventCreation: Bool,
+        allowedAvailabilities: [EventAvailability],
+        supportsRecurrence: Bool,
+        supportsReminders: Bool,
+        isSubscribed: Bool,
+        isImmutable: Bool
+    ) {
+        self.allowsContentModifications = allowsContentModifications
+        self.allowsEventCreation = allowsEventCreation
+        self.allowedAvailabilities = allowedAvailabilities
+        self.supportsRecurrence = supportsRecurrence
+        self.supportsReminders = supportsReminders
+        self.isSubscribed = isSubscribed
+        self.isImmutable = isImmutable
+    }
+}
+
+/// Spec 3.10: why a mutation was refused before it was ever written locally. Carries the
+/// calendar's name because the only useful thing to tell the user is *which* calendar said no —
+/// on a device with several accounts, the identifier alone explains nothing.
+struct CapabilityViolation: Equatable, Hashable {
+    var calendarID: UUID
+    var calendarName: String
+    var reason: Reason
+
+    enum Reason: String, Equatable, Hashable {
+        /// The calendar does not permit modifying existing events.
+        case readOnly
+        /// The calendar does not permit adding new events.
+        case creationNotAllowed
+    }
+
+    /// User-facing copy, per the UI/UX §9.2 rule that an error says what happened and why.
+    var message: String {
+        switch reason {
+        case .readOnly:
+            "\"\(calendarName)\" is read-only, so this event can't be changed here."
+        case .creationNotAllowed:
+            "\"\(calendarName)\" doesn't allow new events."
+        }
     }
 }
 
@@ -302,6 +479,21 @@ struct CalendarEvent: Identifiable, Codable, Hashable {
     var duration: TimeInterval {
         endDate.timeIntervalSince(startDate)
     }
+
+    /// Spec 3.12. Phase 1's editor requires a title, so nothing this app creates is ever
+    /// untitled — but an empty `SUMMARY` is legal in RFC 5545 and routine in EventKit, so both
+    /// ICS import and the Phase 3 mirror can produce one. Every surface that renders a title
+    /// goes through this rather than `title` directly, so an untitled event reads as an event
+    /// rather than as a rendering bug.
+    ///
+    /// Deliberately not applied to `EventDraft`/the editor field, where an empty title must stay
+    /// empty so the placeholder does not become real text the user has to delete.
+    var displayTitle: String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? Self.untitledPlaceholder : trimmed
+    }
+
+    static let untitledPlaceholder = "(No title)"
 }
 
 extension CalendarEvent {

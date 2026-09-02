@@ -50,11 +50,25 @@ struct LocalNotificationPlanner {
         horizonEnd: Date = Date().addingTimeInterval(defaultSchedulingWindow),
         recurrenceExceptions: [RecurrenceException] = []
     ) -> LocalNotificationReconciliationPlan {
-        let visibleCalendarIDs = Set(calendars.filter(\.isVisible).map(\.id))
+        // Spec 3.16 (BC-EK-016), the double-notification rule: a calendar reached through the
+        // device has its alarms delivered by the system, on behalf of the account that owns the
+        // event. Scheduling our own notification for one of those events means the user is
+        // notified twice for every event they mirror. The exclusion lives here, in the planner,
+        // rather than in the scheduler, because the planner's desired-set diff is what also
+        // *cancels* a notification when an event stops qualifying — so a local event that later
+        // moves to a device calendar has its existing requests reconciled away rather than
+        // orphaned.
+        //
+        // No calendar reports `.device` before Phase 3, so today this filter removes nothing.
+        let schedulableCalendarIDs = Set(
+            calendars
+                .filter { $0.isVisible && $0.connectionMethod != .device }
+                .map(\.id)
+        )
         let range = DateInterval(start: now, end: horizonEnd)
         var requests: [LocalNotificationRequest] = []
 
-        for event in events where visibleCalendarIDs.contains(event.calendarID) && !event.reminders.isEmpty {
+        for event in events where schedulableCalendarIDs.contains(event.calendarID) && !event.reminders.isEmpty {
             // Cancelled occurrences stop firing automatically; modified ones use the
             // replacement event's own reminders, scheduled via that event's own loop iteration
             // (spec 0.11, BC-REC-010).
@@ -74,7 +88,7 @@ struct LocalNotificationPlanner {
                         LocalNotificationRequest(
                             identifier: notificationIdentifier(event: event, reminder: reminder, occurrence: occurrence),
                             eventID: event.id,
-                            title: event.title,
+                            title: event.displayTitle,
                             body: notificationBody(for: occurrence),
                             fireDate: fireDate
                         )

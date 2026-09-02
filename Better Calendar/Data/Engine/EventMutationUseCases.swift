@@ -30,6 +30,16 @@ enum EventMutationUseCases {
         /// that already has a tombstone is likewise "nothing to do, already handled" — the
         /// delete that produced the tombstone always wins.
         case duplicate
+        /// Spec 3.10: the target calendar does not permit this operation — it is read-only, or
+        /// its provider reports that it disallows the specific change. Distinct from
+        /// `.conflicted`, which means "you may write this, but not from the version you based it
+        /// on": a rejection is not retryable and not resolvable by refetching.
+        ///
+        /// Returned *before* any `EngineTransaction` is produced, so nothing is written locally
+        /// and the user never sees an optimistic change that a provider then refuses. Nothing in
+        /// Phase 2 can produce this — every calendar that exists today is writable — which is
+        /// exactly the property that makes adding it now safe.
+        case rejected(CapabilityViolation)
         /// Spec 2.14: `expectedVersionNumber` did not match the entity's current stored
         /// version, so the write is rejected rather than silently overwriting a newer one.
         /// The rejected content is not lost in practice: whatever state it was based on is
@@ -51,6 +61,9 @@ enum EventMutationUseCases {
     ) -> Outcome {
         if let outcome = existingOutcome(forIdempotencyKey: idempotencyKey, in: context.database) { return outcome }
         if hasLiveTombstone(forEntityID: event.id, in: context.database) { return .duplicate }
+        if let violation = capabilityViolation(writingTo: event.calendarID, creating: true, in: context.database) {
+            return .rejected(violation)
+        }
 
         var changes: [EntityChange] = [.upsertEvent(event)]
         if let exception {
@@ -93,8 +106,22 @@ enum EventMutationUseCases {
             return .conflicted(currentVersionNumber: previous.versionNumber)
         }
 
+        // Spec 3.10: the calendar the event lives on now must permit the edit...
+        if let violation = capabilityViolation(writingTo: previous.calendarID, creating: false, in: context.database) {
+            return .rejected(violation)
+        }
+
         var updated = previous
         mutate(&updated)
+
+        // ...and, when the edit is a move between calendars (`moveEventToCalendar`), the
+        // destination must permit gaining one. Checked after `mutate` because that closure is
+        // the only thing that knows whether this update is a move.
+        if updated.calendarID != previous.calendarID,
+           let violation = capabilityViolation(writingTo: updated.calendarID, creating: true, in: context.database) {
+            return .rejected(violation)
+        }
+
         updated.versionNumber = previous.versionNumber + 1
 
         let entry = journalEntry(
@@ -189,6 +216,12 @@ enum EventMutationUseCases {
         }
         guard previous.versionNumber == expectedVersionNumber else {
             return .conflicted(currentVersionNumber: previous.versionNumber)
+        }
+        // Spec 3.10: deleting is a content modification. A read-only calendar refuses it for the
+        // same reason it refuses an edit — and refusing here, before the tombstone is minted,
+        // keeps the undo banner from offering to restore something that was never removed.
+        if let violation = capabilityViolation(writingTo: previous.calendarID, creating: false, in: context.database) {
+            return .rejected(violation)
         }
 
         let tombstone = DeletedObjectTombstone(
@@ -295,6 +328,11 @@ enum EventMutationUseCases {
         in context: Context
     ) -> Outcome {
         if let outcome = existingOutcome(forIdempotencyKey: idempotencyKey, in: context.database) { return outcome }
+        // A duplicate is a create on the source event's calendar, so it needs creation rights
+        // there — not the edit rights the original event's own calendar would imply.
+        if let violation = capabilityViolation(writingTo: event.calendarID, creating: true, in: context.database) {
+            return .rejected(violation)
+        }
 
         let duplicateStartDate = startDate ?? event.startDate
         let duplicateEndDate = duplicateStartDate.addingTimeInterval(max(event.duration, event.isAllDay ? 24 * 60 * 60 : 15 * 60))
@@ -377,7 +415,14 @@ enum EventMutationUseCases {
         // Spec 2.13/BC-ENG-006: skip (not fail) any event whose id already has a live
         // tombstone, rather than resurrecting it — the rest of the batch still commits.
         let tombstonedIDs = Set(context.database.deletedEventTombstones.map(\.entityID))
-        let eventsToImport = events.filter { !tombstonedIDs.contains($0.id) }
+        // Spec 3.10, following the same skip-don't-fail precedent as the tombstone filter above:
+        // an import destined for a calendar that refuses new events drops those events and
+        // commits the rest, rather than failing a whole file because one target is read-only.
+        // No calendar refuses today, so this changes nothing until Phase 3 mirrors one.
+        let eventsToImport = events.filter {
+            !tombstonedIDs.contains($0.id)
+                && capabilityViolation(writingTo: $0.calendarID, creating: true, in: context.database) == nil
+        }
         guard !eventsToImport.isEmpty else { return .applied(.empty) }
         let importedIDs = Set(eventsToImport.map(\.id))
         let exceptionsToImport = exceptions.filter { importedIDs.contains($0.masterEventID) }
@@ -416,6 +461,29 @@ enum EventMutationUseCases {
     ///
     /// Not `private`: `RecurrenceSplitter` (spec 2.3/2.4) reuses this exact guard for its own
     /// bespoke `.thisAndFuture` transactions rather than re-implementing it.
+    /// Spec 3.10's model-layer enforcement. Deliberately conservative: a calendar this database
+    /// does not know about is *not* rejected, because Phase 1/2 already allow writing an event
+    /// whose `calendarID` has no matching row (import and undo both rely on it), and turning
+    /// that into a rejection here would change behavior this phase has no business changing.
+    /// Only a calendar that exists and says no produces a violation.
+    static func capabilityViolation(
+        writingTo calendarID: UUID,
+        creating: Bool,
+        in database: LocalCalendarDatabase
+    ) -> CapabilityViolation? {
+        guard let calendar = database.calendars.first(where: { $0.id == calendarID }) else { return nil }
+        if creating {
+            guard calendar.allowsEventCreation else {
+                return CapabilityViolation(calendarID: calendarID, calendarName: calendar.name, reason: .creationNotAllowed)
+            }
+        } else {
+            guard calendar.allowsEventEditing else {
+                return CapabilityViolation(calendarID: calendarID, calendarName: calendar.name, reason: .readOnly)
+            }
+        }
+        return nil
+    }
+
     static func existingOutcome(forIdempotencyKey key: UUID, in database: LocalCalendarDatabase) -> Outcome? {
         let alreadyEnqueued = database.pendingMutations.contains {
             $0.idempotencyKey == key && ($0.status == .pending || $0.status == .applied)

@@ -219,7 +219,7 @@ private struct AgendaEventRow: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 6) {
-                Text(event.title)
+                Text(event.displayTitle)
                     .font(.headline)
 
                 Text(event.isAllDay ? "All Day" : event.startDate.formatted(date: .omitted, time: .shortened))

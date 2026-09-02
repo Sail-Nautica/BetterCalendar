@@ -49,7 +49,7 @@ struct SearchScreen: View {
                             selectedOccurrence = CalendarOccurrence(event: event)
                         } label: {
                             VStack(alignment: .leading, spacing: 6) {
-                                Text(event.title)
+                                Text(event.displayTitle)
                                     .font(.headline)
 
                                 Text(event.startDate.formatted(date: .abbreviated, time: event.isAllDay ? .omitted : .shortened))

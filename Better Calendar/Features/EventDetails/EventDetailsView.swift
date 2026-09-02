@@ -43,7 +43,7 @@ struct EventDetailsView: View {
                             .padding(.top, 4)
 
                         VStack(alignment: .leading, spacing: 8) {
-                            Text(event.title)
+                            Text(event.displayTitle)
                                 .font(.title2.weight(.semibold))
                             Text(event.timeRangeText())
                                 .foregroundStyle(.secondary)

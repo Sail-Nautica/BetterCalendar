@@ -383,6 +383,9 @@ final class BetterCalendarStore {
         case .conflicted:
             lastError = "This event changed since it was last loaded. Your change was not saved."
             return false
+        case .rejected(let violation):
+            lastError = violation.message
+            return false
         }
     }
 
@@ -875,6 +878,11 @@ final class BetterCalendarStore {
             return true
         case .conflicted:
             lastError = "This event changed since it was last loaded. Your change was not saved."
+            return false
+        case .rejected(let violation):
+            // Spec 3.10: nothing was written, locally or anywhere else, so there is nothing to
+            // roll back — only something to explain.
+            lastError = violation.message
             return false
         }
     }

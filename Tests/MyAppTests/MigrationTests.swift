@@ -250,6 +250,17 @@ final class MigrationTests: XCTestCase {
         XCTAssertEqual(database.calendars.first?.name, "Fixture Calendar", "calendar name lost \(context)")
         XCTAssertEqual(database.calendars.first?.isDefault, true, "default flag lost \(context)")
 
+        // Spec 3.6 (v018): a calendar written before provider identity existed migrates to
+        // exactly what it always was — Better Calendar-owned, reached locally, fully writable.
+        // Checked for every released version, so no upgrade path can land a user's own calendar
+        // in a read-only or unknown-transport state.
+        XCTAssertEqual(database.calendars.first?.provider, .betterCalendar, "provider changed \(context)")
+        XCTAssertEqual(database.calendars.first?.connectionMethod, .local, "connection method wrong \(context)")
+        XCTAssertEqual(database.calendars.first?.isReadOnly, false, "calendar became read-only \(context)")
+        XCTAssertEqual(database.calendars.first?.capabilities, .localDefaults, "capabilities wrong \(context)")
+        XCTAssertNil(database.calendars.first?.providerAccountID, "local calendar gained an account \(context)")
+        XCTAssertNil(database.calendars.first?.colorHex, "token color should not become a raw hex \(context)")
+
         XCTAssertEqual(database.events.count, 5, "events lost \(context)")
 
         guard let timed = database.events.first(where: { $0.id == Self.timedEventID }) else {

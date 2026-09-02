@@ -767,7 +767,7 @@ private struct MonthDayCell: View {
                                 .fill(calendarColor(occurrence))
                                 .frame(width: 5, height: 5)
                         }
-                        Text(occurrence.event.title)
+                        Text(occurrence.event.displayTitle)
                             .lineLimit(1)
                     }
                     .font(.caption2)
@@ -815,7 +815,7 @@ private struct CompactOccurrenceCard: View {
                 .frame(width: 4)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(occurrence.event.title)
+                Text(occurrence.event.displayTitle)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
                 Text(occurrence.displayEvent.timeRangeText())
@@ -854,7 +854,7 @@ private struct TimelineOccurrenceCard: View {
                     .fill(calendar?.colorName.color ?? .blue)
                     .frame(height: 4)
 
-                Text(occurrence.event.title)
+                Text(occurrence.event.displayTitle)
                     .font(.caption.weight(.semibold))
                     .lineLimit(2)
 

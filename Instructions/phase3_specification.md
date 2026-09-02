@@ -24,6 +24,31 @@ producing duplicates, resurrection, or write-back failures.
 
 ---
 
+## Prerequisite status
+
+The changes that had to land *before* Phase 3 could begin — because they alter types every later
+adapter builds on, and because retrofitting them once a provider is attached means migrating live
+user data — are **complete**:
+
+| Prerequisite | Where | Status |
+|---|---|---|
+| Calendar provider identity (3.6) | `BetterCalendar`, `v018`, ADR 0004 | Done |
+| Connection method, the two-axis model (3.7) | `ConnectionMethod`, ADR 0004 | Done |
+| Capability enforcement at the model layer (3.10) | `Outcome.rejected`, ADR 0004 | Done |
+| Default-calendar modelling decision (3.9) | ADR 0005 | Decided, no code change |
+| Double-notification guard (3.16) | `LocalNotificationPlanner` | Done |
+| Untitled-event placeholder (3.12) | `CalendarEvent.displayTitle` | Done |
+| Change-journal `reconciliation` source (3L) | — | Not needed; see 3L |
+
+All of it is inert until a provider exists: no calendar reports `.device`, none is read-only, and
+none carries an account, so every gate above is a no-op against today's data. That is the same
+approach Phase 2 took with the outbox — build the mechanism, prove it with tests, attach the
+provider afterwards. Coverage lives in `Tests/MyAppTests/CalendarProviderIdentityTests.swift`,
+plus provider-identity assertions added to the `MigrationTests` loop that runs against every
+released schema version.
+
+---
+
 # Phase 3 — Apple Calendar and Device-Calendar Integration
 
 ## Phase 3 objective
@@ -303,7 +328,9 @@ CalendarAccessStatus
 
 ## 3.6 Extend the calendar record with provider identity
 
-**This is the single largest prerequisite in Phase 3, and it is a real gap in the current code.**
+**This was the single largest prerequisite in Phase 3. It has been built — see ADR 0004,
+migration `v018`, and `CalendarProviderIdentityTests`. The description below is retained because
+it is what the rest of this document is written against.**
 
 `Better Calendar/Domain/CalendarModels.swift` defines `BetterCalendar` with only
 `id, name, colorName, isVisible, isDefault, sortOrder, createdAt, updatedAt, versionNumber`.
@@ -407,8 +434,8 @@ ConnectionMethod
   * Move the default to `AppSettings` as an explicit calendar id (cleaner separation of app
     preference from calendar identity; requires migrating the flag and dropping the index)
 
-  Recommend the first, and record it as an ADR either way — the fallback rules below depend on
-  which is chosen.
+  **Decided: the first.** `isDefault` stays on the row as local-only mirror state that is never
+  written back to a provider. See ADR 0005 for why, and for the rule it imposes on the adapter.
 * If the chosen default becomes unwritable — permission revoked, calendar removed, calendar
   turned read-only — fall back deterministically: the device's own default writable calendar if
   available, otherwise the first writable local calendar. Never fall back to a read-only
@@ -437,9 +464,12 @@ CalendarCapabilities
   disallows it returns a new `Outcome` case rather than producing an `EngineTransaction`. It
   must fail *before* the local write, so the user never sees an optimistic change that then
   vanishes when EventKit rejects it.
-* Suggested addition, matching the existing `.duplicate` / `.conflicted` precedent:
-  `case rejected(CapabilityViolation)`. Every call site in `BetterCalendarStore` already
-  switches exhaustively over `Outcome`, so the compiler will find them.
+* **Built.** `EventMutationUseCases.Outcome` gained `case rejected(CapabilityViolation)`,
+  matching the existing `.duplicate` / `.conflicted` precedent, and `RecurrenceSplitter.Outcome`
+  mirrors it. Create, update, move-between-calendars, delete, duplicate, and ICS import are all
+  gated; `BetterCalendarStore` surfaces the violation's message through `lastError`. The gate is
+  deliberately conservative — a `calendarID` with no matching row is *not* rejected, because
+  Phase 1/2 already permit that and import and undo both rely on it.
 * Birthday and subscribed calendars are always read-only. Holiday calendars usually are.
   Availability values a calendar does not allow must be mapped down, not silently dropped.
 * Read-only events still participate fully in *display*, conflict detection, and free/busy. They
@@ -482,7 +512,7 @@ Mirror rules:
 |---|---|---|
 | identifier | `providerMetadata.providerObjectID` | Plus external identifier, stored alongside |
 | calendar identifier | `calendarID` via the mirrored `BetterCalendar` | Never the raw EventKit id |
-| title | `title` | Empty titles are legal in EventKit and common on imported events. Phase 1 has **no** untitled-event placeholder — every event it creates has a title. Define one now ("(No title)") and apply it in Day, Week, Month, Agenda, Search, and detail |
+| title | `title` | Empty titles are legal in EventKit and common on imported events. `CalendarEvent.displayTitle` supplies "(No title)" and is already applied across Day, Week, Month, Agenda, Search, detail, and notification bodies — deliberately *not* in the editor, where an empty title must stay empty |
 | notes | `notes` | |
 | location (string) | `location` | Structured location/geo is preserved raw (3.17), not modeled |
 | url | `urlString` | |
@@ -560,7 +590,10 @@ a system store:
 
 ## 3.16 Alarms, reminders, and the double-notification rule
 
-**This is the most easily-missed correctness bug in the phase (BC-EK-016).**
+**This is the most easily-missed correctness bug in the phase (BC-EK-016). The guard is already
+in place — `LocalNotificationPlanner` excludes `connectionMethod == .device` calendars from its
+desired set, and three tests in `CalendarProviderIdentityTests` pin it, including the cancellation
+path. It removes nothing today, because no calendar reports `.device` yet.**
 
 A device event's alarms are scheduled by the *system*, on behalf of the account that owns the
 event. If Better Calendar mirrors an event's alarms into its own `EventReminder` list and lets
@@ -1014,21 +1047,26 @@ Phase 3 adds schema. Every change follows the Phase 2 §2.17 framework: numbered
 transactional, checksummed in `schema_metadata`, and tested against fixture databases from every
 previously released version.
 
-Expected migrations (the current head is `v017_rebuild_search_index`):
+**Already landed** as a Phase 3 prerequisite (`v018_add_calendar_provider_identity`): the
+`calendars` extension 3.6 requires — `account_name`, `connection_method`, `capabilities_json`,
+and a partial index on `(provider, provider_account_id, provider_calendar_id)` for the
+duplicate-connection lookup. The other five fields (`provider`, `provider_account_id`,
+`provider_calendar_id`, `is_read_only`, `time_zone_id`) already existed in the table since `v001`
+and simply started carrying real values. See ADR 0004.
 
-* Extend `calendars` with the columns 3.6 requires that are not already present —
-  `account_name`, `color_hex` handling, `connection_method`, and the capability fields. Note
-  that `provider`, `provider_account_id`, `provider_calendar_id`, `is_read_only`, and
-  `time_zone_id` **already exist in the table** and only need to start carrying real values.
+Still expected:
+
 * Add `event_attendees` (3.15).
 * Extend `events` with the device's cross-device external identifier and the last-modified
   value used for concurrency (3.22).
 * Add a reconciliation-state table: per calendar, the last reconciled window and timestamp.
-* Widen the change-journal `source` values to include `reconciliation`. Phase 2's ADR 0003 notes
-  that widening a `CHECK` constraint here requires a table rebuild that must also repair
-  `event_versions`' foreign key, because SQLite rewrites FK clauses on `RENAME TO`. **That work
-  is now unavoidable** — plan it as its own migration with its own fixture test, and update
-  ADR 0003 to record that the deferral ended here.
+
+**No migration is needed for the change journal.** `JournalSource` already has a
+`reconciliation` case, and `change_journal.source` carries no `CHECK` constraint — only
+`operation` does. ADR 0003's deferred table rebuild concerns widening the **`operation`** values
+(e.g. adding a `duplicateDetected` case), which reconciliation does not require: an inbound
+change is an ordinary create, update, or delete. That deferral therefore stands; do not reopen it
+on Phase 3's account.
 
 Extend the launch sequence (Phase 2 §2.18) with a step after outbox reconciliation: re-check
 calendar authorization and mark mirrored calendars unavailable if access was lost — **without**

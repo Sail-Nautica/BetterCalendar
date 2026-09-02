@@ -20,7 +20,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v014_extend_deleted_objects",
         "v015_add_version_numbers",
         "v016_add_engine_indexes",
-        "v017_rebuild_search_index"
+        "v017_rebuild_search_index",
+        "v018_add_calendar_provider_identity"
     ]
 
     /// Spec 2.17: a checksum over the migration set, stored alongside the applied migration
@@ -732,6 +733,37 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             }
         }
 
+        // Spec 3.6: the three columns the calendar record still lacked. The other five fields
+        // provider identity needs — `provider`, `provider_account_id`, `provider_calendar_id`,
+        // `is_read_only`, `time_zone_id` — have existed since `v001`; they were simply written
+        // with hardcoded values because no provider existed to fill them. This migration adds
+        // what was missing and backfills every existing row as what it actually is: a local,
+        // writable, Better Calendar-owned calendar.
+        //
+        // `connection_method` is NOT NULL with a default so the backfill is implicit and a row
+        // can never be in an "unknown transport" state — every calendar is reached exactly one
+        // way, and before Phase 3 that way is always `local`.
+        migrator.registerMigration("v018_add_calendar_provider_identity") { db in
+            try db.execute(sql: "ALTER TABLE calendars ADD COLUMN account_name TEXT")
+            try db.execute(sql: "ALTER TABLE calendars ADD COLUMN connection_method TEXT NOT NULL DEFAULT 'local'")
+            try db.execute(sql: "ALTER TABLE calendars ADD COLUMN capabilities_json TEXT")
+
+            // Repair the hardcoded values `calendarArguments` wrote before this migration:
+            // `provider_calendar_id` was set to the local UUID for every row, which is correct
+            // for a local calendar and is exactly what the reader now expects, so it stays.
+            // `provider` is normalized defensively in case an older build wrote something else.
+            try db.execute(sql: "UPDATE calendars SET provider = 'betterCalendarLocal' WHERE provider IS NULL OR provider = ''")
+
+            // Spec 3.29 and BC-EK-020/021: the lookup the duplicate-connection rule performs on
+            // every discovery pass. Partial, because local calendars have no account identity to
+            // collide on and would otherwise all share one NULL bucket.
+            try db.execute(sql: """
+                CREATE INDEX calendars_provider_identity_idx
+                ON calendars(provider, provider_account_id, provider_calendar_id)
+                WHERE provider_account_id IS NOT NULL
+                """)
+        }
+
         return migrator
     }
 
@@ -863,7 +895,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
     private static let calendarColumns = [
         "id", "provider", "provider_account_id", "provider_calendar_id", "name", "color_hex",
         "is_visible", "is_read_only", "is_default", "time_zone_id", "sort_order",
-        "created_at", "updated_at", "deleted_at", "version_number"
+        "created_at", "updated_at", "deleted_at", "version_number",
+        "account_name", "connection_method", "capabilities_json"
     ]
 
     private static let eventColumns = [
@@ -888,24 +921,56 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         return "\(insertSQL(table: table, columns: columns)) ON CONFLICT(id) DO UPDATE SET \(assignments)"
     }
 
+    /// Spec 3.6. Every value here used to be hardcoded — provider was always
+    /// `betterCalendarLocal`, the account was always `nil`, `provider_calendar_id` was the local
+    /// UUID again, and `is_read_only` was always `0`. The columns existed since `v001`; nothing
+    /// filled them. They now carry what the domain type says.
+    ///
+    /// `color_hex` keeps its established meaning for local calendars — the design token's hex —
+    /// and carries the provider's exact color when one is present, which is the only shape that
+    /// round-trips a device calendar's arbitrary RGB. See ADR 0004.
     private func calendarArguments(_ calendar: BetterCalendar) -> StatementArguments {
         [
             calendar.id.uuidString,
-            EventProvider.betterCalendar.databaseValue,
-            nil,
-            calendar.id.uuidString,
+            calendar.provider.databaseValue,
+            calendar.providerAccountID,
+            calendar.providerCalendarID ?? calendar.id.uuidString,
             calendar.name,
-            calendar.colorName.hexValue,
+            calendar.colorHex ?? calendar.colorName.hexValue,
             calendar.isVisible.databaseInt,
-            0,
+            calendar.isReadOnly.databaseInt,
             calendar.isDefault.databaseInt,
-            nil,
+            calendar.timeZoneIdentifier,
             calendar.sortOrder,
             encodeInstant(calendar.createdAt),
             encodeInstant(calendar.updatedAt),
             nil,
-            calendar.versionNumber
+            calendar.versionNumber,
+            calendar.accountName,
+            calendar.connectionMethod.rawValue,
+            encodeCapabilities(calendar.capabilities)
         ]
+    }
+
+    /// Capabilities are stored as one JSON blob rather than seven columns: the set is provider-
+    /// defined and will grow as adapters are added, and widening a JSON payload needs no
+    /// migration while widening a column list does. `CalendarCapabilities` decodes tolerantly for
+    /// exactly this reason.
+    private func encodeCapabilities(_ capabilities: CalendarCapabilities) -> String? {
+        guard capabilities != .localDefaults else { return nil }
+        guard let data = try? JSONEncoder().encode(capabilities) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// `nil` — the value every pre-`v018` row and every ordinary local calendar carries — means
+    /// the permissive local defaults, so this never fails closed and never locks a user out of
+    /// their own calendar because a blob failed to parse.
+    private func decodeCapabilities(_ json: String?) -> CalendarCapabilities {
+        guard let json, let data = json.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(CalendarCapabilities.self, from: data) else {
+            return .localDefaults
+        }
+        return decoded
     }
 
     private func insert(calendar: BetterCalendar, in db: Database) throws {
@@ -1214,16 +1279,37 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         let rows = try Row.fetchAll(db, sql: "SELECT * FROM calendars WHERE deleted_at IS NULL ORDER BY sort_order ASC, name ASC")
         return rows.compactMap { row in
             guard let id = UUID(uuidString: row["id"]) else { return nil }
+            // Spec 3.6: a hex that matches one of the six design tokens *is* that token, and
+            // `colorHex` stays nil so rendering behaves exactly as it did before this field
+            // existed. Anything else is a provider's own color, kept verbatim.
+            let storedHex: String? = row["color_hex"]
+            let matchedToken = storedHex.flatMap(CalendarColorName.init(hexValue:))
+            // `calendarArguments` writes `providerCalendarID ?? id` so the column is never null
+            // (it has been the local UUID for every row ever written). Normalize the round trip
+            // here rather than there: a value that is just the local id again carries no
+            // provider identity, so it reads back as the `nil` it was written from. A device
+            // calendar's identifier is an EventKit string and never collides with this.
+            let storedProviderCalendarID: String? = row["provider_calendar_id"]
+            let distinctProviderCalendarID = storedProviderCalendarID == id.uuidString ? nil : storedProviderCalendarID
             return BetterCalendar(
                 id: id,
                 name: row["name"],
-                colorName: CalendarColorName(hexValue: row["color_hex"]) ?? .betterBlue,
+                colorName: matchedToken ?? .betterBlue,
                 isVisible: row.boolValue("is_visible"),
                 isDefault: row.boolValue("is_default"),
                 sortOrder: row["sort_order"],
                 createdAt: decodeInstant(row["created_at"]) ?? .now,
                 updatedAt: decodeInstant(row["updated_at"]) ?? .now,
-                versionNumber: row["version_number"] ?? 1
+                versionNumber: row["version_number"] ?? 1,
+                provider: EventProvider(databaseValue: row["provider"] ?? ""),
+                connectionMethod: ConnectionMethod(rawValue: row["connection_method"] ?? "") ?? .local,
+                providerAccountID: row["provider_account_id"],
+                providerCalendarID: distinctProviderCalendarID,
+                accountName: row["account_name"],
+                colorHex: matchedToken == nil ? storedHex : nil,
+                isReadOnly: row.boolValue("is_read_only"),
+                timeZoneIdentifier: row["time_zone_id"],
+                capabilities: decodeCapabilities(row["capabilities_json"])
             )
         }
     }
