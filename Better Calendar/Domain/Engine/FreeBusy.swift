@@ -53,6 +53,7 @@ enum FreeBusy {
 
         var intervals: [DateInterval] = []
         for event in relevantEvents {
+            guard couldIntersect(event, range: range) else { continue }
             let eventExceptions = exceptions.filter { $0.masterEventID == event.id }
             for occurrence in expander.occurrences(of: event, in: range, exceptions: eventExceptions) {
                 let start = max(occurrence.occurrenceStartDate, range.start)
@@ -63,6 +64,54 @@ enum FreeBusy {
         }
 
         return merge(intervals)
+    }
+
+    /// Spec 2.19: a cheap, conservative pre-filter so a query over a narrow range doesn't pay
+    /// `RecurrenceExpander`'s full per-occurrence `Calendar` arithmetic for a series that cannot
+    /// possibly land in `range` — a long-lived calendar accumulates plenty of finished
+    /// short-lived series (an old 10-occurrence standup rotation, say), and without this,
+    /// *every* one of them gets walked occurrence-by-occurrence from its own start regardless of
+    /// how far that is from `range`.
+    ///
+    /// `latestPossibleOccurrenceEnd(of:)` always over-estimates (never under-estimates) a
+    /// bounded series' true last occurrence, so this can only ever skip a series that provably
+    /// cannot intersect `range` — it never skips one that might.
+    private static func couldIntersect(_ event: CalendarEvent, range: DateInterval) -> Bool {
+        guard event.startDate < range.end else { return false }
+        guard let recurrence = event.recurrence, recurrence.frequency != .never else {
+            return event.endDate > range.start
+        }
+        guard let latestEnd = latestPossibleOccurrenceEnd(of: event, recurrence: recurrence) else {
+            return true // `.never`-ending: unbounded going forward, cannot be ruled out this way.
+        }
+        return latestEnd > range.start
+    }
+
+    /// `nil` means "unbounded" (`.never`). Otherwise a safe upper bound on the instant the
+    /// series' last possible occurrence ends — computed from the loosest interpretation of the
+    /// rule's own fields (see inline reasoning per case), never from actually expanding it.
+    private static func latestPossibleOccurrenceEnd(of event: CalendarEvent, recurrence: RecurrenceRule) -> Date? {
+        switch recurrence.end {
+        case .never:
+            return nil
+        case .onDate(let endDate):
+            return endDate.addingTimeInterval(event.duration)
+        case .afterOccurrences(let count):
+            // An upper bound on the spacing between the 1st and Nth occurrence, using the
+            // longest each frequency's own step can possibly span (a 31-day month, a 366-day
+            // leap year) — multiple weekdays/month-days per step only make the true series
+            // *shorter* than this, never longer, so this always over-, never under-, estimates.
+            let stepSeconds: TimeInterval
+            switch recurrence.frequency {
+            case .never: return event.startDate.addingTimeInterval(event.duration)
+            case .daily: stepSeconds = 86_400
+            case .weekly: stepSeconds = 7 * 86_400
+            case .monthly: stepSeconds = 31 * 86_400
+            case .yearly: stepSeconds = 366 * 86_400
+            }
+            let span = stepSeconds * Double(max(recurrence.interval, 1)) * Double(max(count - 1, 0))
+            return event.startDate.addingTimeInterval(span + event.duration)
+        }
     }
 
     private static func merge(_ intervals: [DateInterval]) -> [DateInterval] {

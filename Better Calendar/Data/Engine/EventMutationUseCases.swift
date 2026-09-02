@@ -387,7 +387,7 @@ enum EventMutationUseCases {
 
         var journalEntries: [ChangeJournalEntry] = []
         var mutations: [PendingMutation] = []
-        for event in eventsToImport {
+        for (index, event) in eventsToImport.enumerated() {
             let entry = journalEntry(
                 entityType: .event,
                 entityID: event.id,
@@ -396,7 +396,14 @@ enum EventMutationUseCases {
                 context: context
             )
             journalEntries.append(entry)
-            mutations.append(outboxRow(objectID: event.id, operation: .create, payload: event, idempotencyKey: UUID(), journalEntryID: entry.id, context: context))
+            // The outer `idempotencyKey` guards the batch as a whole (see this function's doc
+            // comment) — but `existingOutcome` only ever finds a key that some row actually
+            // carries, so it has to land on a real outbox row, not just be checked against one
+            // at the top of this function. The first row carries it verbatim; every other row
+            // still gets its own fresh key, since each is independently retryable once a
+            // provider exists.
+            let rowIdempotencyKey = index == 0 ? idempotencyKey : UUID()
+            mutations.append(outboxRow(objectID: event.id, operation: .create, payload: event, idempotencyKey: rowIdempotencyKey, journalEntryID: entry.id, context: context))
         }
 
         return .applied(EngineTransaction(entityChanges: changes, outboxRows: mutations, journalEntries: journalEntries))

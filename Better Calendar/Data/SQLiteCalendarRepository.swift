@@ -242,6 +242,32 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             .joined(separator: " ")
     }
 
+    /// M7's Settings diagnostics surface (spec 2.20): reads live `change_journal`/
+    /// `schema_metadata` state rather than recomputing what *this build* expects to find — the
+    /// whole point is to reveal drift, not restate the build's own assumptions.
+    func diagnostics() throws -> RepositoryDiagnostics {
+        let databaseQueue = try openDatabase()
+        return try databaseQueue.read { db in
+            let journalRowCount = try db.tableExists("change_journal") ? Int.fetchOne(db, sql: "SELECT COUNT(*) FROM change_journal") : nil
+
+            guard try db.tableExists("schema_metadata") else {
+                return RepositoryDiagnostics(changeJournalRowCount: journalRowCount, lastAppliedMigrationIdentifier: nil, migrationChecksum: nil)
+            }
+            let rows = try Row.fetchAll(db, sql: "SELECT key, value FROM schema_metadata")
+            var values: [String: String] = [:]
+            for row in rows {
+                values[row["key"]] = row["value"]
+            }
+            let appliedCount = values["schema_version"].flatMap(Int.init)
+            let lastIdentifier = appliedCount.flatMap { count -> String? in
+                guard count > 0, count <= Self.migrationIdentifiers.count else { return nil }
+                return Self.migrationIdentifiers[count - 1]
+            }
+
+            return RepositoryDiagnostics(changeJournalRowCount: journalRowCount, lastAppliedMigrationIdentifier: lastIdentifier, migrationChecksum: values["migration_checksum"])
+        }
+    }
+
     private func openDatabase() throws -> DatabaseQueue {
         let fileURL = try databaseURL()
         try fileManager.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)

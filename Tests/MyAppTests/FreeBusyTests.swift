@@ -85,6 +85,69 @@ final class FreeBusyTests: XCTestCase {
         XCTAssertEqual(result.count, 4)
     }
 
+    // MARK: - Pre-filter correctness (spec 2.19's cheap "could this series possibly land in
+    // range" check ahead of the real `RecurrenceExpander` call)
+
+    /// A bounded series (`.afterOccurrences`) that provably finishes before the query range
+    /// starts must still correctly contribute nothing — the whole point of the pre-filter is to
+    /// skip the expensive expansion for exactly this case without getting the *answer* wrong.
+    func testBoundedSeriesEntirelyBeforeTheRangeContributesNothing() {
+        let master = TestData.event(
+            id: UUID(),
+            startDate: TestData.date("2026-01-05T09:00:00Z"),
+            endDate: TestData.date("2026-01-05T09:30:00Z"),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(3))
+        )
+
+        let result = FreeBusy.query(query("2026-09-01T00:00:00Z", "2026-09-08T00:00:00Z"), events: [master], exceptions: [])
+
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    /// Same idea for an `.onDate`-bounded series.
+    func testOnDateBoundedSeriesEntirelyBeforeTheRangeContributesNothing() {
+        let master = TestData.event(
+            id: UUID(),
+            startDate: TestData.date("2026-01-05T09:00:00Z"),
+            endDate: TestData.date("2026-01-05T09:30:00Z"),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .onDate(TestData.date("2026-02-01T00:00:00Z")))
+        )
+
+        let result = FreeBusy.query(query("2026-09-01T00:00:00Z", "2026-09-08T00:00:00Z"), events: [master], exceptions: [])
+
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    /// A never-ending series can't be ruled out by the pre-filter no matter how long ago it
+    /// started — it must still be expanded and still correctly contribute an occurrence.
+    func testNeverEndingSeriesStartingLongBeforeTheRangeStillContributes() {
+        let master = TestData.event(
+            id: UUID(),
+            startDate: TestData.date("2020-01-06T09:00:00Z"),
+            endDate: TestData.date("2020-01-06T09:30:00Z"),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .never)
+        )
+
+        let result = FreeBusy.query(query("2026-09-07T00:00:00Z", "2026-09-08T00:00:00Z"), events: [master], exceptions: [])
+
+        XCTAssertEqual(result, [DateInterval(start: TestData.date("2026-09-07T09:00:00Z"), end: TestData.date("2026-09-07T09:30:00Z"))])
+    }
+
+    /// The pre-filter's bound must be conservative enough not to clip a series whose last
+    /// occurrence genuinely does land inside the range, even close to its edge.
+    func testBoundedSeriesEndingRightAtTheStartOfTheRangeStillContributesItsLastOccurrence() {
+        let master = TestData.event(
+            id: UUID(),
+            startDate: TestData.date("2026-08-17T09:00:00Z"), // a Monday
+            endDate: TestData.date("2026-08-17T09:30:00Z"),
+            recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(3)) // last: Aug 31
+        )
+
+        let result = FreeBusy.query(query("2026-08-31T00:00:00Z", "2026-09-08T00:00:00Z"), events: [master], exceptions: [])
+
+        XCTAssertEqual(result, [DateInterval(start: TestData.date("2026-08-31T09:00:00Z"), end: TestData.date("2026-08-31T09:30:00Z"))])
+    }
+
     func testCalendarIDsFilterRestrictsToRequestedCalendars() {
         let included = TestData.event(id: UUID(), calendarID: TestData.calendarID, startDate: TestData.date("2026-09-02T09:00:00Z"), endDate: TestData.date("2026-09-02T10:00:00Z"))
         let excluded = TestData.event(id: UUID(), calendarID: TestData.secondCalendarID, startDate: TestData.date("2026-09-02T11:00:00Z"), endDate: TestData.date("2026-09-02T12:00:00Z"))

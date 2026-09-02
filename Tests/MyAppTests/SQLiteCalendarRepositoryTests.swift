@@ -423,6 +423,35 @@ final class SQLiteCalendarRepositoryTests: XCTestCase {
         XCTAssertEqual(restoredEvent.title, event.title)
     }
 
+    // MARK: - Diagnostics (spec 2.20's Settings diagnostics surface)
+
+    func testDiagnosticsReportsLastAppliedMigrationAndItsChecksumOnAFreshDatabase() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        _ = try repository.load() // triggers the initial migration
+
+        let diagnostics = try repository.diagnostics()
+
+        XCTAssertEqual(diagnostics.lastAppliedMigrationIdentifier, SQLiteCalendarRepository.migrationIdentifiers.last)
+        XCTAssertEqual(diagnostics.migrationChecksum, SQLiteCalendarRepository.migrationChecksum(through: SQLiteCalendarRepository.migrationIdentifiers.count))
+        XCTAssertEqual(diagnostics.changeJournalRowCount, 0)
+    }
+
+    func testDiagnosticsChangeJournalRowCountReflectsAppliedTransactions() throws {
+        let databaseURL = try makeTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: databaseURL.deletingLastPathComponent()) }
+        let repository = SQLiteCalendarRepository(fileURL: databaseURL)
+        try repository.save(TestData.database(events: []))
+
+        let event = TestData.event(id: UUID())
+        let outcome = EventMutationUseCases.createEvent(event, in: .init(database: try repository.load()))
+        guard case .applied(let transaction) = outcome else { return XCTFail("expected the create to apply") }
+        try repository.apply(transaction)
+
+        XCTAssertEqual(try repository.diagnostics().changeJournalRowCount, 1)
+    }
+
     private func makeTemporaryDatabaseURL() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("BetterCalendarSQLiteTests-\(UUID().uuidString)", isDirectory: true)

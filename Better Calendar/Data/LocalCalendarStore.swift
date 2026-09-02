@@ -613,6 +613,14 @@ final class BetterCalendarStore {
         await notificationScheduler.pendingRequestCount()
     }
 
+    /// M7's Settings diagnostics surface (spec 2.20): journal size and the last-applied
+    /// migration's identifier/checksum, read live from `repository`. `nil` fields (rather than a
+    /// thrown error) are how the flat-file/stub repositories signal "not applicable" — see
+    /// `RepositoryDiagnostics.unavailable`.
+    func repositoryDiagnostics() -> RepositoryDiagnostics {
+        (try? repository.diagnostics()) ?? .unavailable
+    }
+
     func refreshForSystemTimeChange() {
         environmentRevision += 1
         purgeExpiredTombstones()
@@ -1145,6 +1153,20 @@ protocol LocalCalendarRepository {
     /// guarantee beyond "these matched" — the caller (the store, which already holds every
     /// event's full data in memory) applies the exact tie-breaking rules spec 1.13 lists.
     func searchEventIDs(matching query: String) throws -> [UUID]
+
+    /// M7's Settings diagnostics surface (spec 2.20): journal size and the last-applied
+    /// migration's identifier/checksum, read live from storage. Meaningful only for a SQL-backed
+    /// repository — the flat-file and stub repositories have no `change_journal`/
+    /// `schema_metadata` tables and return `.unavailable`.
+    func diagnostics() throws -> RepositoryDiagnostics
+}
+
+struct RepositoryDiagnostics: Equatable {
+    var changeJournalRowCount: Int?
+    var lastAppliedMigrationIdentifier: String?
+    var migrationChecksum: String?
+
+    static let unavailable = RepositoryDiagnostics(changeJournalRowCount: nil, lastAppliedMigrationIdentifier: nil, migrationChecksum: nil)
 }
 
 struct JSONCalendarRepository: LocalCalendarRepository {
@@ -1192,6 +1214,10 @@ struct JSONCalendarRepository: LocalCalendarRepository {
                     || (event.urlString.flatMap { URL(string: $0)?.host }?.lowercased().contains(lowercasedQuery) ?? false)
             }
             .map(\.id)
+    }
+
+    func diagnostics() throws -> RepositoryDiagnostics {
+        .unavailable
     }
 
     func save(_ database: LocalCalendarDatabase) throws {

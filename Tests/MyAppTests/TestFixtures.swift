@@ -82,6 +82,77 @@ enum TestData {
             deletedEventTombstones: deletedEventTombstones
         )
     }
+
+    /// Spec 2.19's 10,000-event performance fixture: a production-shaped mix of plain timed
+    /// events (7 in 10), all-day events (1 in 10), and recurring series (2 in 10, a twentieth of
+    /// which carry a cancelled-occurrence exception too) spread across `calendarCount` calendars
+    /// and a two-year date range — so a range-scoped query and a full-table operation alike have
+    /// realistic work to do, per M1's migration-fixture guidance ("fixtures must carry recurrence
+    /// rules, exceptions... not just plain timed events").
+    ///
+    /// The event *mix and dates* are a deterministic function of `count` alone (index arithmetic,
+    /// never `Date.now`/`.random`), so a failing perf assertion reproduces identically across
+    /// runs and machines; individual event/exception ids are still fresh `UUID()`s, same as every
+    /// other fixture in this file — nothing compares ids across two calls to this function.
+    static func largeEventSet(count: Int = 10_000, calendarCount: Int = 5) -> (calendars: [BetterCalendar], events: [CalendarEvent], exceptions: [RecurrenceException]) {
+        let calendars = (0..<calendarCount).map { index in
+            calendar(id: UUID(), name: "Calendar \(index)", isDefault: index == 0, sortOrder: index)
+        }
+        let baseDate = date("2026-01-01T00:00:00Z")
+
+        var events: [CalendarEvent] = []
+        var exceptions: [RecurrenceException] = []
+        events.reserveCapacity(count)
+
+        for index in 0..<count {
+            let calendarID = calendars[index % calendarCount].id
+            // Spread across ~2 years, 12 possible times of day, so events cluster realistically
+            // rather than landing on one instant.
+            let start = baseDate.addingTimeInterval(TimeInterval(index % 730) * 86_400 + TimeInterval(index % 12) * 3600)
+
+            switch index % 10 {
+            case 0:
+                events.append(event(id: UUID(), calendarID: calendarID, title: "All-day \(index)", startDate: start, endDate: start.addingTimeInterval(86_400), isAllDay: true))
+            case 1, 2:
+                let masterID = UUID()
+                events.append(event(
+                    id: masterID,
+                    calendarID: calendarID,
+                    title: "Recurring \(index)",
+                    startDate: start,
+                    endDate: start.addingTimeInterval(3600),
+                    recurrence: RecurrenceRule(frequency: .weekly, interval: 1, weekdays: [.monday], end: .afterOccurrences(10))
+                ))
+                if index % 20 == 1 {
+                    exceptions.append(RecurrenceException(
+                        id: UUID(),
+                        masterEventID: masterID,
+                        originalOccurrenceStart: start.addingTimeInterval(7 * 86_400),
+                        originalOccurrenceLocalDate: nil,
+                        exceptionType: .cancelled,
+                        replacementEventID: nil
+                    ))
+                }
+            default:
+                events.append(event(id: UUID(), calendarID: calendarID, title: "Event \(index)", startDate: start, endDate: start.addingTimeInterval(1800)))
+            }
+        }
+
+        return (calendars, events, exceptions)
+    }
+
+    /// Spec 2.16's three-zone travel scenario: three meetings, each created while the user was
+    /// physically in a different zone, so a dual-time display over the trip is exercised against
+    /// real distinct offsets (US Eastern, UK, Japan) rather than one hand-picked pair. Matches
+    /// CLAUDE.md's storage model: each event carries a UTC instant plus the IANA zone it was
+    /// created in, never a raw offset.
+    static func threeZoneTravelEvents() -> [CalendarEvent] {
+        [
+            event(id: UUID(), title: "New York kickoff", startDate: date("2026-09-02T14:00:00Z"), endDate: date("2026-09-02T15:00:00Z"), timeZoneIdentifier: "America/New_York"),
+            event(id: UUID(), title: "London sync", startDate: date("2026-09-04T14:00:00Z"), endDate: date("2026-09-04T15:00:00Z"), timeZoneIdentifier: "Europe/London"),
+            event(id: UUID(), title: "Tokyo review", startDate: date("2026-09-06T14:00:00Z"), endDate: date("2026-09-06T15:00:00Z"), timeZoneIdentifier: "Asia/Tokyo")
+        ]
+    }
 }
 
 final class StubCalendarRepository: LocalCalendarRepository {
@@ -134,6 +205,10 @@ final class StubCalendarRepository: LocalCalendarRepository {
                     || (event.urlString.flatMap { URL(string: $0)?.host }?.lowercased().contains(lowercasedQuery) ?? false)
             }
             .map(\.id)
+    }
+
+    func diagnostics() throws -> RepositoryDiagnostics {
+        .unavailable
     }
 }
 
