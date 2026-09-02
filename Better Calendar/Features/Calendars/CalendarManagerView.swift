@@ -7,6 +7,9 @@ struct CalendarManagerView: View {
     @State private var isEditing = false
     @State private var newCalendarName = ""
     @State private var newCalendarColor: CalendarColorName = .betterBlue
+    /// `SRC-PERM-01`. Presented only from the Device Calendars section's connect affordance —
+    /// spec 3.3 forbids reaching the system prompt any other way.
+    @State private var isShowingCalendarAccessPrimer = false
 
     var body: some View {
         NavigationStack {
@@ -41,6 +44,11 @@ struct CalendarManagerView: View {
                     }
                 }
 
+                // Spec 3.4/3.33: the permission surface for the calendars already on this
+                // device. Listing those calendars is Phase 3B; this section is the gate in
+                // front of it, and the copy is honest about the difference.
+                DeviceCalendarAccessSection(store: store, isShowingPrimer: $isShowingCalendarAccessPrimer)
+
                 Section("Recently Deleted") {
                     if store.deletedEventTombstones.isEmpty {
                         Text("No recently deleted events.")
@@ -73,11 +81,15 @@ struct CalendarManagerView: View {
                     NavigationLink("Import / Export") {
                         ImportExportView(store: store)
                     }
-
-                    Text("Local-only MVP. Connected accounts are intentionally not exposed in Phase 1.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
                 }
+            }
+            // Spec 3.4: authorization is re-read whenever a device-calendar surface appears,
+            // never cached from launch — the user may have changed it in Settings since. On the
+            // `List` rather than on `DeviceCalendarAccessSection`, because a `Section` is a
+            // container SwiftUI flattens into its rows, and a row below the fold would not
+            // trigger the read until it scrolled into view.
+            .task {
+                store.refreshDeviceCalendarAccess()
             }
             .calendarListEditMode($isEditing)
             .navigationTitle("Calendars")
@@ -100,6 +112,9 @@ struct CalendarManagerView: View {
                     .accessibilityLabel("Close calendars")
                 }
             }
+        }
+        .sheet(isPresented: $isShowingCalendarAccessPrimer) {
+            CalendarAccessPrimerView(store: store)
         }
         // Keeps the sheet a stable size across pushes (e.g. Import / Export).
         .macSheetFrame()

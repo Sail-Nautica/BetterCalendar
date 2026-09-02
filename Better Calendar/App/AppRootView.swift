@@ -63,9 +63,19 @@ struct AppRootView: View {
         } message: {
             Text(store.lastError ?? "")
         }
+        .task {
+            // Spec 3.4: the first authorization read happens here rather than in `load()` —
+            // launch touches nothing from EventKit.
+            store.refreshDeviceCalendarAccess()
+        }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 store.refreshForSystemTimeChange()
+                // Spec 3.4 (BC-EK-022): re-checked on every foreground transition, never
+                // cached for the process lifetime. A user can revoke access in Settings while
+                // the app is backgrounded; on return the app must degrade without crashing and
+                // without losing local data.
+                store.refreshDeviceCalendarAccess()
             }
         }
         .onChange(of: selectedTab) { _, newTab in

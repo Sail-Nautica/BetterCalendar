@@ -11,10 +11,19 @@ final class BetterCalendarStore {
     private(set) var recurrenceExceptions: [RecurrenceException] = []
     private(set) var lastError: String?
     private(set) var environmentRevision = 0
+    /// Spec 3.4: the device's current answer about calendar access, re-read on every foreground
+    /// transition and on every device-calendar surface's appearance — never cached across the
+    /// process lifetime and never persisted. It starts `notDetermined` because `load()`
+    /// deliberately performs no authorization read: launch touches nothing from EventKit, and
+    /// the first read happens when a surface that needs it appears.
+    private(set) var calendarAccessStatus: CalendarAccessStatus = .notDetermined
     var undoAction: UndoAction?
 
     private let repository: LocalCalendarRepository
     private let notificationScheduler: LocalNotificationScheduling
+    /// Spec 3.3/3.4 (Phase 3A). Injected so the whole permission flow runs in CI against
+    /// `FakeCalendarAuthorization` with no device and no system prompt (BC-EK-024).
+    private let calendarAuthorization: CalendarAccessAuthorizing
     /// Spec 2.5: memoised `RecurrenceExpander` output behind `visibleOccurrences(in:)`. Kept
     /// fresh by `invalidateOccurrenceCache(for:previousDatabase:)` on every `EngineTransaction`
     /// applied through `withPersistedMutation` and fully cleared on any whole-database
@@ -28,9 +37,14 @@ final class BetterCalendarStore {
     /// back mutation must never touch it).
     private let conflictIndex = ConflictIndex()
 
-    init(repository: LocalCalendarRepository = SQLiteCalendarRepository(), notificationScheduler: LocalNotificationScheduling = UserNotificationScheduler()) {
+    init(
+        repository: LocalCalendarRepository = SQLiteCalendarRepository(),
+        notificationScheduler: LocalNotificationScheduling = UserNotificationScheduler(),
+        calendarAuthorization: CalendarAccessAuthorizing = EventKitCalendarAuthorization()
+    ) {
         self.repository = repository
         self.notificationScheduler = notificationScheduler
+        self.calendarAuthorization = calendarAuthorization
         load()
     }
 
@@ -628,6 +642,65 @@ final class BetterCalendarStore {
         environmentRevision += 1
         purgeExpiredTombstones()
         reconcileNotifications()
+    }
+
+    // MARK: - Device calendar access (spec 3.3/3.4, Phase 3A)
+
+    /// Spec 3.4's behavior table for the current state, combining the device's answer with the
+    /// one bit of the flow this app owns. Every device-calendar surface reads this rather than
+    /// switching on the raw status.
+    var deviceCalendarAccess: DeviceCalendarAccessState {
+        DeviceCalendarAccessState(
+            status: calendarAccessStatus,
+            hasSeenPrimer: settings.hasSeenCalendarAccessPrimer
+        )
+    }
+
+    /// Spec 3.4: re-read the device's answer. Called on every transition to the active scene
+    /// phase and whenever a device-calendar surface appears — a user can revoke access in
+    /// Settings while the app is backgrounded, and on return the app must degrade without
+    /// crashing and without losing local data (BC-EK-022).
+    ///
+    /// Cheap and synchronous by construction: reading the status is a static EventKit call that
+    /// creates no event store and shows no prompt.
+    func refreshDeviceCalendarAccess() {
+        calendarAccessStatus = calendarAuthorization.authorizationStatus
+    }
+
+    /// BC-EK-001: records that `SRC-PERM-01` has been shown. Called for both of the primer's
+    /// outcomes — "Not Now" records it and stops there, which is what leaves the single-use
+    /// system prompt unburned for whenever the user is ready.
+    @discardableResult
+    func markCalendarAccessPrimerSeen() -> Bool {
+        guard !settings.hasSeenCalendarAccessPrimer else { return true }
+        return updateSettings { $0.hasSeenCalendarAccessPrimer = true }
+    }
+
+    /// Spec 3.3: presents the system alert, at most once, and only after the primer has
+    /// explained it.
+    ///
+    /// Both preconditions are enforced here rather than in the view, so no future screen can
+    /// reach the system alert by calling this directly:
+    /// - the primer must have been seen (BC-EK-001), and
+    /// - the device must not already have answered — after a denial the app never re-prompts
+    ///   in-app, it offers a Settings deep link and stops asking.
+    ///
+    /// Returns the resulting status; when a precondition fails it returns the live status
+    /// unchanged, having asked the system nothing.
+    @discardableResult
+    func requestDeviceCalendarAccess() async -> CalendarAccessStatus {
+        refreshDeviceCalendarAccess()
+        guard deviceCalendarAccess.canRequestAccess else {
+            return calendarAccessStatus
+        }
+
+        // Spec 3.3: always full access. The product must display existing events, so write-only
+        // is a state to handle gracefully, never a state to request.
+        let result = await calendarAuthorization.requestAccess(.full)
+        calendarAccessStatus = result
+        // Spec 3K: counts and enum-like status only — never a calendar name or an account email.
+        PrivacyLog.track(.calendarPermissionResult, metadata: result.rawValue)
+        return result
     }
 
     func visibleOccurrences(in range: DateInterval) -> [CalendarOccurrence] {

@@ -1515,6 +1515,10 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         case lastSelectedTab = "last_selected_tab"
         case lastSelectedDate = "last_selected_date"
         case secondaryTimeZoneIdentifier = "secondary_time_zone_identifier"
+        // Spec 3.3: a new key needs no migration — `application_settings` is key-value, and
+        // `upsertSettings` deletes only the keys it knows about, so an older build reading a
+        // newer database is unaffected.
+        case hasSeenCalendarAccessPrimer = "has_seen_calendar_access_primer"
     }
 
     private func fetchSettings(in db: Database) throws -> AppSettings {
@@ -1566,6 +1570,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             settings.lastSelectedDate = decodeInstant(raw)
         }
         settings.secondaryTimeZoneIdentifier = values[SettingsKey.secondaryTimeZoneIdentifier.rawValue]
+        if let raw = values[SettingsKey.hasSeenCalendarAccessPrimer.rawValue] {
+            settings.hasSeenCalendarAccessPrimer = raw == "1"
+        }
 
         return settings
     }
@@ -1580,7 +1587,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             .snapIntervalMinutes: String(settings.snapIntervalMinutes),
             .appearance: settings.appearance.rawValue,
             .reduceCalendarAnimation: settings.reduceCalendarAnimation.databaseInt.description,
-            .hasCompletedOnboarding: settings.hasCompletedOnboarding.databaseInt.description
+            .hasCompletedOnboarding: settings.hasCompletedOnboarding.databaseInt.description,
+            .hasSeenCalendarAccessPrimer: settings.hasSeenCalendarAccessPrimer.databaseInt.description
         ]
 
         if let offsetSeconds = settings.defaultReminderOffset?.relativeOffsetSeconds {

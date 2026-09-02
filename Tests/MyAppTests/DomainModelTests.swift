@@ -269,9 +269,10 @@ final class DomainModelTests: XCTestCase {
         XCTAssertEqual(decoded, database)
     }
 
-    // BC-PRIV-001: spec 0.13's analytics allow-list, verbatim. `AnalyticsEvent` is a closed enum
-    // specifically so this list can only grow via a reviewed code change to the enum itself,
-    // never a free-form string at a call site.
+    // BC-PRIV-001: spec 0.13's analytics allow-list, verbatim, plus the events later phases add
+    // to it under the same rule. `AnalyticsEvent` is a closed enum specifically so this list can
+    // only grow via a reviewed code change to the enum itself, never a free-form string at a
+    // call site.
     func testAnalyticsEventAllowListMatchesSpecExactly() {
         let specAllowList: Set<String> = [
             "calendar_view_opened",
@@ -281,6 +282,9 @@ final class DomainModelTests: XCTestCase {
             "search_performed",
             "notification_permission_result",
             "ics_import_result",
+            // Spec 3K: the resulting authorization status, which is enum-like status text
+            // carrying no calendar name, account email, or event content.
+            "calendar_permission_result",
         ]
 
         let implementedEvents = Set(PrivacyLog.AnalyticsEvent.allCases.map(\.rawValue))

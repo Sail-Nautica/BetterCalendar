@@ -18,6 +18,9 @@ enum PrivacyLog {
         case eventDeleted = "event_deleted"
         case searchPerformed = "search_performed"
         case notificationPermissionResult = "notification_permission_result"
+        /// Spec 3K: the resulting `CalendarAccessStatus`, which is enum-like status text and
+        /// carries no calendar name, account email, or event content.
+        case calendarPermissionResult = "calendar_permission_result"
         case icsImportResult = "ics_import_result"
     }
 

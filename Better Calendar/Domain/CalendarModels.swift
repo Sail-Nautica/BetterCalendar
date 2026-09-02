@@ -364,6 +364,10 @@ struct AppSettings: Codable, Equatable {
     var lastSelectedTab: BetterCalendarTab?
     var lastSelectedDate: Date?
     var secondaryTimeZoneIdentifier: String?
+    /// Spec 3.3 (BC-EK-001): whether `SRC-PERM-01` has been shown. The one piece of the device-
+    /// calendar permission flow Better Calendar owns and therefore persists — the authorization
+    /// status itself is the device's answer, read live and never stored (spec 3.4).
+    var hasSeenCalendarAccessPrimer: Bool
 
     static let defaultSettings = AppSettings(
         defaultEventDurationMinutes: 60,
@@ -379,7 +383,8 @@ struct AppSettings: Codable, Equatable {
         hasCompletedOnboarding: false,
         lastSelectedTab: nil,
         lastSelectedDate: nil,
-        secondaryTimeZoneIdentifier: nil
+        secondaryTimeZoneIdentifier: nil,
+        hasSeenCalendarAccessPrimer: false
     )
 }
 
