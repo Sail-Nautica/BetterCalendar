@@ -21,7 +21,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v015_add_version_numbers",
         "v016_add_engine_indexes",
         "v017_rebuild_search_index",
-        "v018_add_calendar_provider_identity"
+        "v018_add_calendar_provider_identity",
+        "v019_add_calendar_availability"
     ]
 
     /// Spec 2.17: a checksum over the migration set, stored alongside the applied migration
@@ -764,6 +765,19 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 """)
         }
 
+        // Spec 3B.4 / 3.8: a calendar that disappears from EventKit — account removed, calendar
+        // deleted elsewhere — is marked rather than purged, so the local-only state on the row
+        // (`is_visible`, `is_default`, `sort_order`) survives to be restored if it comes back.
+        //
+        // `is_unavailable` is NOT NULL with a default, so every existing row backfills as what
+        // it is: available. `unavailable_since` is written now and read in Phase 3E, which owes
+        // spec 3.26 a retention limit for hidden mirror rows and an ADR recording it — adding
+        // the column here means that phase writes a policy rather than a migration.
+        migrator.registerMigration("v019_add_calendar_availability") { db in
+            try db.execute(sql: "ALTER TABLE calendars ADD COLUMN is_unavailable INTEGER NOT NULL DEFAULT 0")
+            try db.execute(sql: "ALTER TABLE calendars ADD COLUMN unavailable_since TEXT")
+        }
+
         return migrator
     }
 
@@ -896,7 +910,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "id", "provider", "provider_account_id", "provider_calendar_id", "name", "color_hex",
         "is_visible", "is_read_only", "is_default", "time_zone_id", "sort_order",
         "created_at", "updated_at", "deleted_at", "version_number",
-        "account_name", "connection_method", "capabilities_json"
+        "account_name", "connection_method", "capabilities_json",
+        "is_unavailable", "unavailable_since"
     ]
 
     private static let eventColumns = [
@@ -948,7 +963,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             calendar.versionNumber,
             calendar.accountName,
             calendar.connectionMethod.rawValue,
-            encodeCapabilities(calendar.capabilities)
+            encodeCapabilities(calendar.capabilities),
+            calendar.isUnavailable.databaseInt,
+            calendar.unavailableSince.map(encodeInstant)
         ]
     }
 
@@ -1309,7 +1326,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 colorHex: matchedToken == nil ? storedHex : nil,
                 isReadOnly: row.boolValue("is_read_only"),
                 timeZoneIdentifier: row["time_zone_id"],
-                capabilities: decodeCapabilities(row["capabilities_json"])
+                capabilities: decodeCapabilities(row["capabilities_json"]),
+                isUnavailable: row.boolValue("is_unavailable"),
+                unavailableSince: (row["unavailable_since"] as String?).flatMap(decodeInstant)
             )
         }
     }
@@ -1660,6 +1679,14 @@ private extension EventProvider {
             "eventKit"
         case .university:
             "university"
+        case .exchange:
+            "exchange"
+        case .deviceLocal:
+            "deviceLocal"
+        case .subscribed:
+            "subscribed"
+        case .otherAccount:
+            "otherAccount"
         }
     }
 
@@ -1673,6 +1700,14 @@ private extension EventProvider {
             self = .apple
         case "university":
             self = .university
+        case "exchange":
+            self = .exchange
+        case "deviceLocal":
+            self = .deviceLocal
+        case "subscribed":
+            self = .subscribed
+        case "otherAccount":
+            self = .otherAccount
         default:
             self = .betterCalendar
         }
@@ -1707,44 +1742,6 @@ private extension SyncStatus {
             self = .failed
         default:
             self = .synced
-        }
-    }
-}
-
-private extension CalendarColorName {
-    var hexValue: String {
-        switch self {
-        case .betterBlue:
-            "#4F7DFF"
-        case .success:
-            "#2EA86B"
-        case .warning:
-            "#E68A2E"
-        case .destructive:
-            "#D94D4D"
-        case .navy:
-            "#17243D"
-        case .gray:
-            "#5C6678"
-        }
-    }
-
-    init?(hexValue: String) {
-        switch hexValue.uppercased() {
-        case "#4F7DFF":
-            self = .betterBlue
-        case "#2EA86B":
-            self = .success
-        case "#E68A2E":
-            self = .warning
-        case "#D94D4D":
-            self = .destructive
-        case "#17243D":
-            self = .navy
-        case "#5C6678":
-            self = .gray
-        default:
-            return nil
         }
     }
 }

@@ -472,6 +472,11 @@ enum EventMutationUseCases {
         in database: LocalCalendarDatabase
     ) -> CapabilityViolation? {
         guard let calendar = database.calendars.first(where: { $0.id == calendarID }) else { return nil }
+        // Spec 3B.4: an unavailable calendar refuses everything, and says why in its own words —
+        // it has not denied permission, it is simply no longer on the device.
+        guard !calendar.isUnavailable else {
+            return CapabilityViolation(calendarID: calendarID, calendarName: calendar.name, reason: .unavailable)
+        }
         if creating {
             guard calendar.allowsEventCreation else {
                 return CapabilityViolation(calendarID: calendarID, calendarName: calendar.name, reason: .creationNotAllowed)

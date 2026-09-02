@@ -32,9 +32,9 @@ protocol CalendarAccessAuthorizing {
 /// step and "we asked the system exactly once" is assertable.
 ///
 /// Ships in the app target beside the real implementation, following the
-/// `NoopNotificationScheduler` precedent, so previews and tests share one double. Phase 3B folds
-/// it into `FakeEventKitStore`.
-final class FakeCalendarAuthorization: CalendarAccessAuthorizing {
+/// `NoopNotificationScheduler` precedent, so previews and tests share one double. Phase 3B's
+/// `FakeEventKitStore` extends it rather than restating it.
+class FakeCalendarAuthorization: CalendarAccessAuthorizing {
     var authorizationStatus: CalendarAccessStatus
     /// What the system alert "answers" when `requestAccess` is called.
     var grantResult: CalendarAccessStatus
@@ -58,5 +58,72 @@ final class FakeCalendarAuthorization: CalendarAccessAuthorizing {
     /// revoked this in Settings" reads that way.
     func simulateExternalChange(to status: CalendarAccessStatus) {
         authorizationStatus = status
+    }
+}
+
+// MARK: - Phase 3B: calendar enumeration
+
+/// Spec 3.2's `EventKitStore`, as far as Phase 3B needs it. Refines 3A's authorization seam
+/// rather than restating it, so a caller that only asks about permission keeps the narrower
+/// type and the 3A call sites did not change when this arrived.
+///
+/// Spec 3.2 also sketches `sources()`, `events(in:calendarIDs:)`, `save`, `remove` and
+/// `changeObservations()`. The event members are Phase 3C/3D. `sources()` is Phase 3F: every
+/// consumer in 3B wants the source *of a calendar*, which `DeviceCalendar` carries, and an
+/// account with no calendars has nothing to list or toggle — it is the duplicate-connection rule
+/// that eventually needs to compare accounts rather than calendars.
+protocol EventKitStore: CalendarAccessAuthorizing {
+    /// Everything one discovery pass needs, in one call.
+    ///
+    /// One call rather than two properties because the real implementation needs a live
+    /// `EKEventStore` for both answers and creating one is the expensive part — the shape of the
+    /// protocol should not force the adapter to make two.
+    func discoverCalendars() throws -> DeviceCalendarSnapshot
+}
+
+/// What the device reports about its calendars at one moment.
+struct DeviceCalendarSnapshot: Equatable {
+    var calendars: [DeviceCalendar]
+    /// `EKEventStore.defaultCalendarForNewEvents`, as an identifier. Spec 3B.5's second fallback
+    /// step. Read live and held in memory only — never persisted, because it is the device's
+    /// state and a stored copy disagrees with it the moment the user changes it in Settings.
+    var defaultCalendarIdentifierForNewEvents: String?
+
+    static let empty = DeviceCalendarSnapshot(calendars: [], defaultCalendarIdentifierForNewEvents: nil)
+
+    init(calendars: [DeviceCalendar], defaultCalendarIdentifierForNewEvents: String? = nil) {
+        self.calendars = calendars
+        self.defaultCalendarIdentifierForNewEvents = defaultCalendarIdentifierForNewEvents
+    }
+}
+
+/// Spec 3.36's fake, extended to calendars: scriptable calendars, a scriptable device default,
+/// injectable failure, and a count of how many times discovery actually reached the device.
+final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
+    var snapshot: DeviceCalendarSnapshot
+    /// Set to make the next discovery throw, for the failure paths spec 3.21 will classify.
+    var discoveryError: Error?
+    private(set) var discoveryCount = 0
+
+    init(
+        status: CalendarAccessStatus = .fullAccess,
+        grantResult: CalendarAccessStatus = .fullAccess,
+        snapshot: DeviceCalendarSnapshot = .empty
+    ) {
+        self.snapshot = snapshot
+        super.init(status: status, grantResult: grantResult)
+    }
+
+    func discoverCalendars() throws -> DeviceCalendarSnapshot {
+        discoveryCount += 1
+        if let discoveryError {
+            throw discoveryError
+        }
+        return snapshot
+    }
+
+    /// Someone added, removed, renamed or recoloured a calendar in Settings between passes.
+    func simulateDeviceChange(to snapshot: DeviceCalendarSnapshot) {
+        self.snapshot = snapshot
     }
 }

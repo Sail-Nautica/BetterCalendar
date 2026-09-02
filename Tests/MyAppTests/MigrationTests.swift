@@ -341,6 +341,13 @@ final class MigrationTests: XCTestCase {
             XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT MIN(version_number) FROM events"), 1, "event version not backfilled \(context)")
             XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT MIN(version_number) FROM calendars"), 1, "calendar version not backfilled \(context)")
 
+            // v019: every pre-existing calendar backfills as available, with no timestamp.
+            XCTAssertEqual(
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM calendars WHERE is_unavailable != 0 OR unavailable_since IS NOT NULL"),
+                0,
+                "calendar availability not backfilled \(context)"
+            )
+
             guard Self.fixtureIncludesSyncTables(stoppingAfter: identifier) else { return }
 
             // Columns with a DEFAULT are populated for every row regardless of when it was

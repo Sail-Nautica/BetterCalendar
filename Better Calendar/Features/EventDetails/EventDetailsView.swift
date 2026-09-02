@@ -38,7 +38,7 @@ struct EventDetailsView: View {
                 Section {
                     HStack(alignment: .top, spacing: 12) {
                         Circle()
-                            .fill(calendar?.colorName.color ?? .blue)
+                            .fill(calendar?.displayColor ?? .blue)
                             .frame(width: 14, height: 14)
                             .padding(.top, 4)
 

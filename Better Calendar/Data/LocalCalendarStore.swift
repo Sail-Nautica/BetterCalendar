@@ -40,7 +40,7 @@ final class BetterCalendarStore {
     init(
         repository: LocalCalendarRepository = SQLiteCalendarRepository(),
         notificationScheduler: LocalNotificationScheduling = UserNotificationScheduler(),
-        calendarAuthorization: CalendarAccessAuthorizing = EventKitCalendarAuthorization()
+        calendarAuthorization: CalendarAccessAuthorizing = EventKitDeviceStore()
     ) {
         self.repository = repository
         self.notificationScheduler = notificationScheduler

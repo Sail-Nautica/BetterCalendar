@@ -385,7 +385,7 @@ private struct DayCalendarView: View {
                                 .lineLimit(1)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
-                                .background(calendar(for: occurrence.event)?.colorName.color.opacity(0.18) ?? Color.accentColor.opacity(0.18), in: Capsule())
+                                .background(calendar(for: occurrence.event)?.displayColor.opacity(0.18) ?? Color.accentColor.opacity(0.18), in: Capsule())
                         }
                         .buttonStyle(.plain)
                     }
@@ -651,7 +651,7 @@ private struct MonthCalendarView: View {
                         isInSelectedMonth: Calendar.current.isDate(day, equalTo: selectedDate, toGranularity: .month),
                         isSelected: Calendar.current.isDate(day, inSameDayAs: selectedDate),
                         occurrences: occurrencesForDay(day),
-                        calendarColor: { calendar(for: $0.event)?.colorName.color ?? .blue },
+                        calendarColor: { calendar(for: $0.event)?.displayColor ?? .blue },
                         onSelect: {
                             selectedDate = day
                         },
@@ -811,7 +811,7 @@ private struct CompactOccurrenceCard: View {
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             RoundedRectangle(cornerRadius: 2)
-                .fill(calendar?.colorName.color ?? .blue)
+                .fill(calendar?.displayColor ?? .blue)
                 .frame(width: 4)
 
             VStack(alignment: .leading, spacing: 4) {
@@ -851,7 +851,7 @@ private struct TimelineOccurrenceCard: View {
         } label: {
             VStack(alignment: .leading, spacing: 3) {
                 Capsule()
-                    .fill(calendar?.colorName.color ?? .blue)
+                    .fill(calendar?.displayColor ?? .blue)
                     .frame(height: 4)
 
                 Text(occurrence.event.displayTitle)

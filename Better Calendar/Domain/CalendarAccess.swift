@@ -14,7 +14,7 @@ enum CalendarAccessLevel: String, CaseIterable, Hashable {
 
 /// Spec 3.3/3.4: the device's answer, in Better Calendar's own vocabulary rather than
 /// EventKit's. `EKAuthorizationStatus` is translated at the adapter boundary (see
-/// `EventKitCalendarAuthorization`), so nothing in the domain layer — and no view — depends on
+/// `EventKitDeviceStore`), so nothing in the domain layer — and no view — depends on
 /// EventKit's spelling of these states, or on EventKit at all.
 enum CalendarAccessStatus: String, CaseIterable, Hashable {
     case notDetermined

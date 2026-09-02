@@ -221,7 +221,9 @@ protocol CalendarAccessAuthorizing {
 the 3A call sites changing. Two implementations ship:
 
 * **`EventKitCalendarAuthorization`** — the real one, and the only file in the codebase that
-  imports EventKit (spec 3.2's rule). It translates `EKAuthorizationStatus` into
+  imports EventKit (spec 3.2's rule). *(Renamed `EventKitDeviceStore` in Phase 3B, when it grew
+  calendar enumeration; the rename kept spec 3.2's "only file" rule literally true rather than
+  adding a second EventKit-importing sibling.)* It translates `EKAuthorizationStatus` into
   `CalendarAccessStatus` and calls `requestFullAccessToEvents()`.
 
   It holds **no** `EKEventStore` instance. `EKEventStore.authorizationStatus(for:)` is a static

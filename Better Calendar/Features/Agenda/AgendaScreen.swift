@@ -213,7 +213,7 @@ private struct AgendaEventRow: View {
 
         HStack(alignment: .top, spacing: 10) {
             Circle()
-                .fill(calendar?.colorName.color ?? .blue)
+                .fill(calendar?.displayColor ?? .blue)
                 .frame(width: 10, height: 10)
                 .padding(.top, 5)
                 .accessibilityHidden(true)

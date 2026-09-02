@@ -96,6 +96,17 @@ struct BetterCalendar: Identifiable, Hashable {
     var timeZoneIdentifier: String?
     var capabilities: CalendarCapabilities = .localDefaults
 
+    // MARK: - Availability (spec 3B.4)
+
+    /// Spec 3.8: a calendar that disappears from EventKit — account removed, calendar deleted
+    /// elsewhere — is *marked* rather than purged, so its local-only state (`isVisible`,
+    /// `isDefault`, `sortOrder`) is still there to restore if it comes back.
+    var isUnavailable: Bool = false
+    /// When the mirror last failed to find it. Unused in Phase 3B: spec 3.26 requires a
+    /// retention limit for hidden mirror rows, and that limit is a Phase 3E decision with an ADR
+    /// of its own. The column exists now so 3E writes a policy rather than a migration.
+    var unavailableSince: Date?
+
     /// The single question every mutation path actually asks. Read-only is the coarse switch the
     /// user sees; `capabilities` is the fine-grained truth a provider reports.
     var allowsEventEditing: Bool {
@@ -104,6 +115,14 @@ struct BetterCalendar: Identifiable, Hashable {
 
     var allowsEventCreation: Bool {
         !isReadOnly && capabilities.allowsEventCreation
+    }
+
+    /// Spec 3B.5: a calendar the user may be *offered* as a destination — writable, and actually
+    /// present on the device. Distinct from `allowsEventCreation`, which asks only what the
+    /// calendar permits: an available read-only calendar and an unavailable writable one are
+    /// both unusable destinations, for different reasons and with different copy.
+    var isWritableDestination: Bool {
+        !isUnavailable && allowsEventCreation
     }
 
     static func localDefault(now: Date = .now) -> BetterCalendar {
@@ -125,6 +144,7 @@ extension BetterCalendar: Codable {
         case id, name, colorName, isVisible, isDefault, sortOrder, createdAt, updatedAt, versionNumber
         case provider, connectionMethod, providerAccountID, providerCalendarID, accountName
         case colorHex, isReadOnly, timeZoneIdentifier, capabilities
+        case isUnavailable, unavailableSince
     }
 
     /// Decodes tolerantly so calendars written before `sortOrder` existed still load,
@@ -152,6 +172,10 @@ extension BetterCalendar: Codable {
         isReadOnly = try container.decodeIfPresent(Bool.self, forKey: .isReadOnly) ?? false
         timeZoneIdentifier = try container.decodeIfPresent(String.self, forKey: .timeZoneIdentifier)
         capabilities = try container.decodeIfPresent(CalendarCapabilities.self, forKey: .capabilities) ?? .localDefaults
+        // Spec 3B.4: a calendar written before availability existed decodes as available, which
+        // is what it was — the same tolerance every field above already establishes.
+        isUnavailable = try container.decodeIfPresent(Bool.self, forKey: .isUnavailable) ?? false
+        unavailableSince = try container.decodeIfPresent(Date.self, forKey: .unavailableSince)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -174,6 +198,8 @@ extension BetterCalendar: Codable {
         try container.encode(isReadOnly, forKey: .isReadOnly)
         try container.encodeIfPresent(timeZoneIdentifier, forKey: .timeZoneIdentifier)
         try container.encode(capabilities, forKey: .capabilities)
+        try container.encode(isUnavailable, forKey: .isUnavailable)
+        try container.encodeIfPresent(unavailableSince, forKey: .unavailableSince)
     }
 }
 
@@ -279,6 +305,10 @@ struct CapabilityViolation: Equatable, Hashable {
         case readOnly
         /// The calendar does not permit adding new events.
         case creationNotAllowed
+        /// Spec 3B.4: the calendar is mirrored but no longer present on the device — the
+        /// account was removed, or the calendar was deleted elsewhere. Distinct from `readOnly`
+        /// because the calendar has not refused anything; it is simply not there to write to.
+        case unavailable
     }
 
     /// User-facing copy, per the UI/UX §9.2 rule that an error says what happened and why.
@@ -288,6 +318,8 @@ struct CapabilityViolation: Equatable, Hashable {
             "\"\(calendarName)\" is read-only, so this event can't be changed here."
         case .creationNotAllowed:
             "\"\(calendarName)\" doesn't allow new events."
+        case .unavailable:
+            "\"\(calendarName)\" isn't available on this device right now, so this event can't be saved to it."
         }
     }
 }
@@ -405,6 +437,34 @@ enum CalendarColorName: String, CaseIterable, Identifiable, Codable {
 /// - `allDay`: calendar dates. The date never shifts when the viewing time zone changes.
 /// - `floating`: the same wall-clock time everywhere ("take medication at 8:00 PM wherever
 ///   I am"). The clock time is preserved and re-anchored into whatever zone is displaying it.
+/// The design tokens' own hex values (UI/UX §6.2), in the domain rather than in the repository
+/// that used to own them privately.
+///
+/// Spec 3B.3 is why they moved: `SQLiteCalendarRepository` normalises a stored hex that matches
+/// a token back into that token with `colorHex == nil`, and the discovery planner has to apply
+/// exactly the same normalisation. If it did not, a device calendar whose colour happened to
+/// equal a token would compare unequal to its own stored row on every pass, and discovery would
+/// rewrite it forever.
+extension CalendarColorName {
+    var hexValue: String {
+        switch self {
+        case .betterBlue: "#4F7DFF"
+        case .success: "#2EA86B"
+        case .warning: "#E68A2E"
+        case .destructive: "#D94D4D"
+        case .navy: "#17243D"
+        case .gray: "#5C6678"
+        }
+    }
+
+    init?(hexValue: String) {
+        guard let match = CalendarColorName.allCases.first(where: { $0.hexValue == hexValue.uppercased() }) else {
+            return nil
+        }
+        self = match
+    }
+}
+
 enum EventTimeType: String, Codable, CaseIterable, Identifiable, Hashable {
     case timed
     case allDay
@@ -665,8 +725,25 @@ struct ProviderMetadata: Codable, Hashable {
 enum EventProvider: String, Codable, CaseIterable, Identifiable {
     case betterCalendar = "Better Calendar"
     case google = "Google"
+    /// iCloud, and Apple-provided calendars such as Birthdays.
     case apple = "Apple"
     case university = "U-M"
+    // MARK: - Spec 3B.2
+    //
+    // The values spec 3.6's "…" left open. Without them an Exchange account or an "On My
+    // iPhone" calendar has no honest answer to "who owns this data", and `provider` is the axis
+    // Phase 3F's duplicate-connection rule matches on.
+    case exchange = "Exchange"
+    /// `EKSourceType.local` — the device's own calendar store. Deliberately *not*
+    /// `betterCalendar`: this one is reached through EventKit and we do not own it, and
+    /// collapsing the two would leave `connectionMethod` as the only thing telling a row we own
+    /// from one we mirror.
+    case deviceLocal = "On My Device"
+    /// `EKSourceType.subscribed` — a read-only feed.
+    case subscribed = "Subscribed"
+    /// A CalDAV or other account we cannot attribute more precisely. The honest answer, and the
+    /// safe one: see `DeviceCalendarSource.provider`.
+    case otherAccount = "Other Account"
 
     var id: String { rawValue }
 }
