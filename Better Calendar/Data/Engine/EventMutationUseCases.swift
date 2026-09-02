@@ -406,7 +406,10 @@ enum EventMutationUseCases {
 
     /// Spec 2.10/2.11's idempotency guard: an outbox row already `pending` or `applied` under
     /// this key means the effect this call wants already exists (or is already underway).
-    private static func existingOutcome(forIdempotencyKey key: UUID, in database: LocalCalendarDatabase) -> Outcome? {
+    ///
+    /// Not `private`: `RecurrenceSplitter` (spec 2.3/2.4) reuses this exact guard for its own
+    /// bespoke `.thisAndFuture` transactions rather than re-implementing it.
+    static func existingOutcome(forIdempotencyKey key: UUID, in database: LocalCalendarDatabase) -> Outcome? {
         let alreadyEnqueued = database.pendingMutations.contains {
             $0.idempotencyKey == key && ($0.status == .pending || $0.status == .applied)
         }
@@ -416,11 +419,14 @@ enum EventMutationUseCases {
     /// Spec 2.13/BC-ENG-006's resurrection guard: an entity with a tombstone still present in
     /// `database` hasn't been purged yet, so per spec 2.13's retention semantics it is still
     /// authoritative — the delete it records always wins over a delayed create/update.
-    private static func hasLiveTombstone(forEntityID entityID: UUID, in database: LocalCalendarDatabase) -> Bool {
+    ///
+    /// Not `private`: see `existingOutcome` above — `RecurrenceSplitter` reuses this too.
+    static func hasLiveTombstone(forEntityID entityID: UUID, in database: LocalCalendarDatabase) -> Bool {
         database.deletedEventTombstones.contains { $0.entityID == entityID }
     }
 
-    private static func journalEntry(
+    /// Not `private`: see `existingOutcome` above — `RecurrenceSplitter` reuses this too.
+    static func journalEntry(
         entityType: EngineEntityType,
         entityID: UUID,
         operation: JournalOperation,
@@ -439,7 +445,8 @@ enum EventMutationUseCases {
         )
     }
 
-    private static func outboxRow(
+    /// Not `private`: see `existingOutcome` above — `RecurrenceSplitter` reuses this too.
+    static func outboxRow(
         objectID: UUID,
         operation: MutationOperation,
         payload: CalendarEvent,
