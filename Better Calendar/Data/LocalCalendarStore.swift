@@ -780,25 +780,27 @@ final class BetterCalendarStore {
     }
 
     /// Commits a previously-parsed import in one transaction (spec 1.18/1.22), reassigning
-    /// every imported event to `destinationCalendarID` when given. Duplicate detection is
-    /// UID-based when the imported event carries one (RFC 5545 UID →
-    /// `providerMetadata.providerObjectID`), falling back to title+start-date matching when it
-    /// doesn't. A duplicate master's replacements/exceptions are skipped along with it, since
-    /// they'd otherwise reference a master id that was never created.
+    /// every imported event to `destinationCalendarID` when given. Duplicate detection (spec
+    /// 2.15, BC-ENG-007) goes through `DuplicateDetector`, which checks a provider UID (RFC 5545
+    /// UID → `providerMetadata.providerObjectID`) first when the imported event carries one,
+    /// falling back to `(calendarID, normalizedTitle, startInstant, endInstant)` matching within
+    /// a small tolerance when it doesn't. A duplicate master's replacements/exceptions are
+    /// skipped along with it, since they'd otherwise reference a master id that was never
+    /// created.
     @discardableResult
     func commitImport(_ summary: ImportSummary, destinationCalendarID: UUID? = nil) -> ImportSummary {
         guard !summary.events.isEmpty else { return summary }
 
-        func isDuplicate(_ event: CalendarEvent) -> Bool {
-            if let uid = event.providerMetadata.providerObjectID {
-                return events.contains { $0.providerMetadata.providerObjectID == uid }
-            }
-            return events.contains { $0.title == event.title && $0.startDate == event.startDate }
-        }
-
         let masterEvents = summary.events.filter { $0.recurrenceMasterID == nil }
         let replacementEvents = summary.events.filter { $0.recurrenceMasterID != nil }
-        let duplicateMasterIDs = Set(masterEvents.filter(isDuplicate).map(\.id))
+
+        var duplicateMasterIDs: Set<UUID> = []
+        var duplicateReasonCounts: [DuplicateDetector.MatchReason: Int] = [:]
+        for master in masterEvents {
+            guard let match = DuplicateDetector.candidates(for: master, among: events).first else { continue }
+            duplicateMasterIDs.insert(master.id)
+            duplicateReasonCounts[match.reason, default: 0] += 1
+        }
 
         let newMasters = masterEvents.filter { !duplicateMasterIDs.contains($0.id) }
         let newReplacements = replacementEvents.filter { !duplicateMasterIDs.contains($0.recurrenceMasterID ?? $0.id) }
@@ -813,7 +815,7 @@ final class BetterCalendarStore {
         }
 
         guard !newEvents.isEmpty else {
-            PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount)")
+            PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount)\(duplicateReasonSuffix(duplicateReasonCounts))")
             return ImportSummary(importedCount: 0, skippedCount: skippedCount, failedCount: summary.failedCount, events: [])
         }
 
@@ -821,12 +823,25 @@ final class BetterCalendarStore {
         let didSave = perform(outcome)
 
         if didSave {
-            PrivacyLog.track(.icsImportResult, metadata: "imported=\(newEvents.count) skipped=\(skippedCount) failed=\(summary.failedCount)")
+            PrivacyLog.track(.icsImportResult, metadata: "imported=\(newEvents.count) skipped=\(skippedCount) failed=\(summary.failedCount)\(duplicateReasonSuffix(duplicateReasonCounts))")
             return ImportSummary(importedCount: newEvents.count, skippedCount: skippedCount, failedCount: summary.failedCount, events: newEvents, recurrenceExceptions: newExceptions)
         }
 
-        PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount + newEvents.count)")
+        PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount + newEvents.count)\(duplicateReasonSuffix(duplicateReasonCounts))")
         return ImportSummary(importedCount: 0, skippedCount: skippedCount, failedCount: summary.failedCount + newEvents.count, events: [])
+    }
+
+    /// Spec 2.15's "log duplicate-detection decisions for auditability," at the granularity the
+    /// existing `.icsImportResult` privacy log already tracks import outcomes — not a new
+    /// `change_journal` row per decision. See `Documentation/Decisions/0003-duplicate-detector-logging-scope.md`
+    /// for why: `change_journal.operation`'s SQLite `CHECK` constraint has no "skipped, not
+    /// applied" value, and SQLite's automatic foreign-key-clause rewrite on `ALTER TABLE RENAME`
+    /// (the only way to widen a `CHECK`) would also require rebuilding `event_versions`, which
+    /// references it — real schema risk for a feature with no UI consumer yet in Phase 2.
+    private func duplicateReasonSuffix(_ counts: [DuplicateDetector.MatchReason: Int]) -> String {
+        guard !counts.isEmpty else { return "" }
+        let parts = counts.sorted { $0.key.rawValue < $1.key.rawValue }.map { "\($0.key.rawValue)=\($0.value)" }
+        return " duplicateReasons=" + parts.joined(separator: ",")
     }
 
     /// Convenience for the paste-text flow: parses and commits in one call, keeping the
