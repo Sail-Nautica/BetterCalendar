@@ -455,7 +455,12 @@ final class ICSCalendarCodecTests: XCTestCase {
 
     @MainActor
     func testStoreImportCountsDuplicateEventsAsSkippedWithoutSaving() {
-        let existingEvent = TestData.event(title: "Office Hours", startDate: TestData.date("2026-09-02T15:00:00Z"))
+        // Both start *and* end must match the imported event below (spec 2.15's duplicate match
+        // is `(calendarID, normalizedTitle, startInstant, endInstant)`, not title+start alone) —
+        // explicit here rather than relying on `TestData.event`'s independent startDate/endDate
+        // defaults, which would otherwise give this a zero-duration span that doesn't represent
+        // the same real "Office Hours" meeting as the imported [15:00, 16:00) one.
+        let existingEvent = TestData.event(title: "Office Hours", startDate: TestData.date("2026-09-02T15:00:00Z"), endDate: TestData.date("2026-09-02T16:00:00Z"))
         let repository = StubCalendarRepository(loadResult: .success(TestData.database(events: [existingEvent])))
         let store = BetterCalendarStore(repository: repository, notificationScheduler: NoopNotificationScheduler())
         let text = """

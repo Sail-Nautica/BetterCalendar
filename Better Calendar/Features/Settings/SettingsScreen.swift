@@ -14,6 +14,19 @@ struct SettingsScreen: View {
     private static let snapIntervalOptions = [5, 10, 15, 30, 60]
     private static let durationOptions = [15, 30, 45, 60, 90, 120]
 
+    /// Spec 2.20 diagnostics: rows not yet finalized one way or the other.
+    private var outboxDepth: Int {
+        store.pendingMutations.filter { $0.status == .pending || $0.status == .inFlight }.count
+    }
+
+    private var failedMutationCount: Int {
+        store.pendingMutations.filter { $0.status == .failed }.count
+    }
+
+    private var repositoryDiagnostics: RepositoryDiagnostics {
+        store.repositoryDiagnostics()
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -114,6 +127,11 @@ struct SettingsScreen: View {
                     LabeledContent("Event Count", value: "\(store.events.count)")
                     LabeledContent("Recurrence Master Count", value: "\(store.events.filter { $0.recurrence != nil }.count)")
                     LabeledContent("Pending Notification Count", value: pendingNotificationCount.map(String.init) ?? "—")
+                    LabeledContent("Outbox Depth", value: "\(outboxDepth)")
+                    LabeledContent("Failed Mutation Count", value: "\(failedMutationCount)")
+                    LabeledContent("Journal Size", value: repositoryDiagnostics.changeJournalRowCount.map(String.init) ?? "—")
+                    LabeledContent("Last Applied Migration", value: repositoryDiagnostics.lastAppliedMigrationIdentifier ?? "—")
+                    LabeledContent("Migration Checksum", value: repositoryDiagnostics.migrationChecksum ?? "—")
 
                     Button("Reconcile Notifications") {
                         store.reconcileAllNotifications()

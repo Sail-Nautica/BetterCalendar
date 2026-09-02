@@ -20,6 +20,13 @@ final class BetterCalendarStore {
     /// applied through `withPersistedMutation` and fully cleared on any whole-database
     /// replacement (`load()`, `withBulkMutation`).
     private let occurrenceCache = OccurrenceCache()
+    /// Spec 2.6 (BC-ENG-003): maintained incrementally by `reindexConflicts(for:previousDatabase:)`
+    /// after every successfully persisted `EngineTransaction`, and rebuilt wholesale on any
+    /// whole-database replacement (`load()`, `withBulkMutation`) — the same two hook points as
+    /// `occurrenceCache`, but reindexed only on success (unlike the occurrence cache, this is
+    /// maintained state that mirrors `events`, not a lazily-recomputed memoisation, so a rolled
+    /// back mutation must never touch it).
+    private let conflictIndex = ConflictIndex()
 
     init(repository: LocalCalendarRepository = SQLiteCalendarRepository(), notificationScheduler: LocalNotificationScheduling = UserNotificationScheduler()) {
         self.repository = repository
@@ -44,6 +51,7 @@ final class BetterCalendarStore {
         let outcome = LaunchRecovery.run(repository: repository)
         apply(outcome.database)
         occurrenceCache.invalidateAll()
+        conflictIndex.rebuild(from: events)
         ensureDefaultCalendar()
 
         if outcome.usedFallbackSeed {
@@ -605,6 +613,14 @@ final class BetterCalendarStore {
         await notificationScheduler.pendingRequestCount()
     }
 
+    /// M7's Settings diagnostics surface (spec 2.20): journal size and the last-applied
+    /// migration's identifier/checksum, read live from `repository`. `nil` fields (rather than a
+    /// thrown error) are how the flat-file/stub repositories signal "not applicable" — see
+    /// `RepositoryDiagnostics.unavailable`.
+    func repositoryDiagnostics() -> RepositoryDiagnostics {
+        (try? repository.diagnostics()) ?? .unavailable
+    }
+
     func refreshForSystemTimeChange() {
         environmentRevision += 1
         purgeExpiredTombstones()
@@ -651,6 +667,31 @@ final class BetterCalendarStore {
 
                 return lhs.occurrenceStartDate < rhs.occurrenceStartDate
             }
+    }
+
+    /// Spec 2.6 (BC-ENG-003): event ids currently conflicting with `event` — `.busy` and
+    /// overlapping (all-day events only against other all-day events, on overlapping local
+    /// dates). Engine-API only, like `editSeries`/`deleteSeries`: no `Features/` call site exists
+    /// in Phase 2, this exists for Phase 11/12 to build a conflict-warning UI on.
+    ///
+    /// Indexes each stored `CalendarEvent` row's own interval. For a recurring master that is
+    /// its first occurrence only — an unmodified future occurrence has no row of its own to
+    /// index, so it is not separately checked here. A per-occurrence replacement event (from a
+    /// "This Event" edit) *is* its own row and is fully covered.
+    func conflictingEventIDs(for event: CalendarEvent) -> Set<UUID> {
+        conflictIndex.conflicts(for: event.id)
+    }
+
+    /// Spec 2.7 (BC-ENG-004): merged busy intervals over `query`'s range. `query.calendarIDs ==
+    /// nil` resolves to every currently-visible calendar (`calendars.filter(\.isVisible)`) here —
+    /// `FreeBusy.query` itself treats `nil` as "no filter, every calendar," since the pure
+    /// `Domain/` function has no notion of calendar visibility.
+    func freeBusy(_ query: FreeBusy.Query) -> [DateInterval] {
+        var resolvedQuery = query
+        if resolvedQuery.calendarIDs == nil {
+            resolvedQuery.calendarIDs = Set(calendars.filter(\.isVisible).map(\.id))
+        }
+        return FreeBusy.query(resolvedQuery, events: events, exceptions: recurrenceExceptions)
     }
 
     /// BC-SRCH-001/002 (spec 1.13): full-text search via the FTS5 index (recall) plus
@@ -747,25 +788,27 @@ final class BetterCalendarStore {
     }
 
     /// Commits a previously-parsed import in one transaction (spec 1.18/1.22), reassigning
-    /// every imported event to `destinationCalendarID` when given. Duplicate detection is
-    /// UID-based when the imported event carries one (RFC 5545 UID →
-    /// `providerMetadata.providerObjectID`), falling back to title+start-date matching when it
-    /// doesn't. A duplicate master's replacements/exceptions are skipped along with it, since
-    /// they'd otherwise reference a master id that was never created.
+    /// every imported event to `destinationCalendarID` when given. Duplicate detection (spec
+    /// 2.15, BC-ENG-007) goes through `DuplicateDetector`, which checks a provider UID (RFC 5545
+    /// UID → `providerMetadata.providerObjectID`) first when the imported event carries one,
+    /// falling back to `(calendarID, normalizedTitle, startInstant, endInstant)` matching within
+    /// a small tolerance when it doesn't. A duplicate master's replacements/exceptions are
+    /// skipped along with it, since they'd otherwise reference a master id that was never
+    /// created.
     @discardableResult
     func commitImport(_ summary: ImportSummary, destinationCalendarID: UUID? = nil) -> ImportSummary {
         guard !summary.events.isEmpty else { return summary }
 
-        func isDuplicate(_ event: CalendarEvent) -> Bool {
-            if let uid = event.providerMetadata.providerObjectID {
-                return events.contains { $0.providerMetadata.providerObjectID == uid }
-            }
-            return events.contains { $0.title == event.title && $0.startDate == event.startDate }
-        }
-
         let masterEvents = summary.events.filter { $0.recurrenceMasterID == nil }
         let replacementEvents = summary.events.filter { $0.recurrenceMasterID != nil }
-        let duplicateMasterIDs = Set(masterEvents.filter(isDuplicate).map(\.id))
+
+        var duplicateMasterIDs: Set<UUID> = []
+        var duplicateReasonCounts: [DuplicateDetector.MatchReason: Int] = [:]
+        for master in masterEvents {
+            guard let match = DuplicateDetector.candidates(for: master, among: events).first else { continue }
+            duplicateMasterIDs.insert(master.id)
+            duplicateReasonCounts[match.reason, default: 0] += 1
+        }
 
         let newMasters = masterEvents.filter { !duplicateMasterIDs.contains($0.id) }
         let newReplacements = replacementEvents.filter { !duplicateMasterIDs.contains($0.recurrenceMasterID ?? $0.id) }
@@ -780,7 +823,7 @@ final class BetterCalendarStore {
         }
 
         guard !newEvents.isEmpty else {
-            PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount)")
+            PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount)\(duplicateReasonSuffix(duplicateReasonCounts))")
             return ImportSummary(importedCount: 0, skippedCount: skippedCount, failedCount: summary.failedCount, events: [])
         }
 
@@ -788,12 +831,25 @@ final class BetterCalendarStore {
         let didSave = perform(outcome)
 
         if didSave {
-            PrivacyLog.track(.icsImportResult, metadata: "imported=\(newEvents.count) skipped=\(skippedCount) failed=\(summary.failedCount)")
+            PrivacyLog.track(.icsImportResult, metadata: "imported=\(newEvents.count) skipped=\(skippedCount) failed=\(summary.failedCount)\(duplicateReasonSuffix(duplicateReasonCounts))")
             return ImportSummary(importedCount: newEvents.count, skippedCount: skippedCount, failedCount: summary.failedCount, events: newEvents, recurrenceExceptions: newExceptions)
         }
 
-        PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount + newEvents.count)")
+        PrivacyLog.track(.icsImportResult, metadata: "imported=0 skipped=\(skippedCount) failed=\(summary.failedCount + newEvents.count)\(duplicateReasonSuffix(duplicateReasonCounts))")
         return ImportSummary(importedCount: 0, skippedCount: skippedCount, failedCount: summary.failedCount + newEvents.count, events: [])
+    }
+
+    /// Spec 2.15's "log duplicate-detection decisions for auditability," at the granularity the
+    /// existing `.icsImportResult` privacy log already tracks import outcomes — not a new
+    /// `change_journal` row per decision. See `Documentation/Decisions/0003-duplicate-detector-logging-scope.md`
+    /// for why: `change_journal.operation`'s SQLite `CHECK` constraint has no "skipped, not
+    /// applied" value, and SQLite's automatic foreign-key-clause rewrite on `ALTER TABLE RENAME`
+    /// (the only way to widen a `CHECK`) would also require rebuilding `event_versions`, which
+    /// references it — real schema risk for a feature with no UI consumer yet in Phase 2.
+    private func duplicateReasonSuffix(_ counts: [DuplicateDetector.MatchReason: Int]) -> String {
+        guard !counts.isEmpty else { return "" }
+        let parts = counts.sorted { $0.key.rawValue < $1.key.rawValue }.map { "\($0.key.rawValue)=\($0.value)" }
+        return " duplicateReasons=" + parts.joined(separator: ",")
     }
 
     /// Convenience for the paste-text flow: parses and commits in one call, keeping the
@@ -840,7 +896,37 @@ final class BetterCalendarStore {
             return false
         }
 
+        reindexConflicts(for: transaction, previousDatabase: previousDatabase)
         return true
+    }
+
+    /// Spec 2.6: updates `conflictIndex` for exactly the entities this transaction touched.
+    /// Run only after `persist` succeeds — unlike `invalidateOccurrenceCache`, which merely drops
+    /// entries for lazy recomputation later (safe regardless of whether the mutation ultimately
+    /// commits), `conflictIndex` holds maintained state that must never reflect a change that got
+    /// rolled back.
+    private func reindexConflicts(for transaction: EngineTransaction, previousDatabase: LocalCalendarDatabase) {
+        for change in transaction.entityChanges {
+            switch change {
+            case .upsertEvent(let event):
+                let previous = previousDatabase.events.first { $0.id == event.id }
+                conflictIndex.reindex(movedFrom: previous, to: event)
+            case .deleteEvent(let id):
+                let previous = previousDatabase.events.first { $0.id == id }
+                conflictIndex.reindex(movedFrom: previous, to: nil)
+            case .deleteCalendar(let id):
+                // Mirrors the cascade `LocalCalendarDatabase.applying(_:)` performs in memory:
+                // the transaction itself only carries `.deleteCalendar`, not one `.deleteEvent`
+                // per orphaned event, so those have to be found the same way here.
+                for event in previousDatabase.events where event.calendarID == id {
+                    conflictIndex.reindex(movedFrom: event, to: nil)
+                }
+            case .upsertRecurrenceException, .deleteRecurrenceException, .upsertCalendar:
+                // Exceptions never change a master's own stored interval, and calendar upserts
+                // never change event times — neither affects the index.
+                break
+            }
+        }
     }
 
     /// Spec 2.5: clears only the cache entries a transaction could actually invalidate, rather
@@ -885,9 +971,11 @@ final class BetterCalendarStore {
         guard persist() else {
             apply(previousDatabase)
             occurrenceCache.invalidateAll()
+            conflictIndex.rebuild(from: events)
             return false
         }
 
+        conflictIndex.rebuild(from: events)
         return true
     }
 
@@ -1065,6 +1153,20 @@ protocol LocalCalendarRepository {
     /// guarantee beyond "these matched" — the caller (the store, which already holds every
     /// event's full data in memory) applies the exact tie-breaking rules spec 1.13 lists.
     func searchEventIDs(matching query: String) throws -> [UUID]
+
+    /// M7's Settings diagnostics surface (spec 2.20): journal size and the last-applied
+    /// migration's identifier/checksum, read live from storage. Meaningful only for a SQL-backed
+    /// repository — the flat-file and stub repositories have no `change_journal`/
+    /// `schema_metadata` tables and return `.unavailable`.
+    func diagnostics() throws -> RepositoryDiagnostics
+}
+
+struct RepositoryDiagnostics: Equatable {
+    var changeJournalRowCount: Int?
+    var lastAppliedMigrationIdentifier: String?
+    var migrationChecksum: String?
+
+    static let unavailable = RepositoryDiagnostics(changeJournalRowCount: nil, lastAppliedMigrationIdentifier: nil, migrationChecksum: nil)
 }
 
 struct JSONCalendarRepository: LocalCalendarRepository {
@@ -1112,6 +1214,10 @@ struct JSONCalendarRepository: LocalCalendarRepository {
                     || (event.urlString.flatMap { URL(string: $0)?.host }?.lowercased().contains(lowercasedQuery) ?? false)
             }
             .map(\.id)
+    }
+
+    func diagnostics() throws -> RepositoryDiagnostics {
+        .unavailable
     }
 
     func save(_ database: LocalCalendarDatabase) throws {

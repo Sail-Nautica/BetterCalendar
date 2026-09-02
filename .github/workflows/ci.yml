@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # 09:00 UTC nightly — spec 2.20's full 1,000-cycle crash/forced-retry stress loops
+    # (CrashRecoveryStressTests) run only here, behind BC_STRESS=1. The PR/push gates below
+    # run a 50-cycle smoke variant of the same tests instead: 2,000 full cycles on every PR
+    # would dominate CI time for no added signal (see Tests/MyAppTests/CrashRecoveryStressTests.swift).
+    - cron: '0 9 * * *'
+
+jobs:
+  fast-gate:
+    name: macOS test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: xcodebuild test (macOS)
+        run: |
+          xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp \
+            -destination 'platform=macOS,arch=arm64' test
+
+  platform-gate:
+    name: iOS Simulator test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: xcodebuild test (iOS Simulator)
+        run: |
+          xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp \
+            -destination 'platform=iOS Simulator,name=iPhone 16' test
+
+  nightly-stress:
+    name: Nightly stress suite
+    if: github.event_name == 'schedule'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: xcodebuild test (BC_STRESS=1)
+        env:
+          BC_STRESS: "1"
+        run: |
+          xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp \
+            -destination 'platform=macOS,arch=arm64' test
