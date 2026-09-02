@@ -64,9 +64,9 @@ struct AppRootView: View {
             Text(store.lastError ?? "")
         }
         .task {
-            // Spec 3.4: the first authorization read happens here rather than in `load()` —
-            // launch touches nothing from EventKit.
-            store.refreshDeviceCalendarAccess()
+            // Spec 3.4/3B.3: the first authorization read and the first discovery pass happen
+            // here rather than in `load()` — launch itself touches nothing from EventKit.
+            store.discoverDeviceCalendars()
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
@@ -74,8 +74,9 @@ struct AppRootView: View {
                 // Spec 3.4 (BC-EK-022): re-checked on every foreground transition, never
                 // cached for the process lifetime. A user can revoke access in Settings while
                 // the app is backgrounded; on return the app must degrade without crashing and
-                // without losing local data.
-                store.refreshDeviceCalendarAccess()
+                // without losing local data. Spec 3B.0: a foreground is also one of Phase 3B's
+                // explicit discovery triggers — an unchanged device costs one comparison.
+                store.discoverDeviceCalendars()
             }
         }
         .onChange(of: selectedTab) { _, newTab in

@@ -93,7 +93,7 @@ final class CalendarAccessTests: XCTestCase {
     /// Spec 3.3: never request access on first launch — and, since `load()` performs no
     /// authorization read either, launch touches nothing from EventKit at all.
     func testLaunchAsksTheSystemNothingAndReadsNothing() {
-        let authorization = FakeCalendarAuthorization(status: .fullAccess)
+        let authorization = FakeEventKitStore(status: .fullAccess)
         let store = makeStore(authorization: authorization)
 
         XCTAssertEqual(authorization.requestCount, 0)
@@ -110,7 +110,7 @@ final class CalendarAccessTests: XCTestCase {
     /// BC-EK-001: the explanation comes first. Enforced in the store rather than in the view, so
     /// no future screen can reach the system alert by calling this directly.
     func testAccessRequestIsRefusedUntilThePrimerHasBeenSeen() async {
-        let authorization = FakeCalendarAuthorization(status: .notDetermined, grantResult: .fullAccess)
+        let authorization = FakeEventKitStore(status: .notDetermined, grantResult: .fullAccess)
         let store = makeStore(authorization: authorization)
 
         let result = await store.requestDeviceCalendarAccess()
@@ -123,7 +123,7 @@ final class CalendarAccessTests: XCTestCase {
     /// Spec 3.3: "Not Now" is a first-class choice, and taking it must not burn the single-use
     /// system prompt.
     func testDismissingThePrimerDoesNotBurnTheSystemPrompt() {
-        let authorization = FakeCalendarAuthorization(status: .notDetermined)
+        let authorization = FakeEventKitStore(status: .notDetermined)
         let store = makeStore(authorization: authorization)
 
         store.markCalendarAccessPrimerSeen()
@@ -142,7 +142,7 @@ final class CalendarAccessTests: XCTestCase {
     /// Spec 3.3: request full access, because the product must display existing events.
     /// Write-only is a state to handle gracefully, never a state to request.
     func testConnectingRequestsFullAccessExactlyOnce() async {
-        let authorization = FakeCalendarAuthorization(status: .notDetermined, grantResult: .fullAccess)
+        let authorization = FakeEventKitStore(status: .notDetermined, grantResult: .fullAccess)
         let store = makeStore(authorization: authorization)
 
         store.markCalendarAccessPrimerSeen()
@@ -157,7 +157,7 @@ final class CalendarAccessTests: XCTestCase {
     /// Spec 3.3: the system prompt can only ever be shown once. Treat it as a single-use
     /// resource — including after it has been spent successfully.
     func testTheSystemPromptIsNeverRequestedTwice() async {
-        let authorization = FakeCalendarAuthorization(status: .notDetermined, grantResult: .fullAccess)
+        let authorization = FakeEventKitStore(status: .notDetermined, grantResult: .fullAccess)
         let store = makeStore(authorization: authorization)
         store.markCalendarAccessPrimerSeen()
 
@@ -171,7 +171,7 @@ final class CalendarAccessTests: XCTestCase {
     /// Spec 3.3: after a denial the app must never re-prompt in-app. It offers a Settings deep
     /// link and otherwise stops asking.
     func testDeniedAccessIsNeverRePromptedInApp() async {
-        let authorization = FakeCalendarAuthorization(status: .notDetermined, grantResult: .denied)
+        let authorization = FakeEventKitStore(status: .notDetermined, grantResult: .denied)
         let store = makeStore(authorization: authorization)
         store.markCalendarAccessPrimerSeen()
 
@@ -190,7 +190,7 @@ final class CalendarAccessTests: XCTestCase {
     /// BC-EK-002: denying calendar access leaves every Phase 1/2 local-calendar feature fully
     /// working. Not "mostly" — the app is a complete local calendar with access refused.
     func testLocalCalendarFeaturesAreUnaffectedByDeniedAccess() {
-        let store = makeStore(authorization: FakeCalendarAuthorization(status: .denied))
+        let store = makeStore(authorization: FakeEventKitStore(status: .denied))
         store.refreshDeviceCalendarAccess()
 
         XCTAssertEqual(store.calendarAccessStatus, .denied)
@@ -246,7 +246,7 @@ final class CalendarAccessTests: XCTestCase {
     /// BC-EK-022: a user can revoke access in Settings while the app is backgrounded. On the
     /// next foreground read the app must degrade — which means changing exactly one thing.
     func testRevokingAccessWhileBackgroundedChangesNothingButTheStatus() {
-        let authorization = FakeCalendarAuthorization(status: .fullAccess)
+        let authorization = FakeEventKitStore(status: .fullAccess)
         let store = makeStore(authorization: authorization)
         store.refreshDeviceCalendarAccess()
 
@@ -271,7 +271,7 @@ final class CalendarAccessTests: XCTestCase {
     /// The other half of BC-EK-022: re-granting in Settings is picked up by the foreground read,
     /// without the app prompting again — it has no prompt left to spend.
     func testRegrantingAccessInSettingsIsPickedUpWithoutAnotherPrompt() {
-        let authorization = FakeCalendarAuthorization(status: .denied)
+        let authorization = FakeEventKitStore(status: .denied)
         let store = makeStore(authorization: authorization)
         store.refreshDeviceCalendarAccess()
         XCTAssertFalse(store.deviceCalendarAccess.canReadDeviceEvents)
@@ -292,7 +292,7 @@ final class CalendarAccessTests: XCTestCase {
         let granted = BetterCalendarStore(
             repository: repository,
             notificationScheduler: NoopNotificationScheduler(),
-            calendarAuthorization: FakeCalendarAuthorization(status: .fullAccess)
+            eventKitStore: FakeEventKitStore(status: .fullAccess)
         )
         granted.refreshDeviceCalendarAccess()
         XCTAssertEqual(granted.calendarAccessStatus, .fullAccess)
@@ -300,7 +300,7 @@ final class CalendarAccessTests: XCTestCase {
         let relaunched = BetterCalendarStore(
             repository: repository,
             notificationScheduler: NoopNotificationScheduler(),
-            calendarAuthorization: FakeCalendarAuthorization(status: .denied)
+            eventKitStore: FakeEventKitStore(status: .denied)
         )
         XCTAssertEqual(relaunched.calendarAccessStatus, .notDetermined, "nothing about access survives a launch")
 
@@ -320,7 +320,7 @@ final class CalendarAccessTests: XCTestCase {
         let store = BetterCalendarStore(
             repository: repository,
             notificationScheduler: NoopNotificationScheduler(),
-            calendarAuthorization: FakeCalendarAuthorization()
+            eventKitStore: FakeEventKitStore()
         )
         XCTAssertFalse(store.settings.hasSeenCalendarAccessPrimer)
         XCTAssertTrue(store.markCalendarAccessPrimerSeen())
@@ -330,7 +330,7 @@ final class CalendarAccessTests: XCTestCase {
         let relaunched = BetterCalendarStore(
             repository: repository,
             notificationScheduler: NoopNotificationScheduler(),
-            calendarAuthorization: FakeCalendarAuthorization()
+            eventKitStore: FakeEventKitStore()
         )
         XCTAssertTrue(relaunched.settings.hasSeenCalendarAccessPrimer)
         XCTAssertFalse(relaunched.deviceCalendarAccess.shouldPresentPrimerAutomatically)
@@ -347,7 +347,7 @@ final class CalendarAccessTests: XCTestCase {
         let store = BetterCalendarStore(
             repository: repository,
             notificationScheduler: NoopNotificationScheduler(),
-            calendarAuthorization: FakeCalendarAuthorization()
+            eventKitStore: FakeEventKitStore()
         )
         store.markCalendarAccessPrimerSeen()
         store.updateSettings { $0.snapIntervalMinutes = 30 }
@@ -367,11 +367,11 @@ final class CalendarAccessTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeStore(authorization: FakeCalendarAuthorization) -> BetterCalendarStore {
+    private func makeStore(authorization: FakeEventKitStore) -> BetterCalendarStore {
         BetterCalendarStore(
             repository: StubCalendarRepository(loadResult: .success(TestData.database(events: []))),
             notificationScheduler: NoopNotificationScheduler(),
-            calendarAuthorization: authorization
+            eventKitStore: authorization
         )
     }
 

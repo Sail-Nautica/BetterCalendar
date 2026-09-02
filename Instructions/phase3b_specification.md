@@ -363,16 +363,25 @@ Runs on the macOS destination against `FakeEventKitStore`.
 
 | Milestone | Contents |
 |---|---|
-| **3B-M1** | 3B.1, 3B.2, 3B.3, 3B.4, 3B.7 — the value types, the seam and its fake, the mirror planner, availability and its migration, colour rendering. No UI. |
-| **3B-M2** | Store wiring: the discovery trigger, the `defaultCalendarID` fallback, and the in-memory device default. |
-| **3B-M3** | `SRC-LIST-01`, the `CAL-MGR-01` rework, and the editor/Settings pickers. |
+| **3B-M1** | 3B.1, 3B.2, 3B.3, 3B.4, 3B.7 — the value types, the seam and its fake, the mirror planner, availability and its migration, colour rendering. No UI. **Landed.** |
+| **3B-M2** | Store wiring: the discovery trigger, the `defaultCalendarID` fallback, and the in-memory device default. **Landed.** |
+| **3B-M3** | `SRC-LIST-01`, the `CAL-MGR-01` rework, and the editor/Settings pickers. **Landed.** |
 
-M1 is the whole of the risk. It is where a wrong matching key or an overwritten local field would
-do damage, and it is entirely testable without a screen. **M1 has landed** — see ADR 0007 and
-`DeviceCalendarDiscoveryTests`. Nothing it builds is wired into the running app yet: discovery is
-a mechanism with no trigger, which is the same order Phase 2 used for the outbox and the Phase 3
-prerequisites used for provider identity, and it is what keeps a half-built device-calendar list
-off the calendar manager until M3 can render it properly.
+M1 was the whole of the risk. It is where a wrong matching key or an overwritten local field
+would do damage, and it was entirely testable without a screen — so it landed first, as a
+mechanism with no trigger, the same order Phase 2 used for the outbox and the prerequisites used
+for provider identity. M2 attached the triggers and M3 the screens. See ADR 0007,
+`DeviceCalendarDiscoveryTests` and `DeviceCalendarStoreTests`.
+
+Two rules M2 had to add that the planner alone could not enforce, both of them about *not*
+writing to the device:
+
+* A calendar mutation on a mirrored row enqueues **no outbox row**. The only calendar-level
+  changes Better Calendar makes to one are its local-only fields, and those are ours — an outbox
+  row would mean "push this to the device", which this phase does not do and Phase 3D must not
+  start doing by accident.
+* Discovery journals as `source: .reconciliation` rather than `.userEdit`, so the journal can
+  tell what the user did from what the device told us.
 
 ## 3B.11 Exit criteria
 

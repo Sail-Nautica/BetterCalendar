@@ -17,13 +17,20 @@ final class BetterCalendarStore {
     /// deliberately performs no authorization read: launch touches nothing from EventKit, and
     /// the first read happens when a surface that needs it appears.
     private(set) var calendarAccessStatus: CalendarAccessStatus = .notDetermined
+    /// Spec 3B.5: `EKEventStore.defaultCalendarForNewEvents`, as the provider's own identifier.
+    /// Refreshed by every discovery pass and held in memory only — it is the device's state, and
+    /// a persisted copy disagrees with it the moment the user changes it in Settings.
+    private(set) var deviceDefaultCalendarIdentifier: String?
+    /// Counts from the last discovery pass — never content (spec 3.24). Surfaced in the
+    /// diagnostics section of Settings.
+    private(set) var lastDiscoverySummary: DeviceCalendarMirror.Summary?
     var undoAction: UndoAction?
 
     private let repository: LocalCalendarRepository
     private let notificationScheduler: LocalNotificationScheduling
-    /// Spec 3.3/3.4 (Phase 3A). Injected so the whole permission flow runs in CI against
-    /// `FakeCalendarAuthorization` with no device and no system prompt (BC-EK-024).
-    private let calendarAuthorization: CalendarAccessAuthorizing
+    /// Spec 3.3/3.4 and 3B.3. Injected so the whole permission and discovery flow runs in CI
+    /// against `FakeEventKitStore` with no device, no account and no system prompt (BC-EK-024).
+    private let eventKitStore: EventKitStore
     /// Spec 2.5: memoised `RecurrenceExpander` output behind `visibleOccurrences(in:)`. Kept
     /// fresh by `invalidateOccurrenceCache(for:previousDatabase:)` on every `EngineTransaction`
     /// applied through `withPersistedMutation` and fully cleared on any whole-database
@@ -40,20 +47,65 @@ final class BetterCalendarStore {
     init(
         repository: LocalCalendarRepository = SQLiteCalendarRepository(),
         notificationScheduler: LocalNotificationScheduling = UserNotificationScheduler(),
-        calendarAuthorization: CalendarAccessAuthorizing = EventKitDeviceStore()
+        eventKitStore: EventKitStore = EventKitDeviceStore()
     ) {
         self.repository = repository
         self.notificationScheduler = notificationScheduler
-        self.calendarAuthorization = calendarAuthorization
+        self.eventKitStore = eventKitStore
         load()
     }
 
+    /// Spec 3B.5 (BC-EK-019). `isDefault` stays a flag on the row (ADR 0005), but the flagged
+    /// calendar can stop being usable — permission revoked, account removed, a shared calendar
+    /// turned read-only — so resolving it walks a deterministic fallback chain rather than
+    /// handing back a destination that will refuse the write.
+    ///
+    /// It never falls back to a read-only or unavailable calendar. The final `calendars.first`
+    /// is the pre-Phase-3 behaviour, kept as a last resort for the degenerate case where nothing
+    /// is writable at all.
     var defaultCalendarID: UUID? {
-        calendars.first(where: \.isDefault)?.id ?? calendars.first?.id
+        if let flagged = calendars.first(where: \.isDefault), flagged.isWritableDestination {
+            return flagged.id
+        }
+        if let deviceDefaultCalendarIdentifier,
+           let deviceDefault = calendars.first(where: {
+               $0.connectionMethod == .device && $0.providerCalendarID == deviceDefaultCalendarIdentifier && $0.isWritableDestination
+           }) {
+            return deviceDefault.id
+        }
+        return writableDestinationCalendars.first?.id ?? calendars.first?.id
+    }
+
+    /// Spec 3B.5/3B.8: every calendar the user may be offered as a destination, in display
+    /// order. Read-only and unavailable calendars are absent rather than shown and refused.
+    var writableDestinationCalendars: [BetterCalendar] {
+        calendars.filter(\.isWritableDestination)
+    }
+
+    /// Spec 3B.6: the calendars Better Calendar owns, which are the only ones it may rename,
+    /// recolour, reorder or delete.
+    var localCalendars: [BetterCalendar] {
+        calendars.filter { $0.connectionMethod != .device }
+    }
+
+    /// Mirrored device calendars, in display order.
+    var deviceCalendars: [BetterCalendar] {
+        calendars.filter { $0.connectionMethod == .device }
+    }
+
+    /// Spec 3.8/BC-EK-004: device calendars grouped by their owning account, accounts in
+    /// alphabetical order so the list does not reshuffle between passes.
+    var deviceCalendarAccounts: [DeviceCalendarAccount] {
+        Dictionary(grouping: deviceCalendars) { $0.accountName ?? "Other" }
+            .map { DeviceCalendarAccount(name: $0.key, calendars: $0.value.sorted { $0.sortOrder < $1.sortOrder }) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     var visibleEvents: [CalendarEvent] {
-        let visibleCalendarIDs = Set(calendars.filter(\.isVisible).map(\.id))
+        // Spec 3B.4: a calendar that is no longer on the device contributes nothing to any view,
+        // whatever the user's last visibility choice was — that choice is preserved on the row so
+        // reconnecting restores it, but it cannot show events from a calendar that is gone.
+        let visibleCalendarIDs = Set(calendars.filter { $0.isVisible && !$0.isUnavailable }.map(\.id))
         return events
             .filter { visibleCalendarIDs.contains($0.calendarID) }
             .sorted { $0.startDate < $1.startDate }
@@ -422,6 +474,14 @@ final class BetterCalendarStore {
 
     func updateCalendar(_ calendar: BetterCalendar) {
         guard let index = calendars.firstIndex(where: { $0.id == calendar.id }) else { return }
+        guard !changesProviderOwnedFields(of: calendars[index], to: calendar) else {
+            // Spec 3B.6: renaming, recolouring or deleting a device calendar mutates a shared
+            // system resource in ways a user does not expect a third-party app to perform. The
+            // calendar manager does not offer those affordances; this is the model-layer half of
+            // the same rule, so a future screen cannot reintroduce them by accident.
+            lastError = "\"\(calendar.name)\" is managed by this device's account. Rename, recolour, or remove it in Settings."
+            return
+        }
 
         var updated = calendar
         updated.updatedAt = .now
@@ -460,14 +520,20 @@ final class BetterCalendarStore {
     /// Pure reordering housekeeping, not a journaled "logical user action" of its own (spec
     /// 2.8's vocabulary has no natural single entity id for "the whole list was reshuffled") —
     /// it goes straight through the transaction pipeline with no journal entry or outbox row.
+    ///
+    /// Spec 3B.6: the offsets index into `localCalendars`, because those are the only calendars
+    /// `CAL-MGR-01` lets the user drag. Device calendars keep their relative order and are
+    /// renumbered after them, so the two lists cannot interleave and an offset can never be
+    /// resolved against the wrong row.
     func reorderCalendars(fromOffsets source: IndexSet, toOffset destination: Int) {
-        var reordered = calendars
+        var reordered = localCalendars
         let itemsToMove = source.map { reordered[$0] }
         for index in source.sorted(by: >) {
             reordered.remove(at: index)
         }
         let adjustedDestination = destination - source.filter { $0 < destination }.count
         reordered.insert(contentsOf: itemsToMove, at: adjustedDestination)
+        reordered.append(contentsOf: deviceCalendars)
 
         var changes: [EntityChange] = []
         for (index, calendar) in reordered.enumerated() where calendar.sortOrder != index {
@@ -512,6 +578,13 @@ final class BetterCalendarStore {
 
     func deleteCalendar(_ calendar: BetterCalendar, moveEventsTo replacementID: UUID?) {
         guard !calendar.isDefault || replacementID != nil else { return }
+        guard calendar.connectionMethod != .device else {
+            // Spec 3B.6. Deleting the mirror row would also be wrong on its own terms: the next
+            // discovery pass would import the calendar again as new, losing the user's
+            // visibility choice and (from Phase 3C) orphaning every event mirrored onto it.
+            lastError = "\"\(calendar.name)\" is managed by this device's account. Remove it in Settings."
+            return
+        }
 
         let affectedEvents = events.filter { $0.calendarID == calendar.id }
         let now = Date.now
@@ -664,7 +737,7 @@ final class BetterCalendarStore {
     /// Cheap and synchronous by construction: reading the status is a static EventKit call that
     /// creates no event store and shows no prompt.
     func refreshDeviceCalendarAccess() {
-        calendarAccessStatus = calendarAuthorization.authorizationStatus
+        calendarAccessStatus = eventKitStore.authorizationStatus
     }
 
     /// BC-EK-001: records that `SRC-PERM-01` has been shown. Called for both of the primer's
@@ -696,11 +769,83 @@ final class BetterCalendarStore {
 
         // Spec 3.3: always full access. The product must display existing events, so write-only
         // is a state to handle gracefully, never a state to request.
-        let result = await calendarAuthorization.requestAccess(.full)
+        let result = await eventKitStore.requestAccess(.full)
         calendarAccessStatus = result
         // Spec 3K: counts and enum-like status only — never a calendar name or an account email.
         PrivacyLog.track(.calendarPermissionResult, metadata: result.rawValue)
+        // A fresh grant is the first moment there is anything to discover (BC-EK-004).
+        discoverDeviceCalendars()
         return result
+    }
+
+    // MARK: - Device calendar discovery (spec 3B.3, Phase 3B)
+
+    /// Mirrors the device's calendars into `calendars`, through `DeviceCalendarMirror`.
+    ///
+    /// Spec 3B.0: this runs on **explicit triggers only** — a foreground transition, a fresh
+    /// grant, or a device-calendar surface appearing. Subscribing to `EKEventStoreChanged` is
+    /// Phase 3E's job, and doing it here would mean reacting to event changes with a pass that
+    /// only looks at calendars.
+    ///
+    /// Synchronous on purpose. Enumerating calendars is bounded by their number — dozens at
+    /// worst — unlike Phase 3C's event fetch, which is bounded by the size of the user's
+    /// calendar and is where moving off the main actor stops being optional (spec 3.27).
+    /// `load()` still never calls this, so launch does no EventKit work at all.
+    @discardableResult
+    func discoverDeviceCalendars(now: Date = .now) -> Bool {
+        refreshDeviceCalendarAccess()
+        // Spec 3B.4: access loss is not disappearance. Below full access we cannot see the
+        // calendars, so we say nothing about them — marking every mirrored row unavailable here
+        // would destroy exactly the state a re-grant is supposed to restore.
+        guard calendarAccessStatus.canReadDeviceEvents else { return true }
+
+        let snapshot: DeviceCalendarSnapshot
+        do {
+            snapshot = try eventKitStore.discoverCalendars()
+        } catch {
+            // Nothing is lost by a failed pass — the mirror simply is not updated — so this
+            // does not raise the data-error alert. Raising one on every foreground for a
+            // transient store failure would be worse than the failure.
+            PrivacyLog.debug("Device calendar discovery failed")
+            return false
+        }
+
+        deviceDefaultCalendarIdentifier = snapshot.defaultCalendarIdentifierForNewEvents
+
+        let plan = DeviceCalendarMirror.plan(devices: snapshot.calendars, existing: calendars, now: now)
+        lastDiscoverySummary = plan.summary
+        guard !plan.isEmpty else { return true }
+
+        return applyDiscovery(plan, now: now)
+    }
+
+    /// Spec 3.2: an inbound change writes through the *same* `EngineTransaction` path as a user
+    /// edit, so it is atomic and journalled — but it carries `source: .reconciliation`, because
+    /// the journal has to distinguish "the user did this" from "the device told us this", and it
+    /// enqueues **no outbox row**: this is a change arriving *from* the device, not one to send
+    /// to it.
+    private func applyDiscovery(_ plan: DeviceCalendarMirror.Plan, now: Date) -> Bool {
+        let existingByID = Dictionary(uniqueKeysWithValues: calendars.map { ($0.id, $0) })
+        var journalEntries: [ChangeJournalEntry] = []
+
+        for change in plan.changes {
+            guard case .upsertCalendar(let calendar) = change else { continue }
+            let previous = existingByID[calendar.id]
+            journalEntries.append(
+                ChangeJournalEntry(
+                    id: UUID(),
+                    entityType: .calendar,
+                    entityID: calendar.id,
+                    operation: previous == nil ? .create : .update,
+                    fieldDiff: FieldDiff.compute(from: previous, to: calendar),
+                    source: .reconciliation,
+                    occurredAt: now,
+                    appliedMutationID: nil
+                )
+            )
+        }
+
+        return withPersistedMutation(EngineTransaction(entityChanges: plan.changes, journalEntries: journalEntries))
     }
 
     func visibleOccurrences(in range: DateInterval) -> [CalendarOccurrence] {
@@ -1067,16 +1212,45 @@ final class BetterCalendarStore {
         outboxOperation: MutationOperation
     ) -> Bool {
         let entry = ChangeJournalEntry(id: UUID(), entityType: .calendar, entityID: journalEntityID, operation: journalOperation, fieldDiff: nil, source: .userEdit, occurredAt: .now, appliedMutationID: nil)
-        let mutation = PendingMutation(id: UUID(), objectID: journalEntityID, objectType: .calendar, operation: outboxOperation, createdAt: .now, changeJournalEntryID: entry.id)
-        return withPersistedMutation(EngineTransaction(entityChanges: changes, outboxRows: [mutation], journalEntries: [entry]))
+
+        // Spec 3B.3/ADR 0005: the only calendar-level changes Better Calendar makes to a
+        // mirrored row are its local-only fields — `isVisible`, `isDefault`, `sortOrder` — and
+        // those are ours, never the provider's. An outbox row here would mean "push this
+        // calendar change to the device", which Phase 3B does not do and Phase 3D must not
+        // start doing by accident. The journal entry still records that the user did it.
+        let isMirrored = calendars.first { $0.id == journalEntityID }?.connectionMethod == .device
+        let outboxRows = isMirrored
+            ? []
+            : [PendingMutation(id: UUID(), objectID: journalEntityID, objectType: .calendar, operation: outboxOperation, createdAt: .now, changeJournalEntryID: entry.id)]
+
+        return withPersistedMutation(EngineTransaction(entityChanges: changes, outboxRows: outboxRows, journalEntries: [entry]))
     }
 
     /// Builds `.upsertCalendar` changes for whichever calendar needs `isDefault` set so exactly
     /// one calendar in `candidateCalendars` ends up marked default. Empty when the invariant
     /// already holds — the common case, since every mutation that could break it (deleting the
     /// default calendar, clearing `isDefault` via `updateCalendar`) is rare.
+    /// Whether an edit touches anything the provider owns (spec 3B.3's field-ownership split).
+    /// Local calendars own everything, so this is always `false` for them.
+    private func changesProviderOwnedFields(of stored: BetterCalendar, to edited: BetterCalendar) -> Bool {
+        guard stored.connectionMethod == .device else { return false }
+        return edited.name != stored.name
+            || edited.colorName != stored.colorName
+            || edited.colorHex != stored.colorHex
+            || edited.isReadOnly != stored.isReadOnly
+            || edited.capabilities != stored.capabilities
+            || edited.accountName != stored.accountName
+            || edited.provider != stored.provider
+            || edited.providerAccountID != stored.providerAccountID
+            || edited.providerCalendarID != stored.providerCalendarID
+    }
+
     private func defaultCalendarCorrections(for candidateCalendars: [BetterCalendar]) -> [EntityChange] {
-        guard !candidateCalendars.contains(where: \.isDefault), var target = candidateCalendars.first else {
+        // Spec 3B.5: never hand the default to a read-only or unavailable calendar. Falls back
+        // to the first calendar of any kind only when nothing at all is writable, which is the
+        // same degenerate case `defaultCalendarID` guards.
+        let preferred = candidateCalendars.first(where: \.isWritableDestination) ?? candidateCalendars.first
+        guard !candidateCalendars.contains(where: \.isDefault), var target = preferred else {
             return []
         }
         target.isDefault = true
@@ -1103,9 +1277,12 @@ final class BetterCalendarStore {
             calendars = [BetterCalendar.localDefault()]
         }
 
-        if !calendars.contains(where: \.isDefault), let firstID = calendars.first?.id {
+        // Spec 3B.5: the same "never a read-only or unavailable default" rule as
+        // `defaultCalendarCorrections`, applied at launch.
+        let preferredID = (calendars.first(where: \.isWritableDestination) ?? calendars.first)?.id
+        if !calendars.contains(where: \.isDefault), let preferredID {
             for index in calendars.indices {
-                calendars[index].isDefault = calendars[index].id == firstID
+                calendars[index].isDefault = calendars[index].id == preferredID
             }
         }
     }

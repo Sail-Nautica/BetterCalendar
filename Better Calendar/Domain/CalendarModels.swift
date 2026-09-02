@@ -117,6 +117,14 @@ struct BetterCalendar: Identifiable, Hashable {
         !isReadOnly && capabilities.allowsEventCreation
     }
 
+    /// Spec 3.9 (BC-EK-018-adjacent): how a calendar names itself where the account matters —
+    /// the destination pickers in the editor and Settings. A local calendar has no account and
+    /// is just its name, exactly as before.
+    var destinationLabel: String {
+        guard let accountName, !accountName.isEmpty else { return name }
+        return "\(name) · \(accountName)"
+    }
+
     /// Spec 3B.5: a calendar the user may be *offered* as a destination — writable, and actually
     /// present on the device. Distinct from `allowsEventCreation`, which asks only what the
     /// calendar permits: an available read-only calendar and an unavailable writable one are

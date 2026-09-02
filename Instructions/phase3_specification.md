@@ -53,7 +53,7 @@ released schema version.
 |---|---|---|
 | Prerequisites | 3.6, 3.7, 3.9, 3.10, 3.12, 3.16 | Done — see the table above |
 | **3A — Permission and capability model** | 3.3, 3.4, 3.5 | **Done.** Specified in detail in `Instructions/phase3a_specification.md`; see ADR 0006 and `CalendarAccessTests`. Delivers BC-EK-001, BC-EK-002, BC-EK-022 in full, and the "never claims to display device events" half of BC-EK-003 |
-| 3B — Calendar identity and ownership | 3.8, 3.9 | In progress. Specified in `Instructions/phase3b_specification.md`; M1 (discovery foundation) landed, M2/M3 outstanding |
+| **3B — Calendar identity and ownership** | 3.8, 3.9 | **Done.** Specified in `Instructions/phase3b_specification.md`; see ADR 0007, `DeviceCalendarDiscoveryTests` and `DeviceCalendarStoreTests`. Delivers BC-EK-004, BC-EK-005 and BC-EK-019 in full, and extends BC-EK-022 to calendar rows. Nothing in it writes to EventKit |
 | 3C — Reading events | 3.11–3.17 | Not started |
 | 3D — Writing back | 3.18–3.22 | Not started |
 | 3E — Change detection | 3.23–3.27 | Not started |

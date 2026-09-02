@@ -7,15 +7,12 @@ struct CalendarManagerView: View {
     @State private var isEditing = false
     @State private var newCalendarName = ""
     @State private var newCalendarColor: CalendarColorName = .betterBlue
-    /// `SRC-PERM-01`. Presented only from the Device Calendars section's connect affordance —
-    /// spec 3.3 forbids reaching the system prompt any other way.
-    @State private var isShowingCalendarAccessPrimer = false
 
     var body: some View {
         NavigationStack {
             List {
-                Section("Local Calendars") {
-                    ForEach(store.calendars) { calendar in
+                Section("My Calendars") {
+                    ForEach(store.localCalendars) { calendar in
                         CalendarManagerRow(calendar: calendar, store: store, isEditing: isEditing)
                     }
                     .onMove { source, destination in
@@ -44,10 +41,23 @@ struct CalendarManagerView: View {
                     }
                 }
 
-                // Spec 3.4/3.33: the permission surface for the calendars already on this
-                // device. Listing those calendars is Phase 3B; this section is the gate in
-                // front of it, and the copy is honest about the difference.
-                DeviceCalendarAccessSection(store: store, isShowingPrimer: $isShowingCalendarAccessPrimer)
+                // Spec 3B.8: device calendars live on their own screen rather than in the
+                // list above, because almost nothing the manager offers a local calendar —
+                // rename, recolour, reorder, delete — may be done to one. This row is the entry
+                // point; `SRC-LIST-01` owns the access states and the visibility toggles.
+                Section("Device Calendars") {
+                    NavigationLink {
+                        DeviceCalendarsView(store: store)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(deviceCalendarSummary.title)
+                            Text(deviceCalendarSummary.detail)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
 
                 Section("Recently Deleted") {
                     if store.deletedEventTombstones.isEmpty {
@@ -85,9 +95,8 @@ struct CalendarManagerView: View {
             }
             // Spec 3.4: authorization is re-read whenever a device-calendar surface appears,
             // never cached from launch — the user may have changed it in Settings since. On the
-            // `List` rather than on `DeviceCalendarAccessSection`, because a `Section` is a
-            // container SwiftUI flattens into its rows, and a row below the fold would not
-            // trigger the read until it scrolled into view.
+            // `List` rather than on the row, because a row below the fold would not trigger the
+            // read until it scrolled into view, and the summary above is what it feeds.
             .task {
                 store.refreshDeviceCalendarAccess()
             }
@@ -113,11 +122,31 @@ struct CalendarManagerView: View {
                 }
             }
         }
-        .sheet(isPresented: $isShowingCalendarAccessPrimer) {
-            CalendarAccessPrimerView(store: store)
-        }
+        // `SRC-PERM-01` is presented by `SRC-LIST-01`, which owns every access state — spec 3.3
+        // forbids reaching the system prompt from anywhere else, and one owner is how that stays
+        // true.
         // Keeps the sheet a stable size across pushes (e.g. Import / Export).
         .macSheetFrame()
+    }
+
+    /// What the entry row says before the user opens it: the access state when there is nothing
+    /// to count, and counts once there is.
+    private var deviceCalendarSummary: (title: String, detail: String) {
+        let access = store.deviceCalendarAccess
+        guard access.canReadDeviceEvents else {
+            return (access.message.title, access.message.message)
+        }
+
+        let accounts = store.deviceCalendarAccounts
+        guard !accounts.isEmpty else {
+            return ("Connected", "No calendars on this device yet.")
+        }
+
+        let calendars = store.deviceCalendars
+        let shown = calendars.filter { $0.isVisible && !$0.isUnavailable }.count
+        let calendarLabel = calendars.count == 1 ? "1 calendar" : "\(calendars.count) calendars"
+        let accountLabel = accounts.count == 1 ? "1 account" : "\(accounts.count) accounts"
+        return ("\(calendarLabel) from \(accountLabel)", "\(shown) shown")
     }
 }
 
@@ -193,7 +222,7 @@ private struct CalendarManagerRow: View {
                 }
                 .font(.footnote)
                 .buttonStyle(.borderless)
-                .disabled(calendar.isDefault && store.calendars.count == 1)
+                .disabled(calendar.isDefault && store.localCalendars.count == 1)
             }
         }
         .padding(.vertical, 4)
@@ -208,7 +237,7 @@ private struct CalendarManagerRow: View {
             }
         }
         .confirmationDialog("Delete \"\(calendar.name)\"?", isPresented: $showDeleteConfirmation) {
-            if let replacement = store.calendars.first(where: { $0.id != calendar.id }) {
+            if let replacement = store.localCalendars.first(where: { $0.id != calendar.id }) {
                 Button("Move Events to \(replacement.name)") {
                     store.deleteCalendar(calendar, moveEventsTo: replacement.id)
                 }

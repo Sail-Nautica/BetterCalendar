@@ -134,7 +134,7 @@ private struct PrimerPointView: View {
         store: BetterCalendarStore(
             repository: JSONCalendarRepository(),
             notificationScheduler: NoopNotificationScheduler(),
-            calendarAuthorization: FakeCalendarAuthorization()
+            eventKitStore: FakeEventKitStore(status: .notDetermined)
         )
     )
 }

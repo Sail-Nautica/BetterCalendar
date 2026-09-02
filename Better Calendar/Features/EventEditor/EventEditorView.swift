@@ -25,6 +25,18 @@ private enum RecurrencePreset: String, CaseIterable, Identifiable {
 
 struct EventEditorView: View {
     let calendars: [BetterCalendar]
+
+    /// Spec 3B.5/3B.8: only writable, available calendars are offered as destinations — plus
+    /// whichever calendar this event is already on, even if that one is read-only or gone, so
+    /// the editor shows where the event actually lives instead of silently appearing to move it.
+    private var selectableCalendars: [BetterCalendar] {
+        var offered = calendars.filter(\.isWritableDestination)
+        if !offered.contains(where: { $0.id == draft.calendarID }),
+           let current = calendars.first(where: { $0.id == draft.calendarID }) {
+            offered.insert(current, at: 0)
+        }
+        return offered
+    }
     let initialDraft: EventDraft
     let onSave: (EventDraft) -> Bool
     let onDelete: ((CalendarEvent) -> Void)?
@@ -100,8 +112,12 @@ struct EventEditorView: View {
 
                 Section("Calendar") {
                     Picker("Calendar", selection: $draft.calendarID) {
-                        ForEach(calendars) { calendar in
-                            Label(calendar.name, systemImage: calendar.isDefault ? "checkmark.circle.fill" : "circle.fill")
+                        ForEach(selectableCalendars) { calendar in
+                            // Spec 3.9: always show which calendar *and which account* this is
+                            // about to be written to. On a device with three accounts that is
+                            // the difference between a work event landing in a personal calendar
+                            // and not.
+                            Label(calendar.destinationLabel, systemImage: calendar.isDefault ? "checkmark.circle.fill" : "circle.fill")
                                 .tag(calendar.id)
                         }
                     }

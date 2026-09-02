@@ -27,14 +27,22 @@ struct SettingsScreen: View {
         store.repositoryDiagnostics()
     }
 
+    private var discoverySummaryText: String {
+        guard let summary = store.lastDiscoverySummary else { return "—" }
+        return "+\(summary.added) ~\(summary.updated) ↩\(summary.reconnected) ✕\(summary.markedUnavailable) =\(summary.unchanged)"
+    }
+
     var body: some View {
         NavigationStack {
             Form {
                 Section("Defaults") {
-                    if !store.calendars.isEmpty {
+                    // Spec 3.9 (BC-EK-019): the default destination spans every writable
+                    // calendar, local and device, and never offers a read-only or unavailable
+                    // one.
+                    if !store.writableDestinationCalendars.isEmpty {
                         Picker("Default Calendar", selection: defaultCalendarBinding) {
-                            ForEach(store.calendars) { calendar in
-                                Text(calendar.name).tag(calendar.id)
+                            ForEach(store.writableDestinationCalendars) { calendar in
+                                Text(calendar.destinationLabel).tag(calendar.id)
                             }
                         }
                     }
@@ -128,6 +136,10 @@ struct SettingsScreen: View {
                     LabeledContent("Recurrence Master Count", value: "\(store.events.filter { $0.recurrence != nil }.count)")
                     LabeledContent("Pending Notification Count", value: pendingNotificationCount.map(String.init) ?? "—")
                     LabeledContent("Outbox Depth", value: "\(outboxDepth)")
+                    LabeledContent("Calendar Access", value: store.calendarAccessStatus.rawValue)
+                    LabeledContent("Device Calendars", value: "\(store.deviceCalendars.count)")
+                    // Spec 3.24: counts, never content.
+                    LabeledContent("Last Discovery", value: discoverySummaryText)
                     LabeledContent("Failed Mutation Count", value: "\(failedMutationCount)")
                     LabeledContent("Journal Size", value: repositoryDiagnostics.changeJournalRowCount.map(String.init) ?? "—")
                     LabeledContent("Last Applied Migration", value: repositoryDiagnostics.lastAppliedMigrationIdentifier ?? "—")

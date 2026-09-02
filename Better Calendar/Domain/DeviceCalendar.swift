@@ -158,3 +158,19 @@ struct DeviceCalendar: Hashable, Identifiable {
         )
     }
 }
+
+/// Spec 3.8/BC-EK-004: mirrored calendars under the account that owns them, which is how
+/// `SRC-LIST-01` groups them and how `EVT-EDIT-01` labels a destination. Built from the mirror
+/// rows rather than from a live source list, so it stays correct with calendar access denied.
+struct DeviceCalendarAccount: Identifiable, Equatable {
+    var name: String
+    var calendars: [BetterCalendar]
+
+    var id: String { name }
+
+    /// Spec 3B.4: an account whose calendars have all gone is shown as unavailable rather than
+    /// silently dropped, so a removed account is visibly removed instead of quietly missing.
+    var isUnavailable: Bool {
+        !calendars.isEmpty && calendars.allSatisfy(\.isUnavailable)
+    }
+}

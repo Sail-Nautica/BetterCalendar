@@ -9,6 +9,9 @@ import SwiftUI
 struct DeviceCalendarAccessSection: View {
     let store: BetterCalendarStore
     @Binding var isShowingPrimer: Bool
+    /// `nil` inside `SRC-LIST-01`, whose navigation title already says "Device Calendars" and
+    /// would otherwise say it twice.
+    var header: String?
 
     @Environment(\.openURL) private var openURL
 
@@ -17,7 +20,7 @@ struct DeviceCalendarAccessSection: View {
     }
 
     var body: some View {
-        Section("Device Calendars") {
+        Section {
             VStack(alignment: .leading, spacing: 4) {
                 Text(message.title)
                     .font(.subheadline.weight(.semibold))
@@ -32,6 +35,10 @@ struct DeviceCalendarAccessSection: View {
 
             if let action = message.action {
                 actionButton(action)
+            }
+        } header: {
+            if let header {
+                Text(header)
             }
         }
     }
