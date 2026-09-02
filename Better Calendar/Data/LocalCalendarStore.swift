@@ -20,6 +20,13 @@ final class BetterCalendarStore {
     /// applied through `withPersistedMutation` and fully cleared on any whole-database
     /// replacement (`load()`, `withBulkMutation`).
     private let occurrenceCache = OccurrenceCache()
+    /// Spec 2.6 (BC-ENG-003): maintained incrementally by `reindexConflicts(for:previousDatabase:)`
+    /// after every successfully persisted `EngineTransaction`, and rebuilt wholesale on any
+    /// whole-database replacement (`load()`, `withBulkMutation`) — the same two hook points as
+    /// `occurrenceCache`, but reindexed only on success (unlike the occurrence cache, this is
+    /// maintained state that mirrors `events`, not a lazily-recomputed memoisation, so a rolled
+    /// back mutation must never touch it).
+    private let conflictIndex = ConflictIndex()
 
     init(repository: LocalCalendarRepository = SQLiteCalendarRepository(), notificationScheduler: LocalNotificationScheduling = UserNotificationScheduler()) {
         self.repository = repository
@@ -44,6 +51,7 @@ final class BetterCalendarStore {
         let outcome = LaunchRecovery.run(repository: repository)
         apply(outcome.database)
         occurrenceCache.invalidateAll()
+        conflictIndex.rebuild(from: events)
         ensureDefaultCalendar()
 
         if outcome.usedFallbackSeed {
@@ -653,6 +661,31 @@ final class BetterCalendarStore {
             }
     }
 
+    /// Spec 2.6 (BC-ENG-003): event ids currently conflicting with `event` — `.busy` and
+    /// overlapping (all-day events only against other all-day events, on overlapping local
+    /// dates). Engine-API only, like `editSeries`/`deleteSeries`: no `Features/` call site exists
+    /// in Phase 2, this exists for Phase 11/12 to build a conflict-warning UI on.
+    ///
+    /// Indexes each stored `CalendarEvent` row's own interval. For a recurring master that is
+    /// its first occurrence only — an unmodified future occurrence has no row of its own to
+    /// index, so it is not separately checked here. A per-occurrence replacement event (from a
+    /// "This Event" edit) *is* its own row and is fully covered.
+    func conflictingEventIDs(for event: CalendarEvent) -> Set<UUID> {
+        conflictIndex.conflicts(for: event.id)
+    }
+
+    /// Spec 2.7 (BC-ENG-004): merged busy intervals over `query`'s range. `query.calendarIDs ==
+    /// nil` resolves to every currently-visible calendar (`calendars.filter(\.isVisible)`) here —
+    /// `FreeBusy.query` itself treats `nil` as "no filter, every calendar," since the pure
+    /// `Domain/` function has no notion of calendar visibility.
+    func freeBusy(_ query: FreeBusy.Query) -> [DateInterval] {
+        var resolvedQuery = query
+        if resolvedQuery.calendarIDs == nil {
+            resolvedQuery.calendarIDs = Set(calendars.filter(\.isVisible).map(\.id))
+        }
+        return FreeBusy.query(resolvedQuery, events: events, exceptions: recurrenceExceptions)
+    }
+
     /// BC-SRCH-001/002 (spec 1.13): full-text search via the FTS5 index (recall) plus
     /// `SearchFilters` (date range/calendar/timeframe/all-day/recurring), ranked exact title
     /// match → title prefix → title contains → location → notes → calendar name, with future
@@ -840,7 +873,37 @@ final class BetterCalendarStore {
             return false
         }
 
+        reindexConflicts(for: transaction, previousDatabase: previousDatabase)
         return true
+    }
+
+    /// Spec 2.6: updates `conflictIndex` for exactly the entities this transaction touched.
+    /// Run only after `persist` succeeds — unlike `invalidateOccurrenceCache`, which merely drops
+    /// entries for lazy recomputation later (safe regardless of whether the mutation ultimately
+    /// commits), `conflictIndex` holds maintained state that must never reflect a change that got
+    /// rolled back.
+    private func reindexConflicts(for transaction: EngineTransaction, previousDatabase: LocalCalendarDatabase) {
+        for change in transaction.entityChanges {
+            switch change {
+            case .upsertEvent(let event):
+                let previous = previousDatabase.events.first { $0.id == event.id }
+                conflictIndex.reindex(movedFrom: previous, to: event)
+            case .deleteEvent(let id):
+                let previous = previousDatabase.events.first { $0.id == id }
+                conflictIndex.reindex(movedFrom: previous, to: nil)
+            case .deleteCalendar(let id):
+                // Mirrors the cascade `LocalCalendarDatabase.applying(_:)` performs in memory:
+                // the transaction itself only carries `.deleteCalendar`, not one `.deleteEvent`
+                // per orphaned event, so those have to be found the same way here.
+                for event in previousDatabase.events where event.calendarID == id {
+                    conflictIndex.reindex(movedFrom: event, to: nil)
+                }
+            case .upsertRecurrenceException, .deleteRecurrenceException, .upsertCalendar:
+                // Exceptions never change a master's own stored interval, and calendar upserts
+                // never change event times — neither affects the index.
+                break
+            }
+        }
     }
 
     /// Spec 2.5: clears only the cache entries a transaction could actually invalidate, rather
@@ -885,9 +948,11 @@ final class BetterCalendarStore {
         guard persist() else {
             apply(previousDatabase)
             occurrenceCache.invalidateAll()
+            conflictIndex.rebuild(from: events)
             return false
         }
 
+        conflictIndex.rebuild(from: events)
         return true
     }
 
