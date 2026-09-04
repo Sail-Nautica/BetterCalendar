@@ -1259,6 +1259,19 @@ struct PendingMutation: Identifiable, Hashable {
     /// written before this column existed.
     var changeJournalEntryID: UUID?
 
+    // MARK: - Phase 3D
+
+    /// Spec 3.22/3D.7: the device event's last-modified value the local edit was **based on**.
+    /// Compared against a fresh fetch immediately before writing, so a change that arrived
+    /// underneath us is noticed rather than overwritten. `nil` for a create (there is nothing on
+    /// the far side yet) and for every local-calendar mutation.
+    var baseProviderVersion: String?
+    /// Spec 3.21/3D.6: why this mutation last failed, which is what a diagnostics surface reads
+    /// to say *why* something is stuck rather than only that it is. `nil` for a row that has
+    /// never failed.
+    var failureClass: MutationFailureClass?
+    var lastFailureAt: Date?
+
     init(
         id: UUID,
         objectID: UUID,
@@ -1271,7 +1284,10 @@ struct PendingMutation: Identifiable, Hashable {
         attemptCount: Int = 0,
         lastAttemptAt: Date? = nil,
         nextRetryAt: Date? = nil,
-        changeJournalEntryID: UUID? = nil
+        changeJournalEntryID: UUID? = nil,
+        baseProviderVersion: String? = nil,
+        failureClass: MutationFailureClass? = nil,
+        lastFailureAt: Date? = nil
     ) {
         self.id = id
         self.objectID = objectID
@@ -1285,6 +1301,9 @@ struct PendingMutation: Identifiable, Hashable {
         self.lastAttemptAt = lastAttemptAt
         self.nextRetryAt = nextRetryAt
         self.changeJournalEntryID = changeJournalEntryID
+        self.baseProviderVersion = baseProviderVersion
+        self.failureClass = failureClass
+        self.lastFailureAt = lastFailureAt
     }
 }
 
@@ -1292,6 +1311,7 @@ extension PendingMutation: Codable {
     private enum CodingKeys: String, CodingKey {
         case id, objectID, objectType, operation, createdAt
         case payload, idempotencyKey, status, attemptCount, lastAttemptAt, nextRetryAt, changeJournalEntryID
+        case baseProviderVersion, failureClass, lastFailureAt
     }
 
     /// Decodes tolerantly so mutations written before the Phase 2 columns existed still load —
@@ -1310,6 +1330,9 @@ extension PendingMutation: Codable {
         lastAttemptAt = try container.decodeIfPresent(Date.self, forKey: .lastAttemptAt)
         nextRetryAt = try container.decodeIfPresent(Date.self, forKey: .nextRetryAt)
         changeJournalEntryID = try container.decodeIfPresent(UUID.self, forKey: .changeJournalEntryID)
+        baseProviderVersion = try container.decodeIfPresent(String.self, forKey: .baseProviderVersion)
+        failureClass = try container.decodeIfPresent(MutationFailureClass.self, forKey: .failureClass)
+        lastFailureAt = try container.decodeIfPresent(Date.self, forKey: .lastFailureAt)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1326,6 +1349,9 @@ extension PendingMutation: Codable {
         try container.encodeIfPresent(lastAttemptAt, forKey: .lastAttemptAt)
         try container.encodeIfPresent(nextRetryAt, forKey: .nextRetryAt)
         try container.encodeIfPresent(changeJournalEntryID, forKey: .changeJournalEntryID)
+        try container.encodeIfPresent(baseProviderVersion, forKey: .baseProviderVersion)
+        try container.encodeIfPresent(failureClass, forKey: .failureClass)
+        try container.encodeIfPresent(lastFailureAt, forKey: .lastFailureAt)
     }
 }
 
@@ -1347,6 +1373,35 @@ enum MutationStatus: String, Codable, Hashable, CaseIterable {
     case applied
     case failed
     case conflicted
+    /// Spec 3.21/3D.6: the provider refused for a reason retrying cannot fix — access revoked,
+    /// write-only, a calendar that became read-only. Deliberately **not** a retryable failure
+    /// with a long delay: a parked mutation's `attemptCount` is untouched and it has no
+    /// `nextRetryAt`, so a user who denies access for a week and then re-grants it finds their
+    /// queued edits waiting rather than a queue that exhausted its retry window against a wall.
+    case parked
+}
+
+/// Spec 3.21's four failure classes. Phase 2 had one, and collapsing these back into it is how a
+/// permission problem becomes an exhausted retry budget and a permanent rejection becomes an
+/// infinite loop.
+enum MutationFailureClass: String, Codable, Hashable, CaseIterable {
+    /// Store busy, account temporarily unavailable. Retry on the existing backoff.
+    case transient
+    /// Access revoked, write-only, calendar became read-only. Park; do not spend an attempt.
+    case permission
+    /// Calendar deleted, event gone, data the provider rejected. Fail — but never silently.
+    case permanent
+    /// The device event changed underneath us. Routed to Phase 3E, never to retry.
+    case conflict
+
+    var label: String {
+        switch self {
+        case .transient: "Temporary problem"
+        case .permission: "Permission needed"
+        case .permanent: "Couldn't be saved"
+        case .conflict: "Changed in two places"
+        }
+    }
 }
 
 /// A single recurring occurrence that no longer follows its master's rule unmodified

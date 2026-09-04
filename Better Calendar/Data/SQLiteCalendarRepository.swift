@@ -23,7 +23,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v017_rebuild_search_index",
         "v018_add_calendar_provider_identity",
         "v019_add_calendar_availability",
-        "v020_create_event_attendees"
+        "v020_create_event_attendees",
+        "v021_extend_pending_mutations_for_write_back"
     ]
 
     /// Spec 2.17: a checksum over the migration set, stored alongside the applied migration
@@ -833,6 +834,27 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 """)
         }
 
+        // Spec 3D.10. Everything Phase 3D's write-back needs on an outbox row, and nothing it
+        // does not: `pending_mutations.status` already exists and carries no `CHECK` (it arrived
+        // by `ALTER TABLE` in `v013`), so `MutationStatus.parked` is additive with no table
+        // rebuild. ADR 0003's deferred rebuild concerns `change_journal.operation` and stays
+        // deferred.
+        migrator.registerMigration("v021_extend_pending_mutations_for_write_back") { db in
+            // Spec 3.22: the device's last-modified value the local edit was based on, compared
+            // against a fresh fetch immediately before writing.
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN base_provider_version TEXT")
+            // Spec 3.21: *why* a row is stuck, which is what `SRC-STAT-01` reads and what the
+            // un-parking pass filters on. Nullable — a row that never failed has no class.
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN failure_class TEXT")
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN last_failure_at TEXT")
+
+            // No index is added. `v016` already created `pending_mutations_status_idx` on
+            // `(status, next_retry_at)`, which serves both queries this phase adds — the drain
+            // pass filtering on status and due time, and the diagnostics surface filtering on
+            // status alone. A second index over the same leading column would cost every outbox
+            // write and buy nothing.
+        }
+
         return migrator
     }
 
@@ -1224,7 +1246,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
     private static let pendingMutationColumns = [
         "id", "object_id", "object_type", "operation", "created_at",
         "payload", "idempotency_key", "status", "attempt_count",
-        "last_attempt_at", "next_retry_at", "change_journal_entry_id"
+        "last_attempt_at", "next_retry_at", "change_journal_entry_id",
+        "base_provider_version", "failure_class", "last_failure_at"
     ]
 
     private func pendingMutationArguments(_ mutation: PendingMutation) -> StatementArguments {
@@ -1240,7 +1263,10 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             mutation.attemptCount,
             mutation.lastAttemptAt.map(encodeInstant),
             mutation.nextRetryAt.map(encodeInstant),
-            mutation.changeJournalEntryID?.uuidString
+            mutation.changeJournalEntryID?.uuidString,
+            mutation.baseProviderVersion,
+            mutation.failureClass?.rawValue,
+            mutation.lastFailureAt.map(encodeInstant)
         ]
     }
 
@@ -1615,7 +1641,10 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 attemptCount: row["attempt_count"] ?? 0,
                 lastAttemptAt: decodeInstant(row["last_attempt_at"]),
                 nextRetryAt: decodeInstant(row["next_retry_at"]),
-                changeJournalEntryID: (row["change_journal_entry_id"] as String?).flatMap(UUID.init(uuidString:))
+                changeJournalEntryID: (row["change_journal_entry_id"] as String?).flatMap(UUID.init(uuidString:)),
+                baseProviderVersion: row["base_provider_version"],
+                failureClass: (row["failure_class"] as String?).flatMap(MutationFailureClass.init(rawValue:)),
+                lastFailureAt: decodeInstant(row["last_failure_at"])
             )
         }
     }

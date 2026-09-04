@@ -314,8 +314,6 @@ tested against fixture databases from every previously released version.
 ALTER TABLE pending_mutations ADD COLUMN base_provider_version TEXT;
 ALTER TABLE pending_mutations ADD COLUMN failure_class TEXT;
 ALTER TABLE pending_mutations ADD COLUMN last_failure_at TEXT;
-CREATE INDEX pending_mutations_status_idx ON pending_mutations(status)
-    WHERE status IN ('pending', 'parked', 'conflicted', 'failed');
 ```
 
 * `base_provider_version` is 3D.7's concurrency anchor.
@@ -323,6 +321,11 @@ CREATE INDEX pending_mutations_status_idx ON pending_mutations(status)
   un-parking pass filters on. Nullable: a row that never failed has no class.
 * No column is added for the status itself — `pending_mutations.status` already exists and carries
   no `CHECK`.
+* **No index is added either.** `v016_add_engine_indexes` already created
+  `pending_mutations_status_idx` on `(status, next_retry_at)`, which serves both queries this
+  phase adds: the drain pass filtering on status and due time, and `SRC-STAT-01` filtering on
+  status alone. A second index over the same leading column would cost every outbox write and buy
+  nothing.
 
 ---
 

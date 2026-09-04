@@ -375,6 +375,16 @@ final class MigrationTests: XCTestCase {
 
             guard Self.fixtureIncludesSyncTables(stoppingAfter: identifier) else { return }
 
+            // v021: a mutation written before write-back existed was never attempted against a
+            // provider, so it has no concurrency anchor and no failure class. Nullable columns,
+            // and they must read back null rather than an invented default — `failure_class`
+            // says *why* a row is stuck, and a fabricated one would say the wrong thing.
+            XCTAssertEqual(
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM pending_mutations WHERE base_provider_version IS NOT NULL OR failure_class IS NOT NULL OR last_failure_at IS NOT NULL"),
+                0,
+                "write-back columns invented a value \(context)"
+            )
+
             // Columns with a DEFAULT are populated for every row regardless of when it was
             // written, so these hold at every fixture version.
             let mutation = try Row.fetchOne(db, sql: "SELECT * FROM pending_mutations WHERE id = ?", arguments: [Self.mutationID.uuidString])
