@@ -1,8 +1,8 @@
 # ADR 0002 — Conflict detection and free/busy: API surface and scope (spec 2.6/2.7)
 
-- **Status:** Accepted
-- **Date:** 2026-09-02
-- **Scope:** Phase 2 M5
+- **Status:** Accepted; Decision 2 superseded by the Phase 3C amendment below
+- **Date:** 2026-09-02, amended 2026-09-04 (Phase 3C)
+- **Scope:** Phase 2 M5; amended in Phase 3C M4
 - **Relates to:** `Instructions/phase2_specification.md` §2.6, §2.7 (BC-ENG-003, BC-ENG-004),
   `Instructions/phase2plan.md`'s M5 section
 
@@ -64,10 +64,37 @@ This is the same pattern `ProviderMetadata`'s already-scaffolded-but-unused fiel
 (CLAUDE.md) — keeping the parameter on the shape now means Phase 3/4 (which do add attendees) only
 have to change this function's body, not every call site.
 
-### Revisit trigger
+### Revisit trigger — fired in Phase 3C
 
 Revisit once Phase 3/4 add an attendee/RSVP model or a tentative `EventAvailability` case —
 `includeTentative` should stop being a no-op at that point, not stay one out of inertia.
+
+## Amendment (Phase 3C, 2026-09-04) — Decision 2 is retired
+
+Phase 3C supplies both things Decision 2 was waiting on: `EventAttendee` with a
+`participationStatus` and an `isCurrentUser` flag (spec 3C.5), and `EventStatus` on
+`ProviderMetadata`, which is what the `events.status` column has been carrying since `v001`
+without anyone reading it. So the reservations become behaviour:
+
+* **Declined is implemented.** An event whose current-user attendee answered `.declined`
+  contributes no busy time. The user is not busy at a meeting they said no to.
+* **Cancelled is implemented at the event level too.** Decision 2's "cancelled *is* implemented"
+  referred only to cancelled *occurrences* of a series, via `RecurrenceException`. An event the
+  organizer cancelled outright is now excluded from free/busy **and** from `ConflictIndex`, while
+  still being displayed with its status shown — it is information, not a commitment.
+* **`includeTentative` is no longer a no-op.** With it `false`, an event whose status is
+  `.tentative`, or on which the current user answered "maybe", stops occupying time.
+
+The rule lives in one place — `CalendarEvent.occupiesTime(includeTentative:)` — which both
+`FreeBusy.query` and `ConflictIndex.insert` call, so the two cannot drift apart about what "busy"
+means. They differ in exactly one respect, deliberately: `ConflictIndex` always passes the
+default `true`, because a "maybe" on the calendar is still worth warning about, whereas an
+explicit free/busy query is entitled to ask for firm commitments only.
+
+Decision 1 is unchanged and its own revisit trigger (Phase 11 specifying a conflict-warning
+screen) still stands.
+
+Covered by `FreeBusyTests` and `ConflictDetectionTests`.
 
 ## Non-decisions
 

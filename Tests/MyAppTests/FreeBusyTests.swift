@@ -165,6 +165,73 @@ final class FreeBusyTests: XCTestCase {
         XCTAssertEqual(result, [DateInterval(start: TestData.date("2026-09-02T00:00:00Z"), end: TestData.date("2026-09-02T02:00:00Z"))])
     }
 
+    // MARK: - Cancelled, declined and tentative (spec 3C.5, ADR 0002)
+
+    /// ADR 0002 recorded that "declined" could not be implemented because Phase 2 had no attendee
+    /// model, and named this phase as its revisit trigger. The user is not busy at a meeting they
+    /// said no to.
+    func testAnEventTheCurrentUserDeclinedContributesNoBusyTime() {
+        var event = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T09:00:00Z"), endDate: TestData.date("2026-09-02T10:00:00Z"))
+        event.attendees = [
+            EventAttendee(name: "Dana", email: "dana@example.com", participationStatus: .accepted, isOrganizer: true),
+            EventAttendee(name: "Me", email: "me@example.com", participationStatus: .declined, isCurrentUser: true)
+        ]
+
+        let result = FreeBusy.query(query("2026-09-01T00:00:00Z", "2026-09-03T00:00:00Z"), events: [event], exceptions: [])
+
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    /// Someone *else* declining says nothing about whether the user is busy.
+    func testAnotherAttendeeDecliningDoesNotFreeTheUsersTime() {
+        var event = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T09:00:00Z"), endDate: TestData.date("2026-09-02T10:00:00Z"))
+        event.attendees = [
+            EventAttendee(name: "Sam", email: "sam@example.com", participationStatus: .declined),
+            EventAttendee(name: "Me", email: "me@example.com", participationStatus: .accepted, isCurrentUser: true)
+        ]
+
+        let result = FreeBusy.query(query("2026-09-01T00:00:00Z", "2026-09-03T00:00:00Z"), events: [event], exceptions: [])
+
+        XCTAssertEqual(result, [DateInterval(start: TestData.date("2026-09-02T09:00:00Z"), end: TestData.date("2026-09-02T10:00:00Z"))])
+    }
+
+    /// A cancelled event is still *displayed*, with its status shown — it is information, not a
+    /// commitment — but it occupies no time.
+    func testACancelledEventContributesNoBusyTime() {
+        var event = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T09:00:00Z"), endDate: TestData.date("2026-09-02T10:00:00Z"))
+        event.providerMetadata.status = .cancelled
+
+        let result = FreeBusy.query(query("2026-09-01T00:00:00Z", "2026-09-03T00:00:00Z"), events: [event], exceptions: [])
+
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    /// `includeTentative` stops being the documented no-op ADR 0002 left it as.
+    func testIncludeTentativeGovernsWhetherATentativeEventIsBusy() {
+        var byStatus = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T09:00:00Z"), endDate: TestData.date("2026-09-02T10:00:00Z"))
+        byStatus.providerMetadata.status = .tentative
+
+        var byParticipation = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T11:00:00Z"), endDate: TestData.date("2026-09-02T12:00:00Z"))
+        byParticipation.attendees = [EventAttendee(name: "Me", participationStatus: .tentative, isCurrentUser: true)]
+
+        let events = [byStatus, byParticipation]
+        let range = (start: "2026-09-01T00:00:00Z", end: "2026-09-03T00:00:00Z")
+
+        let included = FreeBusy.query(
+            FreeBusy.Query(rangeStart: TestData.date(range.start), rangeEnd: TestData.date(range.end), includeTentative: true),
+            events: events,
+            exceptions: []
+        )
+        XCTAssertEqual(included.count, 2, "a maybe still occupies the slot unless the caller says otherwise")
+
+        let excluded = FreeBusy.query(
+            FreeBusy.Query(rangeStart: TestData.date(range.start), rangeEnd: TestData.date(range.end), includeTentative: false),
+            events: events,
+            exceptions: []
+        )
+        XCTAssertTrue(excluded.isEmpty, "both forms of tentative — the event's status and the user's answer — must be excluded")
+    }
+
     // MARK: - Store wiring
 
     @MainActor

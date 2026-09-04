@@ -32,6 +32,12 @@ struct EventDetailsView: View {
         occurrence.displayEvent
     }
 
+    /// Asked of the store rather than derived here, so what this screen says and what the save
+    /// path would do cannot drift apart. See `BetterCalendarStore.editRefusal(for:)`.
+    private var editRefusal: CapabilityViolation? {
+        store.editRefusal(for: occurrence.event)
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -58,13 +64,59 @@ struct EventDetailsView: View {
                     .padding(.vertical, 4)
                 }
 
+                // Spec 3.34/3C.9: everything that changes what the user may do goes *above*
+                // the actions, so a read-only event says so before the attempt rather than
+                // after. Nothing here renders for a Better Calendar-owned event: no local
+                // calendar is read-only, nothing local carries a status other than confirmed,
+                // and nothing local can have a repeat pattern the engine cannot express.
+                if event.isCancelled || event.hasUnrepresentableRecurrence || editRefusal != nil {
+                    Section {
+                        if event.isCancelled {
+                            Label {
+                                Text("This event has been cancelled by its organizer. It's still shown here, and it no longer counts as busy time.")
+                            } icon: {
+                                Image(systemName: "xmark.circle")
+                            }
+                            .foregroundStyle(.secondary)
+                        }
+
+                        if event.hasUnrepresentableRecurrence {
+                            Label {
+                                Text("This event repeats in a way Better Calendar can't show yet, so only this date appears. Open it in the app that owns \(calendar?.accountName ?? "this calendar") to see the full series.")
+                            } icon: {
+                                Image(systemName: "repeat.circle")
+                            }
+                            .foregroundStyle(.secondary)
+                        }
+
+                        // The recurrence banner above already explains that case in its own
+                        // words, so only a *different* refusal reason adds anything — but a
+                        // read-only calendar and an unexpressible repeat pattern are two
+                        // separate true facts, and an event with both says both.
+                        if let editRefusal, editRefusal.reason != .unrepresentableRecurrence {
+                            Label {
+                                Text(editRefusal.message)
+                            } icon: {
+                                Image(systemName: "lock")
+                            }
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
                 Section("Actions") {
-                    Button("Edit", systemImage: "pencil") {
-                        if occurrence.isRecurringOccurrence {
-                            pendingScopeAction = .edit
-                        } else {
-                            dismiss()
-                            onEdit(occurrence.event)
+                    // Spec 3C.9: an event that cannot be edited does not open the editor at all,
+                    // rather than opening it and refusing to save. The same gate hides every
+                    // other action that would produce a rejected mutation — move, resize,
+                    // reassignment and delete all route through `updateEvent`/`deleteEvent`.
+                    if editRefusal == nil {
+                        Button("Edit", systemImage: "pencil") {
+                            if occurrence.isRecurringOccurrence {
+                                pendingScopeAction = .edit
+                            } else {
+                                dismiss()
+                                onEdit(occurrence.event)
+                            }
                         }
                     }
 
@@ -73,22 +125,24 @@ struct EventDetailsView: View {
                         onDuplicate(event)
                     }
 
-                    Menu(occurrence.isRecurringOccurrence ? "Move series" : "Move") {
-                        Button("15 minutes earlier") {
-                            move(by: -15 * 60)
-                        }
-                        Button("15 minutes later") {
-                            move(by: 15 * 60)
-                        }
-                        Button("1 day earlier") {
-                            move(by: -24 * 60 * 60)
-                        }
-                        Button("1 day later") {
-                            move(by: 24 * 60 * 60)
+                    if editRefusal == nil {
+                        Menu(occurrence.isRecurringOccurrence ? "Move series" : "Move") {
+                            Button("15 minutes earlier") {
+                                move(by: -15 * 60)
+                            }
+                            Button("15 minutes later") {
+                                move(by: 15 * 60)
+                            }
+                            Button("1 day earlier") {
+                                move(by: -24 * 60 * 60)
+                            }
+                            Button("1 day later") {
+                                move(by: 24 * 60 * 60)
+                            }
                         }
                     }
 
-                    if !event.isAllDay {
+                    if editRefusal == nil, !event.isAllDay {
                         Menu(occurrence.isRecurringOccurrence ? "Resize series" : "Resize") {
                             Button("Shorten by 15 minutes") {
                                 resizeEnd(by: -15 * 60)
@@ -105,10 +159,13 @@ struct EventDetailsView: View {
                         }
                     }
 
-                    if store.calendars.count > 1 {
+                    // Spec 3B.5/3B.8: only calendars that would actually accept the event are
+                    // offered. A read-only or unavailable destination shown and then refused is
+                    // exactly the pattern spec 3.34 exists to prevent.
+                    if editRefusal == nil, store.writableDestinationCalendars.contains(where: { $0.id != event.calendarID }) {
                         Menu("Move to Calendar") {
-                            ForEach(store.calendars.filter { $0.id != event.calendarID }) { destination in
-                                Button(destination.name) {
+                            ForEach(store.writableDestinationCalendars.filter { $0.id != event.calendarID }) { destination in
+                                Button(destination.destinationLabel) {
                                     store.moveEventToCalendar(occurrence.event, calendarID: destination.id)
                                 }
                             }
@@ -129,12 +186,14 @@ struct EventDetailsView: View {
                         }
                     }
 
-                    Button("Delete", systemImage: "trash", role: .destructive) {
-                        if occurrence.isRecurringOccurrence {
-                            pendingScopeAction = .delete
-                        } else {
-                            dismiss()
-                            onDelete(occurrence.event)
+                    if editRefusal == nil {
+                        Button("Delete", systemImage: "trash", role: .destructive) {
+                            if occurrence.isRecurringOccurrence {
+                                pendingScopeAction = .delete
+                            } else {
+                                dismiss()
+                                onDelete(occurrence.event)
+                            }
                         }
                     }
                 }
@@ -149,6 +208,20 @@ struct EventDetailsView: View {
 
                 Section("Details") {
                     DetailRow(title: "Calendar", value: calendar?.name ?? "Local calendar", systemImage: "calendar")
+
+                    // BC-EK-018 / spec 3.34: a user with a work Exchange calendar and a personal
+                    // iCloud calendar must never have to guess which one an event is on before
+                    // editing it. Shown only for a calendar that has an owning account — a local
+                    // calendar has none, and "Account: Better Calendar" would be noise.
+                    if let accountName = calendar?.accountName {
+                        DetailRow(title: "Account", value: accountName, systemImage: "person.crop.circle")
+                    }
+
+                    // Spec 3C.9: status is shown when it is not plain confirmed. A confirmed
+                    // event saying "Confirmed" tells the user nothing they did not assume.
+                    if event.status != .confirmed && event.status != .none {
+                        DetailRow(title: "Status", value: event.status.label, systemImage: "questionmark.circle")
+                    }
 
                     // Spec 1.10 "time zone when relevant": an all-day event has no meaningful
                     // zone, and a timed event already in the device's current zone doesn't
@@ -191,6 +264,17 @@ struct EventDetailsView: View {
                     DetailRow(title: "Created", value: event.createdAt.formatted(date: .abbreviated, time: .shortened), systemImage: "clock")
                     if event.updatedAt != event.createdAt {
                         DetailRow(title: "Last Edited", value: event.updatedAt.formatted(date: .abbreviated, time: .shortened), systemImage: "clock.arrow.circlepath")
+                    }
+                }
+
+                // Spec 3C.5 (BC-EK-018): read-only attribution. There is deliberately no "add
+                // guest" affordance anywhere in this phase — EventKit offers no API to add an
+                // attendee, and an affordance that silently does nothing is worse than none.
+                if !event.attendees.isEmpty {
+                    Section("Guests") {
+                        ForEach(event.attendees.sorted { $0.sortOrder < $1.sortOrder }) { attendee in
+                            AttendeeRow(attendee: attendee)
+                        }
                     }
                 }
 
@@ -282,6 +366,50 @@ private struct ICSShareDocument: Transferable {
     static var transferRepresentation: some TransferRepresentation {
         DataRepresentation(exportedContentType: .icsCalendar) { document in
             Data(document.text.utf8)
+        }
+    }
+}
+
+/// Spec 3C.5: one guest, with their answer and — where they are the organizer — the fact that
+/// they called the meeting. Read-only by construction; there is nothing to tap.
+private struct AttendeeRow: View {
+    let attendee: EventAttendee
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attendee.displayName)
+                    .foregroundStyle(.primary)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } icon: {
+            Image(systemName: icon)
+                .foregroundStyle(attendee.participationStatus == .declined ? Color.secondary : Color.accentColor)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var subtitle: String {
+        var parts = [attendee.participationStatus.label]
+        if attendee.isOrganizer {
+            parts.append("Organizer")
+        }
+        // The role is only worth saying when it is not the unremarkable default.
+        if attendee.role != .unknown && attendee.role != .required {
+            parts.append(attendee.role.label)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var icon: String {
+        switch attendee.participationStatus {
+        case .accepted: "checkmark.circle.fill"
+        case .declined: "xmark.circle"
+        case .tentative: "questionmark.circle"
+        case .delegated: "arrowshape.turn.up.right.circle"
+        case .pending, .unknown: "person.crop.circle"
         }
     }
 }

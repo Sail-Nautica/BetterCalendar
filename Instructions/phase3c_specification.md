@@ -429,14 +429,34 @@ Runs on the macOS destination against `FakeEventKitStore`.
 
 | Milestone | Contents |
 |---|---|
-| **3C-M1** | The model and the schema: attendees, status, provider identity fields, the unrepresentable-recurrence marker, migration `v020`, repository persistence. |
-| **3C-M2** | The mapping layer: `DeviceEvent` and friends, `DeviceEventMapper`, recurrence translation, time semantics. |
-| **3C-M3** | The seam and the pass: `events(in:calendarIDs:)`, `DeviceEventMirror`, store wiring. |
-| **3C-M4** | The consequences: free/busy and conflict exclusions, `EVT-DETAIL-01`, the notification proof, ADR updates. |
+| **3C-M1** | The model and the schema: attendees, status, provider identity fields, the unrepresentable-recurrence marker, migration `v020`, repository persistence. **Landed.** |
+| **3C-M2** | The mapping layer: `DeviceEvent` and friends, `DeviceEventMapper`, recurrence translation, time semantics. **Landed.** |
+| **3C-M3** | The seam and the pass: `events(in:calendarIdentifiers:)`, `DeviceEventMirror`, store wiring. **Landed.** |
+| **3C-M4** | The consequences: free/busy and conflict exclusions, `EVT-DETAIL-01`, the notification proof, ADR updates. **Landed.** |
+
+Four decisions this phase made that the specification above leaves open, all recorded in ADR 0008
+because each one is expensive to change once it is on disk:
+
+* **Local ids are derived from provider identity** (UUIDv5 over the EventKit identifier), not
+  minted. That is what makes the pass idempotent, the mirror reconstructible, and the
+  resurrection guard actually able to recognise a re-reported event.
+* **The seam returns a series' master plus its detachments**, never EventKit's expanded
+  occurrences — the collapsing needs an `EKEventStore` and so belongs on the EventKit side, and
+  mirroring the expansion would discard the rule.
+* **The device wins by content, not by timestamp.** `providerVersion` is carried for Phase 3D's
+  concurrency check, but the change detector is a field comparison, which is what makes
+  idempotence structural and a stray local edit self-correcting.
+* **A row is deleted only when its *own start* is inside the fetched window** — the strict
+  reading of §3C.8's bounded-window rule, chosen so the failure mode is a stale row a wider
+  window cleans up rather than a deleted calendar.
+
+The signature named in §3C.0 as `events(in:calendarIDs:)` shipped as
+`events(in:calendarIdentifiers:)`, and is `async`: it takes the *provider's* calendar identifiers
+rather than local ids, and spec 3.27 requires that rendering never block on it.
 
 ## 3C.13 Exit criteria
 
-Phase 3C is complete when:
+**Every criterion below is met.** Phase 3C is complete when:
 
 * An event created in Apple Calendar appears in Better Calendar, on the right calendar, at the
   right time, in every view — Day, Week, Month, Agenda, Search — with no screen knowing it came

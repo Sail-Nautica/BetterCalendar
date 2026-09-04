@@ -13,11 +13,13 @@ enum FreeBusy {
         var rangeEnd: Date
         /// `nil` means every calendar.
         var calendarIDs: Set<UUID>?
-        /// Reserved. Phase 2 has no attendee model (spec 2.0 explicitly excludes attendees and
-        /// invitations) and `EventAvailability` is only `.busy`/`.free` — there is no tentative
-        /// state to include or exclude yet, so this parameter is currently a no-op. Kept on the
-        /// query shape now rather than added later, so Phase 3/4 (which do add attendees) don't
-        /// have to change every call site — only this function's body.
+        /// Whether an event the user is only tentatively committed to contributes busy time.
+        ///
+        /// A no-op through Phase 2, which had no attendee model and no event status to read
+        /// (ADR 0002). Phase 3C supplies both, so this now does what its name says: when `false`,
+        /// an event whose *status* is tentative, or on which the current user answered "maybe",
+        /// stops occupying time. Cancelled and declined events are excluded either way — those
+        /// are not tentative commitments, they are not commitments.
         var includeTentative: Bool = true
 
         init(rangeStart: Date, rangeEnd: Date, calendarIDs: Set<UUID>? = nil, includeTentative: Bool = true) {
@@ -47,8 +49,12 @@ enum FreeBusy {
         let range = DateInterval(start: query.rangeStart, end: query.rangeEnd)
         let expander = RecurrenceExpander()
 
+        // Spec 3C.5: `occupiesTime` folds three questions into one — is this event marked busy,
+        // is it still on, and did the user actually say yes. A cancelled meeting and one the user
+        // declined are both information, not commitments, and neither makes them unavailable.
         let relevantEvents = events.filter { event in
-            event.availability == .busy && (query.calendarIDs?.contains(event.calendarID) ?? true)
+            event.occupiesTime(includeTentative: query.includeTentative)
+                && (query.calendarIDs?.contains(event.calendarID) ?? true)
         }
 
         var intervals: [DateInterval] = []

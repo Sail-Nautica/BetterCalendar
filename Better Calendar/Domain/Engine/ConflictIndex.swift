@@ -1,9 +1,9 @@
 import Foundation
 
 /// Spec 2.6 (BC-ENG-003): a sorted-interval structure over `[startInstant, endInstant)` for
-/// `availability == .busy` events, so a conflict check never needs a full table scan.
+/// events that occupy time, so a conflict check never needs a full table scan.
 ///
-/// Two events conflict when their intervals overlap and both are `.busy`. Timed events are
+/// Two events conflict when their intervals overlap and both occupy time. Timed events are
 /// compared as UTC instants; all-day events are compared as `LocalCalendarDate` ranges against
 /// other all-day events only — an all-day event never conflicts with a timed one (CLAUDE.md:
 /// all-day compares local calendar dates, never UTC instants, and this default is deliberately
@@ -92,7 +92,12 @@ final class ConflictIndex {
     // MARK: - Mutation
 
     private func insert(_ event: CalendarEvent) {
-        guard event.availability == .busy else { return }
+        // Spec 3C.5: "occupies time" is `.busy` *and* still on *and* actually accepted. A
+        // cancelled meeting is still displayed, with its status shown — it just cannot conflict
+        // with anything, and neither can one the user declined. Tentative events are indexed:
+        // only an explicit free/busy query gets to exclude those (`Query.includeTentative`),
+        // because a "maybe" on the calendar is still something worth warning about.
+        guard event.occupiesTime() else { return }
 
         if event.isAllDay {
             let calendar = event.calendarInOriginalTimeZone

@@ -180,4 +180,42 @@ final class ConflictDetectionTests: XCTestCase {
 
         XCTAssertTrue(store.conflictingEventIDs(for: b).isEmpty, "a was cascaded away with its calendar and must not still be reported as a conflict")
     }
+
+    // MARK: - Cancelled and declined (spec 3C.5)
+
+    /// A cancelled meeting still occupies the calendar visually, but it cannot conflict with
+    /// anything — it is information, not a commitment.
+    func testACancelledEventRaisesNoConflictButIsStillReturnedForDisplay() {
+        var cancelled = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T14:00:00Z"), endDate: TestData.date("2026-09-02T15:00:00Z"))
+        cancelled.providerMetadata.status = .cancelled
+        let live = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T14:30:00Z"), endDate: TestData.date("2026-09-02T15:30:00Z"))
+        let index = ConflictIndex(events: [cancelled, live])
+
+        XCTAssertTrue(index.conflicts(for: live.id).isEmpty)
+        XCTAssertTrue(index.conflicts(for: cancelled.id).isEmpty)
+        // Still a row, still displayable — the exclusion is from conflict detection, not from
+        // the calendar.
+        XCTAssertEqual(cancelled.title, "Calculus Lecture")
+        XCTAssertFalse(cancelled.occupiesTime())
+    }
+
+    func testAnEventTheCurrentUserDeclinedRaisesNoConflict() {
+        var declined = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T14:00:00Z"), endDate: TestData.date("2026-09-02T15:00:00Z"))
+        declined.attendees = [EventAttendee(name: "Me", participationStatus: .declined, isCurrentUser: true)]
+        let live = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T14:30:00Z"), endDate: TestData.date("2026-09-02T15:30:00Z"))
+        let index = ConflictIndex(events: [declined, live])
+
+        XCTAssertTrue(index.conflicts(for: live.id).isEmpty)
+    }
+
+    /// Tentative is deliberately *not* excluded here. A "maybe" on the calendar is still worth
+    /// warning about; only an explicit free/busy query gets to drop it.
+    func testATentativeEventStillRaisesAConflict() {
+        var tentative = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T14:00:00Z"), endDate: TestData.date("2026-09-02T15:00:00Z"))
+        tentative.providerMetadata.status = .tentative
+        let live = TestData.event(id: UUID(), startDate: TestData.date("2026-09-02T14:30:00Z"), endDate: TestData.date("2026-09-02T15:30:00Z"))
+        let index = ConflictIndex(events: [tentative, live])
+
+        XCTAssertEqual(index.conflicts(for: live.id), [tentative.id])
+    }
 }
