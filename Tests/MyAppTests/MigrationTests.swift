@@ -348,6 +348,31 @@ final class MigrationTests: XCTestCase {
                 "calendar availability not backfilled \(context)"
             )
 
+            // v020: every pre-Phase-3 event predates provider identity and repeat-pattern
+            // translation, so it backfills as "nothing unusual about this event" — not NULL,
+            // which `row.boolValue` would have to guess at, and not 1, which would make every
+            // event in an upgraded database uneditable.
+            XCTAssertEqual(
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM events WHERE has_unrepresentable_recurrence != 0"),
+                0,
+                "unrepresentable-recurrence flag not backfilled \(context)"
+            )
+            XCTAssertEqual(
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM events WHERE has_unrepresentable_recurrence IS NULL"),
+                0,
+                "unrepresentable-recurrence flag left null \(context)"
+            )
+            // The new provider columns are nullable and start empty: a locally-created event has
+            // no external identifier and nothing unmodelled to preserve.
+            XCTAssertEqual(
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM events WHERE provider_external_id IS NOT NULL OR provider_raw_fields IS NOT NULL"),
+                0,
+                "provider columns invented a value \(context)"
+            )
+            // The table exists and is empty — an event written before attendees existed had
+            // none, which is exactly what no rows means.
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM event_attendees"), 0, "attendees invented \(context)")
+
             guard Self.fixtureIncludesSyncTables(stoppingAfter: identifier) else { return }
 
             // Columns with a DEFAULT are populated for every row regardless of when it was

@@ -110,6 +110,13 @@ enum EventMutationUseCases {
         if let violation = capabilityViolation(writingTo: previous.calendarID, creating: false, in: context.database) {
             return .rejected(violation)
         }
+        // ...and spec 3.13/3C.3: so must the event's own repeat pattern. A series the engine
+        // cannot express was mirrored raw; editing it would mean writing back an approximation
+        // of the user's series, which is how a series gets destroyed. Refusing here is what makes
+        // that unreachable rather than merely unlikely.
+        if let violation = recurrenceViolation(editing: previous, in: context.database) {
+            return .rejected(violation)
+        }
 
         var updated = previous
         mutate(&updated)
@@ -487,6 +494,29 @@ enum EventMutationUseCases {
             }
         }
         return nil
+    }
+
+    /// Spec 3.13/3C.3's model-layer refusal, the event-level counterpart of
+    /// `capabilityViolation(writingTo:creating:in:)`.
+    ///
+    /// A device event whose repeat pattern `RecurrenceRule` cannot express — more than one rule,
+    /// or a set-position/day-of-year form the engine does not model — is mirrored with its
+    /// `recurrence` left `nil` and its raw rules preserved. Its occurrences after the first are
+    /// therefore *not shown*, which is visible incompleteness; letting it be edited would turn
+    /// that into invisible wrongness, because the write-back Phase 3D performs would replace the
+    /// user's real series with the approximation we hold.
+    ///
+    /// Only edits are refused. Creating an event on the same calendar is fine (the new event has
+    /// its own, expressible, recurrence), and duplicating one produces a Better Calendar-owned
+    /// copy with no recurrence at all — neither can write an approximation back over a series.
+    static func recurrenceViolation(editing event: CalendarEvent, in database: LocalCalendarDatabase) -> CapabilityViolation? {
+        guard event.hasUnrepresentableRecurrence else { return nil }
+        let calendarName = database.calendars.first { $0.id == event.calendarID }?.name ?? event.title
+        return CapabilityViolation(
+            calendarID: event.calendarID,
+            calendarName: calendarName,
+            reason: .unrepresentableRecurrence
+        )
     }
 
     static func existingOutcome(forIdempotencyKey key: UUID, in database: LocalCalendarDatabase) -> Outcome? {

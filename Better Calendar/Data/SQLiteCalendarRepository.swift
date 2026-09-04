@@ -22,7 +22,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v016_add_engine_indexes",
         "v017_rebuild_search_index",
         "v018_add_calendar_provider_identity",
-        "v019_add_calendar_availability"
+        "v019_add_calendar_availability",
+        "v020_create_event_attendees"
     ]
 
     /// Spec 2.17: a checksum over the migration set, stored alongside the applied migration
@@ -201,9 +202,19 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         try db.execute(sql: "DELETE FROM event_reminders WHERE event_id = ?", arguments: [event.id.uuidString])
         try db.execute(sql: "DELETE FROM event_recurrence_rules WHERE event_id = ?", arguments: [event.id.uuidString])
         try db.execute(sql: "DELETE FROM event_search WHERE event_id = ?", arguments: [event.id.uuidString])
+        // Spec 3.15: attendees are wholly owned by their event and carry no identity a caller
+        // holds onto, so they are replaced outright like the reminders above. Deliberately *not*
+        // indexed into `event_search`: attendee names and addresses are third-party personal
+        // data, and putting them in a search index is how they end up somewhere they were never
+        // meant to be.
+        try db.execute(sql: "DELETE FROM event_attendees WHERE event_id = ?", arguments: [event.id.uuidString])
 
         for reminder in event.reminders {
             try insert(reminder: reminder, eventID: event.id, in: db)
+        }
+
+        for attendee in event.attendees {
+            try insert(attendee: attendee, eventID: event.id, in: db)
         }
 
         if let recurrence = event.recurrence, recurrence.frequency != .never {
@@ -778,6 +789,50 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             try db.execute(sql: "ALTER TABLE calendars ADD COLUMN unavailable_since TEXT")
         }
 
+        // Spec 3C.10. Three things Phase 3C needs and one it does not:
+        //
+        // - `event_attendees` (spec 3.15), a table rather than a blob, because free/busy has to
+        //   ask "did the current user decline this" without decoding JSON per event.
+        // - `provider_external_id`, the cross-device identifier that recognises the same event
+        //   after a restore. Distinct from `provider_object_id`, which is what you pass back to
+        //   fetch or save — the two answer different questions (spec 3C.1).
+        // - `provider_raw_fields`, the payload spec 3.17 requires be preserved so a title-only
+        //   edit cannot strip a video-call link.
+        // - `has_unrepresentable_recurrence`, which makes an event the engine cannot express
+        //   read-only at the model layer rather than editable-and-approximated.
+        //
+        // No column is added for the last-modified value spec 3L expected: `provider_version`
+        // has existed since `v001` and is exactly what spec 3.12 maps `lastModified` onto.
+        // `events.status` likewise already exists — it stops being hardcoded rather than being
+        // added, the same shape as the `v018` calendar work.
+        migrator.registerMigration("v020_create_event_attendees") { db in
+            try db.execute(sql: """
+                CREATE TABLE event_attendees (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    name TEXT,
+                    email TEXT,
+                    participation_status TEXT NOT NULL DEFAULT 'unknown',
+                    role TEXT NOT NULL DEFAULT 'unknown',
+                    is_organizer INTEGER NOT NULL DEFAULT 0,
+                    is_current_user INTEGER NOT NULL DEFAULT 0,
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                )
+                """)
+            try db.execute(sql: "CREATE INDEX event_attendees_event_idx ON event_attendees(event_id)")
+
+            try db.execute(sql: "ALTER TABLE events ADD COLUMN provider_external_id TEXT")
+            try db.execute(sql: "ALTER TABLE events ADD COLUMN provider_raw_fields TEXT")
+            try db.execute(sql: "ALTER TABLE events ADD COLUMN has_unrepresentable_recurrence INTEGER NOT NULL DEFAULT 0")
+
+            // Partial, because every pre-Phase-3 row has no external identifier and would
+            // otherwise share one NULL bucket.
+            try db.execute(sql: """
+                CREATE INDEX events_provider_external_idx ON events(provider_external_id)
+                WHERE provider_external_id IS NOT NULL
+                """)
+        }
+
         return migrator
     }
 
@@ -859,6 +914,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         try db.execute(sql: "DELETE FROM event_recurrence_exceptions")
         try db.execute(sql: "DELETE FROM event_recurrence_rules")
         try db.execute(sql: "DELETE FROM event_reminders")
+        try db.execute(sql: "DELETE FROM event_attendees")
         try db.execute(sql: "DELETE FROM pending_mutations")
         try db.execute(sql: "DELETE FROM deleted_objects")
         try db.execute(sql: "DELETE FROM events")
@@ -876,6 +932,14 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
             for reminder in event.reminders {
                 try insert(reminder: reminder, eventID: event.id, in: db)
+            }
+
+            // Spec 3.15. The incremental path (`upsert(event:)`) writes these too; both paths
+            // need it, because the whole-database replacement is what `load()`, `withBulkMutation`
+            // and ICS import go through — an event that round-tripped through any of those
+            // would otherwise come back with its guest list silently emptied.
+            for attendee in event.attendees {
+                try insert(attendee: attendee, eventID: event.id, in: db)
             }
 
             if let recurrence = event.recurrence, recurrence.frequency != .never {
@@ -920,7 +984,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "event_type", "start_instant", "end_instant", "start_local_date", "end_local_date_exclusive",
         "original_timezone_id", "availability", "status", "privacy", "color_override",
         "recurrence_master_id", "recurrence_original_start", "is_recurrence_master",
-        "sync_status", "created_at", "updated_at", "deleted_at", "raw_ics_properties", "version_number"
+        "sync_status", "created_at", "updated_at", "deleted_at", "raw_ics_properties", "version_number",
+        "provider_external_id", "provider_raw_fields", "has_unrepresentable_recurrence"
     ]
 
     private static func insertSQL(table: String, columns: [String]) -> String {
@@ -1033,7 +1098,10 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             endLocalDateExclusive,
             event.timeZoneIdentifier,
             event.availability.rawValue,
-            "confirmed",
+            // Spec 3C.2: hardcoded `'confirmed'` on every write since `v001`. It now carries
+            // what the provider actually says, which is what lets a cancelled meeting be shown
+            // as cancelled and excluded from free/busy.
+            event.providerMetadata.status.rawValue,
             "default",
             nil,
             event.recurrenceMasterID?.uuidString,
@@ -1044,7 +1112,10 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             encodeInstant(event.updatedAt),
             event.providerMetadata.deletedAt.map(encodeInstant),
             event.providerMetadata.rawICSProperties,
-            event.versionNumber
+            event.versionNumber,
+            event.providerMetadata.providerExternalID,
+            event.providerMetadata.providerRawFields,
+            event.providerMetadata.hasUnrepresentableRecurrence.databaseInt
         ]
     }
 
@@ -1077,6 +1148,29 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 eventID.uuidString,
                 offsetSeconds,
                 "event-\(eventID.uuidString)-reminder-\(reminder.id.uuidString)"
+            ]
+        )
+    }
+
+    private func insert(attendee: EventAttendee, eventID: UUID, in db: Database) throws {
+        try db.execute(
+            sql: """
+                INSERT INTO event_attendees (
+                    id, event_id, name, email, participation_status, role,
+                    is_organizer, is_current_user, sort_order
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+            arguments: [
+                attendee.id.uuidString,
+                eventID.uuidString,
+                attendee.name,
+                attendee.email,
+                attendee.participationStatus.rawValue,
+                attendee.role.rawValue,
+                attendee.isOrganizer.databaseInt,
+                attendee.isCurrentUser.databaseInt,
+                attendee.sortOrder
             ]
         )
     }
@@ -1378,6 +1472,7 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
 
         let reminders = try fetchReminders(eventID: id, in: db)
         let recurrence = try fetchRecurrence(eventID: id, isAllDay: isAllDay, timeZoneIdentifier: timeZoneIdentifier, in: db)
+        let attendees = try fetchAttendees(eventID: id, in: db)
 
         return CalendarEvent(
             id: id,
@@ -1396,14 +1491,25 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             recurrence: recurrence,
             providerMetadata: ProviderMetadata(
                 provider: EventProvider(databaseValue: row["provider"]),
+                // Spec 3C.1: an event carries no account or calendar identifier of its own. Its
+                // `calendarID` points at a mirrored `BetterCalendar` that already holds both,
+                // and duplicating them here would create two places for one fact to live —
+                // which is one more than can be kept in agreement. `load()` used to invent
+                // `providerCalendarID` from the row's `calendar_id`; that was the same
+                // hardcoding `v018` removed for calendars.
                 providerAccountID: nil,
-                providerCalendarID: calendarID.uuidString,
+                providerCalendarID: nil,
                 providerObjectID: row["provider_object_id"],
                 providerVersion: row["provider_version"],
                 syncStatus: SyncStatus(databaseValue: row["sync_status"]),
                 deletedAt: decodeInstant(row["deleted_at"]),
-                rawICSProperties: row["raw_ics_properties"]
+                rawICSProperties: row["raw_ics_properties"],
+                providerExternalID: row["provider_external_id"],
+                providerRawFields: row["provider_raw_fields"],
+                status: EventStatus(rawValue: row["status"] ?? "") ?? .confirmed,
+                hasUnrepresentableRecurrence: row.boolValue("has_unrepresentable_recurrence")
             ),
+            attendees: attendees,
             createdAt: decodeInstant(row["created_at"]) ?? .now,
             updatedAt: decodeInstant(row["updated_at"]) ?? .now,
             availability: EventAvailability(rawValue: row["availability"]) ?? .busy,
@@ -1426,6 +1532,28 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 return nil
             }
             return EventReminder(id: id, offset: offset)
+        }
+    }
+
+    private func fetchAttendees(eventID: UUID, in db: Database) throws -> [EventAttendee] {
+        let rows = try Row.fetchAll(
+            db,
+            sql: "SELECT * FROM event_attendees WHERE event_id = ? ORDER BY sort_order ASC, id ASC",
+            arguments: [eventID.uuidString]
+        )
+
+        return rows.compactMap { row in
+            guard let id = UUID(uuidString: row["id"]) else { return nil }
+            return EventAttendee(
+                id: id,
+                name: row["name"],
+                email: row["email"],
+                participationStatus: EventParticipationStatus(rawValue: row["participation_status"] ?? "") ?? .unknown,
+                role: EventAttendeeRole(rawValue: row["role"] ?? "") ?? .unknown,
+                isOrganizer: row.boolValue("is_organizer"),
+                isCurrentUser: row.boolValue("is_current_user"),
+                sortOrder: row["sort_order"] ?? 0
+            )
         }
     }
 

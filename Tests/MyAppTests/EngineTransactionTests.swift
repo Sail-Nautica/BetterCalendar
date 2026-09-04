@@ -499,8 +499,8 @@ final class EngineTransactionTests: XCTestCase {
         XCTAssertEqual(lhs.calendars.sorted { $0.id.uuidString < $1.id.uuidString },
                        rhs.calendars.sorted { $0.id.uuidString < $1.id.uuidString },
                        "calendars differ", file: file, line: line)
-        XCTAssertEqual(lhs.events.map(normalisedForComparison).sorted { $0.id.uuidString < $1.id.uuidString },
-                       rhs.events.map(normalisedForComparison).sorted { $0.id.uuidString < $1.id.uuidString },
+        XCTAssertEqual(lhs.events.sorted { $0.id.uuidString < $1.id.uuidString },
+                       rhs.events.sorted { $0.id.uuidString < $1.id.uuidString },
                        "events differ", file: file, line: line)
         XCTAssertEqual(Set(lhs.recurrenceExceptions), Set(rhs.recurrenceExceptions), "recurrence exceptions differ", file: file, line: line)
         XCTAssertEqual(Set(lhs.deletedEventTombstones), Set(rhs.deletedEventTombstones), "tombstones differ", file: file, line: line)
@@ -508,19 +508,15 @@ final class EngineTransactionTests: XCTestCase {
         XCTAssertEqual(lhs.settings, rhs.settings, "settings differ", file: file, line: line)
     }
 
-    /// `SQLiteCalendarRepository.load()` derives `providerCalendarID` from the row's
-    /// `calendar_id`, whereas `applying(_:)` passes domain values through exactly as given.
-    /// That is a load-time normalisation of a field reserved for Phase 3 provider sync, not
-    /// part of what a transaction means, so it is normalised away here instead of being
-    /// asserted on both sides. `testLoadDerivesProviderCalendarIDFromTheRow` pins the
-    /// behaviour itself so this normalisation cannot quietly absorb a regression.
-    private func normalisedForComparison(_ event: CalendarEvent) -> CalendarEvent {
-        var copy = event
-        copy.providerMetadata.providerCalendarID = nil
-        return copy
-    }
-
-    func testLoadDerivesProviderCalendarIDFromTheRow() throws {
+    /// Spec 3C.1: the loader used to *invent* `providerCalendarID` from the row's `calendar_id`,
+    /// which meant the same fact lived in two places — the event and the calendar it points at —
+    /// and the event's copy was a local UUID rather than anything a provider would recognise.
+    /// Phase 3C stops that: the calendar row carries the account and calendar identifiers, and
+    /// the event carries neither.
+    ///
+    /// The consequence for this file is that `load()` and `applying(_:)` now agree on every
+    /// field, so `assertDatabasesEqual` no longer normalises one away before comparing.
+    func testLoadDoesNotInventProviderIdentityForAnEvent() throws {
         let fixture = try makeSeededRepository()
         let added = TestData.event(
             id: UUID(),
@@ -534,11 +530,11 @@ final class EngineTransactionTests: XCTestCase {
         try fixture.repository.apply(EngineTransaction(entityChanges: [.upsertEvent(added)]))
 
         let reloaded = try XCTUnwrap(try fixture.repository.load().events.first { $0.id == added.id })
-        XCTAssertEqual(
+        XCTAssertNil(
             reloaded.providerMetadata.providerCalendarID,
-            TestData.secondCalendarID.uuidString,
-            "the loader fills providerCalendarID in from calendar_id"
+            "an event's calendar already holds the provider calendar identifier; a second copy is one more than can be kept in agreement"
         )
+        XCTAssertNil(reloaded.providerMetadata.providerAccountID)
     }
 
     /// The counterpart to the migration test's backfill assertions: rows the repository

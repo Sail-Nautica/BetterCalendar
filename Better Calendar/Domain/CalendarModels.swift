@@ -317,6 +317,10 @@ struct CapabilityViolation: Equatable, Hashable {
         /// account was removed, or the calendar was deleted elsewhere. Distinct from `readOnly`
         /// because the calendar has not refused anything; it is simply not there to write to.
         case unavailable
+        /// Spec 3.13/3C.3: the *event's* repeat pattern is one `RecurrenceRule` cannot express,
+        /// so it was mirrored raw. Editing it would mean writing back an approximation of the
+        /// user's series, which is how a series gets destroyed.
+        case unrepresentableRecurrence
     }
 
     /// User-facing copy, per the UI/UX §9.2 rule that an error says what happened and why.
@@ -328,6 +332,8 @@ struct CapabilityViolation: Equatable, Hashable {
             "\"\(calendarName)\" doesn't allow new events."
         case .unavailable:
             "\"\(calendarName)\" isn't available on this device right now, so this event can't be saved to it."
+        case .unrepresentableRecurrence:
+            "This event repeats in a way Better Calendar can't edit yet. Change it in the app that owns \"\(calendarName)\"."
         }
     }
 }
@@ -509,6 +515,9 @@ struct CalendarEvent: Identifiable, Codable, Hashable {
     var reminders: [EventReminder]
     var recurrence: RecurrenceRule?
     var providerMetadata: ProviderMetadata
+    /// Spec 3.15 (3C.5): read-only attribution from the provider. Always empty for a Better
+    /// Calendar-owned event — nothing in this app can add one.
+    var attendees: [EventAttendee] = []
     var createdAt: Date
     var updatedAt: Date
     /// BC-EVT-020, spec 1.5/1.10. The `events.availability` SQLite column already existed
@@ -567,6 +576,48 @@ struct CalendarEvent: Identifiable, Codable, Hashable {
     }
 
     static let untitledPlaceholder = "(No title)"
+
+    // MARK: - Provider state (spec 3C.5)
+
+    var status: EventStatus {
+        providerMetadata.status
+    }
+
+    var isCancelled: Bool {
+        providerMetadata.status == .cancelled
+    }
+
+    var organizer: EventAttendee? {
+        attendees.first(where: \.isOrganizer)
+    }
+
+    var currentUserAttendee: EventAttendee? {
+        attendees.first(where: \.isCurrentUser)
+    }
+
+    /// Spec 3.15: "An event the user has **declined** is excluded from free/busy." They are not
+    /// busy at a meeting they said no to.
+    var isDeclinedByCurrentUser: Bool {
+        currentUserAttendee?.participationStatus == .declined
+    }
+
+    /// Either the event itself is marked tentative, or the current user answered "maybe".
+    var isTentative: Bool {
+        providerMetadata.status == .tentative || currentUserAttendee?.participationStatus == .tentative
+    }
+
+    /// Spec 3.13/3C.3: the provider's repeat pattern could not be expressed, so it is preserved
+    /// raw rather than approximated — and this event must not be edited here.
+    var hasUnrepresentableRecurrence: Bool {
+        providerMetadata.hasUnrepresentableRecurrence
+    }
+
+    /// Spec 2.7/3.15: whether this event occupies time for free/busy and conflict purposes.
+    /// A cancelled meeting and one the user declined are both information, not commitments.
+    func occupiesTime(includeTentative: Bool = true) -> Bool {
+        guard availability == .busy, !isCancelled, !isDeclinedByCurrentUser else { return false }
+        return includeTentative || !isTentative
+    }
 }
 
 extension CalendarEvent {
@@ -577,6 +628,7 @@ extension CalendarEvent {
         case recurrenceMasterID, recurrenceOriginalStart
         case availability
         case versionNumber
+        case attendees
     }
 
     /// Decodes tolerantly so databases written before `timeType` existed still load.
@@ -606,6 +658,9 @@ extension CalendarEvent {
         recurrenceOriginalStart = try container.decodeIfPresent(Date.self, forKey: .recurrenceOriginalStart)
         availability = try container.decodeIfPresent(EventAvailability.self, forKey: .availability) ?? .busy
         versionNumber = try container.decodeIfPresent(Int.self, forKey: .versionNumber) ?? 1
+        // Spec 3C.5: an event written before attendees existed had none, which is exactly what
+        // an empty list means.
+        attendees = try container.decodeIfPresent([EventAttendee].self, forKey: .attendees) ?? []
 
         if let decodedTimeType = try container.decodeIfPresent(EventTimeType.self, forKey: .timeType) {
             timeType = decodedTimeType
@@ -638,6 +693,10 @@ extension CalendarEvent {
         try container.encodeIfPresent(recurrenceOriginalStart, forKey: .recurrenceOriginalStart)
         try container.encode(availability, forKey: .availability)
         try container.encode(versionNumber, forKey: .versionNumber)
+        // Encoded even when empty, so a tombstone snapshot of a mirrored event can restore its
+        // guest list rather than quietly losing it — this snapshot is what spec 0.12 requires be
+        // "enough to reconstruct it".
+        try container.encode(attendees, forKey: .attendees)
     }
 
     /// Boolean-shaped initializer preserving the pre-`timeType` signature.
@@ -706,11 +765,14 @@ extension CalendarEvent {
     }
 }
 
-struct ProviderMetadata: Codable, Hashable {
+struct ProviderMetadata: Hashable {
     var provider: EventProvider
     var providerAccountID: String?
     var providerCalendarID: String?
+    /// Spec 3C.1: `EKEvent.eventIdentifier` — what you pass back to fetch or save this event.
     var providerObjectID: String?
+    /// Spec 3C.1: the device event's last-modified timestamp. The change detector in Phase 3C,
+    /// and the optimistic-concurrency check in Phase 3D (spec 3.22).
     var providerVersion: String?
     var syncStatus: SyncStatus
     var deletedAt: Date?
@@ -718,6 +780,55 @@ struct ProviderMetadata: Codable, Hashable {
     /// later export is non-destructive. Best-effort reconstruction of the source properties,
     /// not a byte-exact copy of the original file.
     var rawICSProperties: String?
+
+    // MARK: - Phase 3C
+
+    /// Spec 3C.1: `EKEvent.calendarItemExternalIdentifier` — what recognises "the same event"
+    /// after a restore or on another device. Deliberately separate from `providerObjectID`,
+    /// because the two answer different questions and neither is unique on its own for a
+    /// detached occurrence.
+    var providerExternalID: String?
+    /// Spec 3.17 (BC-EK-017): the provider fields Better Calendar does not model — structured
+    /// location, conference and video-call data, geolocation, per-account custom properties —
+    /// kept as JSON so a local edit cannot silently strip them. Distinct from
+    /// `rawICSProperties`: two providers, two payloads, no shared bucket to disagree over.
+    var providerRawFields: String?
+    /// Spec 3.12/3.15. `events.status` has existed since `v001` and was hardcoded `'confirmed'`.
+    var status: EventStatus
+    /// Spec 3.13/3C.3: the device's recurrence could not be expressed by `RecurrenceRule` — more
+    /// than one rule, or a set-position/day-of-year form the engine does not model. The rules
+    /// themselves are preserved in `providerRawFields`; this flag is what makes the event
+    /// read-only at the model layer, so no local edit is ever built on a series we would have to
+    /// approximate to write back.
+    var hasUnrepresentableRecurrence: Bool
+
+    init(
+        provider: EventProvider,
+        providerAccountID: String? = nil,
+        providerCalendarID: String? = nil,
+        providerObjectID: String? = nil,
+        providerVersion: String? = nil,
+        syncStatus: SyncStatus,
+        deletedAt: Date? = nil,
+        rawICSProperties: String? = nil,
+        providerExternalID: String? = nil,
+        providerRawFields: String? = nil,
+        status: EventStatus = .confirmed,
+        hasUnrepresentableRecurrence: Bool = false
+    ) {
+        self.provider = provider
+        self.providerAccountID = providerAccountID
+        self.providerCalendarID = providerCalendarID
+        self.providerObjectID = providerObjectID
+        self.providerVersion = providerVersion
+        self.syncStatus = syncStatus
+        self.deletedAt = deletedAt
+        self.rawICSProperties = rawICSProperties
+        self.providerExternalID = providerExternalID
+        self.providerRawFields = providerRawFields
+        self.status = status
+        self.hasUnrepresentableRecurrence = hasUnrepresentableRecurrence
+    }
 
     static let local = ProviderMetadata(
         provider: .betterCalendar,
@@ -728,6 +839,50 @@ struct ProviderMetadata: Codable, Hashable {
         syncStatus: .synced,
         deletedAt: nil
     )
+}
+
+extension ProviderMetadata: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case provider, providerAccountID, providerCalendarID, providerObjectID, providerVersion
+        case syncStatus, deletedAt, rawICSProperties
+        case providerExternalID, providerRawFields, status, hasUnrepresentableRecurrence
+    }
+
+    /// Hand-written for the same reason `BetterCalendar` and `CalendarEvent` are: Swift's
+    /// synthesized decoder ignores property defaults, so a payload written before these fields
+    /// existed — a tombstone's event snapshot, a flat-file database — would throw rather than
+    /// decode as what it was. That throw is a silent-data-loss path, not an inconvenience.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decode(EventProvider.self, forKey: .provider)
+        providerAccountID = try container.decodeIfPresent(String.self, forKey: .providerAccountID)
+        providerCalendarID = try container.decodeIfPresent(String.self, forKey: .providerCalendarID)
+        providerObjectID = try container.decodeIfPresent(String.self, forKey: .providerObjectID)
+        providerVersion = try container.decodeIfPresent(String.self, forKey: .providerVersion)
+        syncStatus = try container.decode(SyncStatus.self, forKey: .syncStatus)
+        deletedAt = try container.decodeIfPresent(Date.self, forKey: .deletedAt)
+        rawICSProperties = try container.decodeIfPresent(String.self, forKey: .rawICSProperties)
+        providerExternalID = try container.decodeIfPresent(String.self, forKey: .providerExternalID)
+        providerRawFields = try container.decodeIfPresent(String.self, forKey: .providerRawFields)
+        status = try container.decodeIfPresent(EventStatus.self, forKey: .status) ?? .confirmed
+        hasUnrepresentableRecurrence = try container.decodeIfPresent(Bool.self, forKey: .hasUnrepresentableRecurrence) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(provider, forKey: .provider)
+        try container.encodeIfPresent(providerAccountID, forKey: .providerAccountID)
+        try container.encodeIfPresent(providerCalendarID, forKey: .providerCalendarID)
+        try container.encodeIfPresent(providerObjectID, forKey: .providerObjectID)
+        try container.encodeIfPresent(providerVersion, forKey: .providerVersion)
+        try container.encode(syncStatus, forKey: .syncStatus)
+        try container.encodeIfPresent(deletedAt, forKey: .deletedAt)
+        try container.encodeIfPresent(rawICSProperties, forKey: .rawICSProperties)
+        try container.encodeIfPresent(providerExternalID, forKey: .providerExternalID)
+        try container.encodeIfPresent(providerRawFields, forKey: .providerRawFields)
+        try container.encode(status, forKey: .status)
+        try container.encode(hasUnrepresentableRecurrence, forKey: .hasUnrepresentableRecurrence)
+    }
 }
 
 enum EventProvider: String, Codable, CaseIterable, Identifiable {
@@ -764,6 +919,123 @@ enum SyncStatus: String, Codable, CaseIterable, Identifiable {
     case failed = "Failed"
 
     var id: String { rawValue }
+}
+
+/// Spec 3.15 (3C.5): a guest on a mirrored event, as read-only attribution.
+///
+/// EventKit exposes attendees and the organizer but offers no API to add one, so Better Calendar
+/// never presents an "add guest" affordance in Phase 3 — invitations are Phase 11. These exist to
+/// be *shown*, and to answer the two questions free/busy needs: did the current user decline, and
+/// who called this meeting.
+///
+/// Names and email addresses here are personal data belonging to third parties, subject to the
+/// same rule as event content (spec 0.13): never logged, never in analytics, never in a
+/// diagnostic string, and never in the search index.
+struct EventAttendee: Identifiable, Codable, Hashable {
+    var id: UUID
+    var name: String?
+    var email: String?
+    var participationStatus: EventParticipationStatus
+    var role: EventAttendeeRole
+    var isOrganizer: Bool
+    var isCurrentUser: Bool
+    var sortOrder: Int
+
+    init(
+        id: UUID = UUID(),
+        name: String? = nil,
+        email: String? = nil,
+        participationStatus: EventParticipationStatus = .unknown,
+        role: EventAttendeeRole = .unknown,
+        isOrganizer: Bool = false,
+        isCurrentUser: Bool = false,
+        sortOrder: Int = 0
+    ) {
+        self.id = id
+        self.name = name
+        self.email = email
+        self.participationStatus = participationStatus
+        self.role = role
+        self.isOrganizer = isOrganizer
+        self.isCurrentUser = isCurrentUser
+        self.sortOrder = sortOrder
+    }
+
+    /// What to render. An attendee with neither a name nor an address is rare but expressible,
+    /// and reads better as "Guest" than as an empty row.
+    var displayName: String {
+        if let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return name
+        }
+        if let email, !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return email
+        }
+        return "Guest"
+    }
+}
+
+/// An attendee's answer, in Better Calendar's vocabulary rather than EventKit's.
+enum EventParticipationStatus: String, Codable, CaseIterable, Identifiable, Hashable {
+    case unknown
+    case pending
+    case accepted
+    case declined
+    case tentative
+    case delegated
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .unknown: "No response"
+        case .pending: "Invited"
+        case .accepted: "Going"
+        case .declined: "Not going"
+        case .tentative: "Maybe"
+        case .delegated: "Delegated"
+        }
+    }
+}
+
+enum EventAttendeeRole: String, Codable, CaseIterable, Identifiable, Hashable {
+    case unknown
+    case required
+    case optional
+    case chair
+    case nonParticipant
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .unknown: "Guest"
+        case .required: "Required"
+        case .optional: "Optional"
+        case .chair: "Chair"
+        case .nonParticipant: "Not participating"
+        }
+    }
+}
+
+/// Spec 3.12/3.15: the event's own status, distinct from any one attendee's answer. The
+/// `events.status` column has existed since `v001`, written as the literal `'confirmed'` for
+/// every row; Phase 3C is where it starts carrying what the provider actually says.
+enum EventStatus: String, Codable, CaseIterable, Identifiable, Hashable {
+    case none
+    case confirmed
+    case tentative
+    case cancelled
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .none: "No status"
+        case .confirmed: "Confirmed"
+        case .tentative: "Tentative"
+        case .cancelled: "Cancelled"
+        }
+    }
 }
 
 struct EventReminder: Identifiable, Codable, Hashable {
