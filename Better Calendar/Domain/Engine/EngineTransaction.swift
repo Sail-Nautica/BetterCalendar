@@ -158,6 +158,12 @@ enum TombstoneCause: String, Codable, Hashable, CaseIterable {
     case recurrenceSplit
     case calendarDeletion
     case reset
+    /// Spec 3C.8: the event went away *out there* — it was inside a fetched window, on a
+    /// calendar included in the fetch, and the device no longer reports it. Distinct from
+    /// `userEdit` because the journal has to tell "the user deleted this here" from "the device
+    /// deleted this", and because a Phase 3D write-back must not try to delete an event that is
+    /// already gone. The existing resurrection guard applies to it either way.
+    case providerDeletion
 }
 
 /// Retention windows shared by the store and the repository, so the 30-day figure is stated

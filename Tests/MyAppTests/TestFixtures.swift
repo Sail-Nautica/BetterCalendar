@@ -216,3 +216,199 @@ enum TestRepositoryError: Error {
     case loadFailed
     case saveFailed
 }
+
+/// Spec 3.36/3C.11: the device side of Phase 3C's fixtures — a two-account device, its mirrored
+/// calendar rows, and a builder for the events on them.
+///
+/// Shared across `DeviceEventMappingTests`, `DeviceEventMirrorTests` and `DeviceEventStoreTests`
+/// so all three describe the same device, and a test that disagrees with another about what the
+/// fixture *is* cannot happen.
+enum DeviceTestData {
+    static let now = TestData.date("2026-09-04T09:00:00Z")
+
+    static let icloudSource = DeviceCalendarSource(identifier: "source-icloud", title: "iCloud", type: .mobileMe)
+    static let exchangeSource = DeviceCalendarSource(identifier: "source-exchange", title: "Work Exchange", type: .exchange)
+
+    static let personalCalendar = DeviceCalendar(
+        identifier: "cal-personal",
+        source: icloudSource,
+        title: "Personal",
+        type: .calDAV,
+        colorHex: "#2B6CE8"
+    )
+    static let workCalendar = DeviceCalendar(
+        identifier: "cal-work",
+        source: exchangeSource,
+        title: "Work",
+        type: .exchange,
+        colorHex: "#7B2D8E"
+    )
+    static let holidaysCalendar = DeviceCalendar(
+        identifier: "cal-holidays",
+        source: icloudSource,
+        title: "US Holidays",
+        type: .calDAV,
+        isSubscribed: true,
+        allowsContentModifications: false
+    )
+
+    static let devices = [personalCalendar, workCalendar, holidaysCalendar]
+
+    static func snapshot(defaultCalendarIdentifier: String? = "cal-personal") -> DeviceCalendarSnapshot {
+        DeviceCalendarSnapshot(calendars: devices, defaultCalendarIdentifierForNewEvents: defaultCalendarIdentifier)
+    }
+
+    /// A mirrored `BetterCalendar` row for one of the fixture's device calendars, as
+    /// `DeviceCalendarMirror` would have written it. Built directly rather than by running a
+    /// discovery pass so a mapping test does not depend on the discovery planner.
+    static func mirroredRow(
+        for device: DeviceCalendar,
+        id: UUID,
+        isVisible: Bool = true,
+        isUnavailable: Bool = false
+    ) -> BetterCalendar {
+        BetterCalendar(
+            id: id,
+            name: device.title,
+            colorName: .betterBlue,
+            isVisible: isVisible,
+            isDefault: false,
+            sortOrder: 0,
+            createdAt: now,
+            updatedAt: now,
+            provider: device.source.provider,
+            connectionMethod: .device,
+            providerAccountID: device.source.identifier,
+            providerCalendarID: device.identifier,
+            accountName: device.source.title,
+            colorHex: device.colorHex,
+            isReadOnly: device.isReadOnly,
+            capabilities: device.capabilities,
+            isUnavailable: isUnavailable
+        )
+    }
+
+    static let personalRowID = UUID(uuidString: "AAAAAAAA-0000-0000-0000-000000000001")!
+    static let workRowID = UUID(uuidString: "AAAAAAAA-0000-0000-0000-000000000002")!
+    static let holidaysRowID = UUID(uuidString: "AAAAAAAA-0000-0000-0000-000000000003")!
+
+    static var mirroredCalendars: [BetterCalendar] {
+        [
+            mirroredRow(for: personalCalendar, id: personalRowID),
+            mirroredRow(for: workCalendar, id: workRowID),
+            mirroredRow(for: holidaysCalendar, id: holidaysRowID)
+        ]
+    }
+
+    static func event(
+        identifier: String = "evt-1",
+        externalIdentifier: String? = "ext-1",
+        calendarIdentifier: String = "cal-personal",
+        title: String = "Standup",
+        notes: String? = nil,
+        location: String? = nil,
+        urlString: String? = nil,
+        startDate: Date = TestData.date("2026-09-10T14:00:00Z"),
+        endDate: Date = TestData.date("2026-09-10T14:30:00Z"),
+        isAllDay: Bool = false,
+        timeZoneIdentifier: String? = "America/New_York",
+        availability: DeviceEventAvailability = .busy,
+        status: DeviceEventStatus = .confirmed,
+        alarms: [DeviceEventAlarm] = [],
+        recurrenceRules: [DeviceRecurrenceRule] = [],
+        attendees: [DeviceEventAttendee] = [],
+        lastModified: Date? = TestData.date("2026-09-01T08:00:00Z"),
+        isDetached: Bool = false,
+        occurrenceDate: Date? = nil,
+        rawFields: [String: String] = [:]
+    ) -> DeviceEvent {
+        DeviceEvent(
+            identifier: identifier,
+            externalIdentifier: externalIdentifier,
+            calendarIdentifier: calendarIdentifier,
+            title: title,
+            notes: notes,
+            location: location,
+            urlString: urlString,
+            startDate: startDate,
+            endDate: endDate,
+            isAllDay: isAllDay,
+            timeZoneIdentifier: timeZoneIdentifier,
+            availability: availability,
+            status: status,
+            alarms: alarms,
+            recurrenceRules: recurrenceRules,
+            attendees: attendees,
+            lastModified: lastModified,
+            isDetached: isDetached,
+            occurrenceDate: occurrenceDate,
+            rawFields: rawFields
+        )
+    }
+
+    static func context(
+        calendarID: UUID = personalRowID,
+        provider: EventProvider = .apple,
+        deviceTimeZoneIdentifier: String = "America/New_York",
+        localID: UUID = UUID(uuidString: "BBBBBBBB-0000-0000-0000-000000000001")!,
+        createdAt: Date = now
+    ) -> DeviceEventMapper.Context {
+        DeviceEventMapper.Context(
+            calendarID: calendarID,
+            provider: provider,
+            deviceTimeZoneIdentifier: deviceTimeZoneIdentifier,
+            localID: localID,
+            createdAt: createdAt
+        )
+    }
+
+    /// The window the mirror tests use unless they are specifically about window boundaries.
+    static let window = DateInterval(
+        start: TestData.date("2026-09-01T00:00:00Z"),
+        end: TestData.date("2026-10-01T00:00:00Z")
+    )
+
+    static func input(
+        devices: [DeviceEvent],
+        window: DateInterval = window,
+        fetchedCalendarIDs: Set<UUID> = [personalRowID, workRowID, holidaysRowID],
+        calendars: [BetterCalendar]? = nil,
+        existingEvents: [CalendarEvent] = [],
+        existingExceptions: [RecurrenceException] = [],
+        tombstones: [DeletedEventTombstone] = [],
+        deviceTimeZoneIdentifier: String = "America/New_York"
+    ) -> DeviceEventMirror.Input {
+        DeviceEventMirror.Input(
+            devices: devices,
+            window: window,
+            fetchedCalendarIDs: fetchedCalendarIDs,
+            calendars: calendars ?? mirroredCalendars,
+            existingEvents: existingEvents,
+            existingExceptions: existingExceptions,
+            tombstones: tombstones,
+            deviceTimeZoneIdentifier: deviceTimeZoneIdentifier
+        )
+    }
+
+    /// The events a plan would upsert, in emission order.
+    static func upsertedEvents(_ plan: DeviceEventMirror.Plan) -> [CalendarEvent] {
+        plan.changes.compactMap { change in
+            guard case .upsertEvent(let event) = change else { return nil }
+            return event
+        }
+    }
+
+    static func deletedEventIDs(_ plan: DeviceEventMirror.Plan) -> [UUID] {
+        plan.changes.compactMap { change in
+            guard case .deleteEvent(let id) = change else { return nil }
+            return id
+        }
+    }
+
+    static func upsertedExceptions(_ plan: DeviceEventMirror.Plan) -> [RecurrenceException] {
+        plan.changes.compactMap { change in
+            guard case .upsertRecurrenceException(let exception) = change else { return nil }
+            return exception
+        }
+    }
+}

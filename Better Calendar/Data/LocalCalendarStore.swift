@@ -24,6 +24,12 @@ final class BetterCalendarStore {
     /// Counts from the last discovery pass — never content (spec 3.24). Surfaced in the
     /// diagnostics section of Settings.
     private(set) var lastDiscoverySummary: DeviceCalendarMirror.Summary?
+    /// The same, for the last event-mirroring pass (spec 3C.8).
+    private(set) var lastEventMirrorSummary: DeviceEventMirror.Summary?
+    /// The window the last event-mirroring pass actually covered. Held so a diagnostics surface
+    /// can say what was reconciled rather than implying the whole calendar was — and so Phase 3E
+    /// has the value it needs to persist per calendar.
+    private(set) var lastEventMirrorWindow: DateInterval?
     var undoAction: UndoAction?
 
     private let repository: LocalCalendarRepository
@@ -773,8 +779,9 @@ final class BetterCalendarStore {
         calendarAccessStatus = result
         // Spec 3K: counts and enum-like status only — never a calendar name or an account email.
         PrivacyLog.track(.calendarPermissionResult, metadata: result.rawValue)
-        // A fresh grant is the first moment there is anything to discover (BC-EK-004).
-        discoverDeviceCalendars()
+        // A fresh grant is the first moment there is anything to discover (BC-EK-004) — or, from
+        // Phase 3C, anything to mirror.
+        await refreshDeviceCalendars()
         return result
     }
 
@@ -817,6 +824,94 @@ final class BetterCalendarStore {
         guard !plan.isEmpty else { return true }
 
         return applyDiscovery(plan, now: now)
+    }
+
+    /// Spec 3C.9/3.34: why this event cannot be edited, or `nil` if it can.
+    ///
+    /// Answered by the *model layer* — the same two gates `updateEvent` applies — rather than by
+    /// the view re-deriving the rule from `isReadOnly`. That matters more than it looks: spec
+    /// 3.34 requires the detail view say an event is read-only **before** the user attempts an
+    /// edit, and a screen that computes its own answer is a screen that can disagree with the
+    /// one the save path will give. Here, what the user is told and what the engine would do are
+    /// the same expression.
+    func editRefusal(for event: CalendarEvent) -> CapabilityViolation? {
+        EventMutationUseCases.capabilityViolation(writingTo: event.calendarID, creating: false, in: database)
+            ?? EventMutationUseCases.recurrenceViolation(editing: event, in: database)
+    }
+
+    // MARK: - Device event mirroring (spec 3C.8, Phase 3C)
+
+    /// Spec 3B.0/3C.0: the two halves of one pass, on the triggers Phase 3B established — a
+    /// foreground transition, a fresh grant, or a device-calendar surface appearing.
+    ///
+    /// Calendars first, always. An event whose calendar is not mirrored yet has nowhere to go and
+    /// is skipped, so discovering a newly-added account and then mirroring its events in the
+    /// other order would silently drop everything on it until the next pass.
+    func refreshDeviceCalendars(now: Date = .now) async {
+        discoverDeviceCalendars(now: now)
+        await mirrorDeviceEvents(now: now)
+    }
+
+    /// Spec 3C.8: mirrors the device's events for one bounded window into local rows, through
+    /// `DeviceEventMirror`.
+    ///
+    /// `async` because the fetch is bounded by the size of the user's calendar and spec 3.27
+    /// requires that rendering never block on it; the planning and the write are back on the
+    /// caller's actor, where every other store mutation happens.
+    ///
+    /// Returns `false` only when the *write* failed. A failed fetch is not an error state the
+    /// user is told about: nothing is lost by a pass that did not run, and raising the data-error
+    /// alert on every foreground for a transient store failure would be worse than the failure.
+    @discardableResult
+    func mirrorDeviceEvents(in requestedWindow: DateInterval? = nil, now: Date = .now) async -> Bool {
+        refreshDeviceCalendarAccess()
+        // Spec 3.4/BC-EK-003: below full access there is nothing to read, and an empty fetch
+        // result must never be mistaken for an empty device — so the pass does not run at all
+        // rather than running and concluding every mirrored event was deleted.
+        guard calendarAccessStatus.canReadDeviceEvents else { return true }
+
+        let fetchable = DeviceEventMirror.fetchableCalendars(from: calendars)
+        guard !fetchable.isEmpty else { return true }
+
+        let window = requestedWindow ?? DeviceEventMirror.defaultWindow(around: now)
+        let identifiers = Set(fetchable.compactMap(\.providerCalendarID))
+        guard !identifiers.isEmpty else { return true }
+
+        let devices: [DeviceEvent]
+        do {
+            devices = try await eventKitStore.events(in: window, calendarIdentifiers: identifiers)
+        } catch {
+            PrivacyLog.debug("Device event fetch failed")
+            return false
+        }
+
+        let plan = DeviceEventMirror.plan(
+            DeviceEventMirror.Input(
+                devices: devices,
+                window: window,
+                // The calendars actually fetched, not the ones that exist. This set is what the
+                // bounded-window rule tests deletions against, so it has to be the truth about
+                // what was asked rather than a re-derivation that could drift from it.
+                fetchedCalendarIDs: Set(fetchable.map(\.id)),
+                calendars: calendars,
+                existingEvents: events,
+                existingExceptions: recurrenceExceptions,
+                tombstones: deletedEventTombstones,
+                deviceTimeZoneIdentifier: TimeZone.current.identifier
+            ),
+            now: now
+        )
+
+        lastEventMirrorSummary = plan.summary
+        lastEventMirrorWindow = window
+        guard !plan.isEmpty else { return true }
+
+        // The same atomic path a user edit takes — and, like discovery, carrying no outbox row:
+        // this is a change arriving *from* the device, not one to send to it. Notification
+        // reconciliation runs inside it, which is where BC-EK-016 is actually enforced: the
+        // planner excludes every `.device` calendar, so a mirrored event's alarms produce no
+        // local requests however many of them there are.
+        return withPersistedMutation(plan.transaction)
     }
 
     /// Spec 3.2: an inbound change writes through the *same* `EngineTransaction` path as a user

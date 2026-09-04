@@ -29,8 +29,9 @@ struct DeviceCalendarsView: View {
         .navigationTitle("Device Calendars")
         .task {
             // Spec 3.4/3B.0: a device-calendar surface appearing is both an authorization
-            // re-check and one of this phase's explicit discovery triggers.
-            store.discoverDeviceCalendars()
+            // re-check and one of this phase's explicit discovery triggers — and, from Phase 3C,
+            // an event-mirroring trigger too.
+            await store.refreshDeviceCalendars()
             // Spec 3.3: the primer auto-presents the first time this screen is opened, and only
             // the first time — the rule Phase 3A specified and this screen finally consumes.
             if store.deviceCalendarAccess.shouldPresentPrimerAutomatically {

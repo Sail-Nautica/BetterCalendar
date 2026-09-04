@@ -79,6 +79,22 @@ protocol EventKitStore: CalendarAccessAuthorizing {
     /// `EKEventStore` for both answers and creating one is the expensive part — the shape of the
     /// protocol should not force the adapter to make two.
     func discoverCalendars() throws -> DeviceCalendarSnapshot
+
+    /// Spec 3C.8 step 2: the device events intersecting `range`, on the given provider calendar
+    /// identifiers.
+    ///
+    /// **Bounded by construction.** There is no "everything" call, because spec 3.24's most
+    /// dangerous failure is a mirror inferring a deletion from an absence it never actually
+    /// queried for. A caller that cannot name a range and a calendar set cannot ask.
+    ///
+    /// A series is returned as its **master plus its detachments**, not as expanded occurrences
+    /// — see `DeviceEvent`'s doc comment for why that collapsing belongs on this side of the
+    /// seam.
+    ///
+    /// `async` because this is the expensive member: it is bounded by the size of the user's
+    /// calendar rather than by a handful of calendars, and spec 3.27 requires that rendering
+    /// never block on it. `discoverCalendars` stays synchronous for exactly the opposite reason.
+    func events(in range: DateInterval, calendarIdentifiers: Set<String>) async throws -> [DeviceEvent]
 }
 
 /// What the device reports about its calendars at one moment.
@@ -101,16 +117,29 @@ struct DeviceCalendarSnapshot: Equatable {
 /// injectable failure, and a count of how many times discovery actually reached the device.
 final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
     var snapshot: DeviceCalendarSnapshot
+    /// Spec 3.36: the device's events, scriptable between passes so "someone edited this in
+    /// Apple Calendar" is a deterministic test step rather than a manual one.
+    var deviceEvents: [DeviceEvent]
     /// Set to make the next discovery throw, for the failure paths spec 3.21 will classify.
     var discoveryError: Error?
+    /// The same, for the event fetch.
+    var eventFetchError: Error?
     private(set) var discoveryCount = 0
+    private(set) var eventFetchCount = 0
+    /// What the last fetch actually asked for, so a test can assert the *window* a caller used
+    /// rather than only the rows it got back — the bounded-window rule is about the question,
+    /// not the answer.
+    private(set) var lastRequestedRange: DateInterval?
+    private(set) var lastRequestedCalendarIdentifiers: Set<String> = []
 
     init(
         status: CalendarAccessStatus = .fullAccess,
         grantResult: CalendarAccessStatus = .fullAccess,
-        snapshot: DeviceCalendarSnapshot = .empty
+        snapshot: DeviceCalendarSnapshot = .empty,
+        deviceEvents: [DeviceEvent] = []
     ) {
         self.snapshot = snapshot
+        self.deviceEvents = deviceEvents
         super.init(status: status, grantResult: grantResult)
     }
 
@@ -122,8 +151,37 @@ final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
         return snapshot
     }
 
+    /// Filters the same way the real adapter's predicate does, rather than returning everything
+    /// scripted: a fake that ignores the window would let a bounded-window bug pass CI, and the
+    /// bounded-window rule is the one spec 3.24 calls the most dangerous line in the phase.
+    func events(in range: DateInterval, calendarIdentifiers: Set<String>) async throws -> [DeviceEvent] {
+        eventFetchCount += 1
+        lastRequestedRange = range
+        lastRequestedCalendarIdentifiers = calendarIdentifiers
+        if let eventFetchError {
+            throw eventFetchError
+        }
+
+        return deviceEvents.filter { event in
+            guard calendarIdentifiers.contains(event.calendarIdentifier) else { return false }
+            // A repeating series is reported whenever it *reaches* the window, which the real
+            // predicate resolves by expanding it. Approximated here as "starts before the window
+            // ends", which over-reports rather than under-reports — the safe direction, since an
+            // under-reporting fake would make a wrongly-inferred deletion look correct.
+            if !event.recurrenceRules.isEmpty {
+                return event.startDate < range.end
+            }
+            return event.startDate < range.end && event.endDate > range.start
+        }
+    }
+
     /// Someone added, removed, renamed or recoloured a calendar in Settings between passes.
     func simulateDeviceChange(to snapshot: DeviceCalendarSnapshot) {
         self.snapshot = snapshot
+    }
+
+    /// Someone created, edited or deleted an event in Apple Calendar between passes.
+    func simulateDeviceEventChange(to events: [DeviceEvent]) {
+        deviceEvents = events
     }
 }

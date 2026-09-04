@@ -65,8 +65,10 @@ struct AppRootView: View {
         }
         .task {
             // Spec 3.4/3B.3: the first authorization read and the first discovery pass happen
-            // here rather than in `load()` — launch itself touches nothing from EventKit.
-            store.discoverDeviceCalendars()
+            // here rather than in `load()` — launch itself touches nothing from EventKit. Spec
+            // 3C.8: the event-mirroring pass rides the same trigger, after the calendars it needs
+            // to attach events to exist.
+            await store.refreshDeviceCalendars()
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
@@ -76,7 +78,9 @@ struct AppRootView: View {
                 // the app is backgrounded; on return the app must degrade without crashing and
                 // without losing local data. Spec 3B.0: a foreground is also one of Phase 3B's
                 // explicit discovery triggers — an unchanged device costs one comparison.
-                store.discoverDeviceCalendars()
+                // Spec 3.27: the event fetch that follows it runs off the main thread, so a
+                // foreground never blocks the first frame on reconciliation.
+                Task { await store.refreshDeviceCalendars() }
             }
         }
         .onChange(of: selectedTab) { _, newTab in
