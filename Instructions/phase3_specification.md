@@ -55,7 +55,7 @@ released schema version.
 | **3A — Permission and capability model** | 3.3, 3.4, 3.5 | **Done.** Specified in detail in `Instructions/phase3a_specification.md`; see ADR 0006 and `CalendarAccessTests`. Delivers BC-EK-001, BC-EK-002, BC-EK-022 in full, and the "never claims to display device events" half of BC-EK-003 |
 | **3B — Calendar identity and ownership** | 3.8, 3.9 | **Done.** Specified in `Instructions/phase3b_specification.md`; see ADR 0007, `DeviceCalendarDiscoveryTests` and `DeviceCalendarStoreTests`. Delivers BC-EK-004, BC-EK-005 and BC-EK-019 in full, and extends BC-EK-022 to calendar rows. Nothing in it writes to EventKit |
 | **3C — Reading events** | 3.11–3.17 | **Done.** Specified in `Instructions/phase3c_specification.md`; see ADR 0008, ADR 0002's Phase 3C amendment, and `DeviceEventMappingTests` / `DeviceEventMirrorTests` / `DeviceEventStoreTests` / `DeviceEventPersistenceTests`. Delivers BC-EK-006, BC-EK-012, BC-EK-013, BC-EK-016 and BC-EK-018 in full, completes BC-EK-003, and delivers the preservation half of BC-EK-017. Nothing in it writes to EventKit |
-| 3D — Writing back | 3.18–3.22 | Not started |
+| 3D — Writing back | 3.18–3.22 | In progress. Specified in `Instructions/phase3d_specification.md` |
 | 3E — Change detection | 3.23–3.27 | Not started |
 | 3F — Duplicate connections | 3.28–3.30 | Not started |
 | 3G — Reminders | 3.31–3.32 | Not started |
