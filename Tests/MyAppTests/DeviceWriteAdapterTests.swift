@@ -232,12 +232,22 @@ final class DeviceWriteAdapterTests: XCTestCase {
         XCTAssertEqual(fixture.eventKit.deviceEvents.first?.location, "Room 12", "the device's own change survives the patch")
     }
 
-    func testAConcurrentEditToTheSameFieldConflictsAndWritesNothing() async throws {
+    /// A concurrent edit to the same **time** field. Phase 3D stops here and writes nothing;
+    /// Phase 3E is what decides what happens next, and spec 3.25 will not decide this one on the
+    /// user's behalf — a time resolved the wrong way sends somebody to a meeting that moved.
+    ///
+    /// A same-field conflict over a *low-risk* field no longer stops here: 3E resolves it to the
+    /// newest write. `ConflictResolutionTests` owns that behaviour.
+    func testAConcurrentEditToTheSameTimeFieldConflictsAndWritesNothing() async throws {
         let fixture = try await mirroredEventStore()
         let mirrored = try XCTUnwrap(fixture.store.events.first)
-        Self.rename(mirrored, to: "Renamed here", in: fixture.store)
 
-        fixture.eventKit.deviceEvents[0].title = "Renamed there"
+        var draft = EventDraft(event: mirrored)
+        draft.startDate = mirrored.startDate.addingTimeInterval(3_600)
+        draft.endDate = mirrored.endDate.addingTimeInterval(3_600)
+        _ = fixture.store.saveEvent(from: draft)
+
+        fixture.eventKit.deviceEvents[0].startDate = mirrored.startDate.addingTimeInterval(7_200)
         fixture.eventKit.deviceEvents[0].lastModified = Self.now
 
         await fixture.store.drainDeviceWrites(now: Self.now)
@@ -246,9 +256,13 @@ final class DeviceWriteAdapterTests: XCTestCase {
         XCTAssertEqual(row.status, .conflicted)
         XCTAssertEqual(row.failureClass, .conflict)
         XCTAssertTrue(fixture.eventKit.writeLog.isEmpty, "a conflict must write nothing to the device")
-        XCTAssertEqual(fixture.eventKit.deviceEvents.first?.title, "Renamed there", "the device is untouched")
+        XCTAssertEqual(
+            fixture.eventKit.deviceEvents.first?.startDate,
+            mirrored.startDate.addingTimeInterval(7_200),
+            "the device is untouched"
+        )
         // Spec 3.25: the local edit is not lost — it is still on the row and still in the outbox.
-        XCTAssertEqual(fixture.store.events.first?.title, "Renamed here")
+        XCTAssertEqual(fixture.store.events.first?.startDate, mirrored.startDate.addingTimeInterval(3_600))
         XCTAssertNotNil(row.payload)
     }
 

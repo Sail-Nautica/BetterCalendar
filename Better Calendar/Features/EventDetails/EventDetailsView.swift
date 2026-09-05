@@ -42,6 +42,24 @@ struct EventDetailsView: View {
         store.editRefusal(for: occurrence.event)
     }
 
+    /// Spec 3.25: a local edit to this event that has not reached the device yet.
+    private var pendingWriteStatus: MutationStatus? {
+        store.pendingWriteStatus(for: occurrence.event)
+    }
+
+    private func pendingWriteMessage(for status: MutationStatus) -> String {
+        switch status {
+        case .conflicted:
+            "This event was changed here and on your device at the same time. You're seeing your device's version; open Sync Status in Settings to choose which to keep."
+        case .parked:
+            "Your change to this event is waiting for calendar access. You're seeing your device's version until it can be sent."
+        case .failed:
+            "Your change to this event couldn't be saved to your calendar. It's still saved here — open Sync Status in Settings to try again."
+        default:
+            "Your change to this event hasn't reached your calendar yet. You're seeing your device's version until it does."
+        }
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -73,8 +91,21 @@ struct EventDetailsView: View {
                 // after. Nothing here renders for a Better Calendar-owned event: no local
                 // calendar is read-only, nothing local carries a status other than confirmed,
                 // and nothing local can have a repeat pattern the engine cannot express.
-                if event.isCancelled || event.hasUnrepresentableRecurrence || editRefusal != nil {
+                if event.isCancelled || event.hasUnrepresentableRecurrence || editRefusal != nil || pendingWriteStatus != nil {
                     Section {
+                        // Spec 3.25: while a local edit has not reached the device, the event
+                        // shown here is the **device's** version — the one other people and the
+                        // user's other devices can see — and saying so is the difference between
+                        // a stale-looking screen and an explained one.
+                        if let pendingWriteStatus {
+                            Label {
+                                Text(pendingWriteMessage(for: pendingWriteStatus))
+                            } icon: {
+                                Image(systemName: pendingWriteStatus == .conflicted ? "exclamationmark.arrow.triangle.2.circlepath" : "arrow.triangle.2.circlepath")
+                            }
+                            .foregroundStyle(.secondary)
+                        }
+
                         if event.isCancelled {
                             Label {
                                 Text("This event has been cancelled by its organizer. It's still shown here, and it no longer counts as busy time.")

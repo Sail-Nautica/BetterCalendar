@@ -31,6 +31,17 @@ enum DeviceWritePlanner {
         /// superseded it. `nil` when there is no snapshot — an update whose base is unknown is
         /// treated conservatively; see `DeviceMutationAdapter`.
         var baseEvent: DeviceEvent?
+        /// Spec 3.25: when the local edit was made, for the "newest write wins" comparison. The
+        /// outbox row's `createdAt` *is* that moment — the row is enqueued in the same
+        /// transaction as the edit (spec 2.10).
+        var localEditedAt: Date?
+        /// The fields the user's edit touched, from the change journal. The other half of the
+        /// conflict classification.
+        var localFields: Set<DeviceEventField> = []
+        /// The outbox row's own operation, distinct from `operation` above — that one is what to
+        /// ask the *device* for, this one is what the *user* did, and spec 3.25 treats a delete
+        /// differently from an edit whatever shape the device write takes.
+        var mutationOperation: MutationOperation = .update
 
         enum Operation: Equatable {
             /// `mightAlreadyExist` is true when the row was left `.inFlight` by an earlier pass —
@@ -209,7 +220,10 @@ enum DeviceWritePlanner {
                 )
             ),
             baseProviderVersion: mutation.baseProviderVersion ?? event.providerMetadata.providerVersion,
-            baseEvent: baseEvent(for: mutation, calendarIdentifier: calendarIdentifier, baseSnapshots: baseSnapshots)
+            baseEvent: baseEvent(for: mutation, calendarIdentifier: calendarIdentifier, baseSnapshots: baseSnapshots),
+            localEditedAt: mutation.createdAt,
+            localFields: fields,
+            mutationOperation: mutation.operation
         )
     }
 

@@ -988,6 +988,84 @@ final class BetterCalendarStore {
         return CalendarEvent.untitledPlaceholder
     }
 
+    /// Spec 3.25/3E.4: "keep mine". Re-bases the local edit on what the device holds now and puts
+    /// it back in the queue, so the next drain writes it and the device's competing change is
+    /// superseded by an explicit choice rather than by a rule.
+    @discardableResult
+    func resolveConflictKeepingLocalEdit(_ mutation: PendingMutation, now: Date = .now) -> Bool {
+        guard let stored = pendingMutations.first(where: { $0.id == mutation.id }), stored.status == .conflicted else { return false }
+
+        var resolved = stored
+        resolved.status = .pending
+        resolved.failureClass = nil
+        resolved.nextRetryAt = nil
+        // Re-based on the device's current version: without this the next drain would notice the
+        // same mismatch and conflict again, and the button would appear to do nothing.
+        resolved.baseProviderVersion = events.first { $0.id == stored.objectID }?.providerMetadata.providerVersion
+        resolved.createdAt = now
+        return withPersistedMutation(EngineTransaction(outboxRows: [resolved]))
+    }
+
+    /// Spec 3.25/3E.4: "keep theirs". Retires the mutation — and writes the local edit it was
+    /// carrying into `EventVersion` first.
+    ///
+    /// Nothing on screen changes: the row already shows the device's state, because the mirror
+    /// maps it back on every pass. What changes is that the queue stops carrying an edit the user
+    /// has abandoned. The snapshot is taken because spec 3.25's "never discard" has no exception
+    /// for the case where the user said so — they chose which version to *show*, not which to
+    /// forget.
+    @discardableResult
+    func resolveConflictKeepingDeviceVersion(_ mutation: PendingMutation, now: Date = .now) -> Bool {
+        guard let stored = pendingMutations.first(where: { $0.id == mutation.id }), stored.status == .conflicted else { return false }
+
+        var resolved = stored
+        resolved.status = .applied
+        resolved.failureClass = nil
+        resolved.nextRetryAt = nil
+        resolved.lastAttemptAt = now
+
+        var journalEntries: [ChangeJournalEntry] = []
+        var eventVersions: [EventVersion] = []
+        if let payload = stored.payload, let losing = CalendarEvent(snapshotJSON: payload) {
+            let entry = ChangeJournalEntry(
+                id: UUID(),
+                entityType: .event,
+                entityID: stored.objectID,
+                operation: .update,
+                fieldDiff: nil,
+                source: .userEdit,
+                occurredAt: now,
+                appliedMutationID: stored.id
+            )
+            journalEntries.append(entry)
+            eventVersions.append(
+                EventVersion(
+                    id: UUID(),
+                    eventID: stored.objectID,
+                    versionNumber: losing.versionNumber,
+                    snapshotJSON: payload,
+                    createdAt: now,
+                    changeJournalEntryID: entry.id
+                )
+            )
+        }
+
+        return withPersistedMutation(
+            EngineTransaction(outboxRows: [resolved], journalEntries: journalEntries, eventVersions: eventVersions)
+        )
+    }
+
+    /// Spec 3.25: whether this event has a local edit that has not reached the device — which is
+    /// what `EVT-DETAIL-01` shows an indicator for, and why the event on screen is the device's
+    /// version rather than the user's.
+    func pendingWriteStatus(for event: CalendarEvent) -> MutationStatus? {
+        pendingMutations
+            .filter { $0.objectID == event.id && $0.status != .applied }
+            .map(\.status)
+            // A conflict is the one worth surfacing when a row has more than one state to report.
+            .max { lhs, rhs in (lhs == .conflicted ? 1 : 0) < (rhs == .conflicted ? 1 : 0) }
+    }
+
     /// Spec 3.21/3D.8's "try again". Puts a stuck row back in the queue, by the user's explicit
     /// choice rather than by a schedule.
     ///

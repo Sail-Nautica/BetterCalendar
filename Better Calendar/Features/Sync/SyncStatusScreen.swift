@@ -49,7 +49,9 @@ struct SyncStatusScreen: View {
                         StuckMutationRow(
                             title: store.eventTitle(forMutation: mutation),
                             mutation: mutation,
-                            onRetry: { store.retryMutation(mutation) }
+                            onRetry: { store.retryMutation(mutation) },
+                            onKeepMine: { store.resolveConflictKeepingLocalEdit(mutation) },
+                            onKeepTheirs: { store.resolveConflictKeepingDeviceVersion(mutation) }
                         )
                     }
                 } header: {
@@ -87,6 +89,8 @@ private struct StuckMutationRow: View {
     let title: String
     let mutation: PendingMutation
     let onRetry: () -> Void
+    let onKeepMine: () -> Void
+    let onKeepTheirs: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -96,10 +100,21 @@ private struct StuckMutationRow: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
-            // A parked mutation has nothing to retry — the block is a permission, and it resumes
-            // on its own when access returns. Offering a button that cannot work would be worse
-            // than offering none.
-            if mutation.status != .parked {
+            switch mutation.status {
+            case .conflicted:
+                // Spec 3.25's two answers. Neither discards anything: "Keep Theirs" writes the
+                // version it is setting aside into history before it retires the mutation.
+                HStack(spacing: 16) {
+                    Button("Keep Mine", action: onKeepMine)
+                    Button("Keep Theirs", action: onKeepTheirs)
+                }
+                .font(.footnote)
+                .buttonStyle(.borderless)
+            case .parked:
+                // Nothing to retry — the block is a permission, and it resumes on its own when
+                // access returns. A button that cannot work is worse than none.
+                EmptyView()
+            default:
                 Button("Try Again", action: onRetry)
                     .font(.footnote)
                     .buttonStyle(.borderless)

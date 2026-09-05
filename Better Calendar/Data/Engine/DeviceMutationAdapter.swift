@@ -13,6 +13,11 @@ struct DeviceMutationAdapter {
         /// Spec 3.19: this create had already reached the device on an earlier attempt that
         /// crashed before recording its receipt. Adopted rather than issued again.
         case adopted(DeviceWriteReceipt)
+        /// Spec 3.25: the two sides changed the same low-risk field and the device's change is
+        /// the newer one. The local edit loses — and is written to `EventVersion` by the
+        /// committer before it is dropped, because "never discard" has no exception for a
+        /// decision the engine made on the user's behalf.
+        case supersededByDevice
         case failed(DeviceWriteFailure)
     }
 
@@ -50,10 +55,14 @@ struct DeviceMutationAdapter {
                 return .applied(try await store.save(write))
 
             case .update(let write):
-                if let failure = try await concurrencyFailure(for: planned, write: write) {
+                switch try await concurrencyOutcome(for: planned, write: write) {
+                case .proceed:
+                    return .applied(try await store.save(write))
+                case .superseded:
+                    return .supersededByDevice
+                case .failed(let failure):
                     return .failed(failure)
                 }
-                return .applied(try await store.save(write))
 
             case .delete(let identifier, let span):
                 try await store.remove(identifier: identifier, span: span)
@@ -127,16 +136,22 @@ struct DeviceMutationAdapter {
     /// they touched entirely different fields. So a mismatch is confirmed with a field-level
     /// comparison: if what the device changed and what this mutation changes are disjoint, it is
     /// a merge and the patch proceeds. Only an overlap is a conflict.
-    private func concurrencyFailure(for planned: DeviceWritePlanner.PlannedWrite, write: DeviceEventWrite) async throws -> DeviceWriteFailure? {
-        guard let baseVersion = planned.baseProviderVersion, let identifier = write.identifier else { return nil }
+    enum ConcurrencyOutcome {
+        case proceed
+        case superseded
+        case failed(DeviceWriteFailure)
+    }
+
+    private func concurrencyOutcome(for planned: DeviceWritePlanner.PlannedWrite, write: DeviceEventWrite) async throws -> ConcurrencyOutcome {
+        guard let baseVersion = planned.baseProviderVersion, let identifier = write.identifier else { return .proceed }
         guard let current = try await store.event(withIdentifier: identifier) else {
             // Gone from the device. Not a conflict — there is nothing left to conflict with, and
             // retrying will not bring it back.
-            return .permanent
+            return .failed(.permanent)
         }
 
         let currentVersion = current.lastModified.map(DeviceEventMapper.providerVersionString)
-        guard currentVersion != baseVersion else { return nil }
+        guard currentVersion != baseVersion else { return .proceed }
 
         // Compared against the state this edit was **based on**, never against the state it
         // intends to produce. Comparing against the intent would find every field the mutation is
@@ -147,7 +162,7 @@ struct DeviceMutationAdapter {
             // a path that writes none. The device has changed and we cannot say how, so this
             // stops rather than guessing. A conflict costs the user a decision; a wrong merge
             // costs them a field.
-            return .conflict(currentProviderVersion: currentVersion)
+            return .failed(.conflict(currentProviderVersion: currentVersion))
         }
 
         let changedOnDevice = changedFields(between: base, and: current)
@@ -155,10 +170,27 @@ struct DeviceMutationAdapter {
             // Two writes within the same second that touched different fields are a merge, not a
             // conflict (spec 3.22). The patch writes only `write.fields`, so the device's own
             // change survives it.
-            return nil
+            return .proceed
         }
 
-        return .conflict(currentProviderVersion: currentVersion)
+        // Spec 3.25 (3E.4): the overlap is real, so classify it rather than always stopping.
+        // Low-risk fields resolve on their own; time, recurrence and deletion wait for the user.
+        switch ConflictResolver.resolve(
+            operation: planned.mutationOperation,
+            localFields: planned.localFields,
+            deviceFields: changedOnDevice,
+            localEditedAt: planned.localEditedAt,
+            deviceModifiedAt: current.lastModified
+        ) {
+        case .keepLocal:
+            // The local edit is the newer one. It writes, and the version it supersedes is the
+            // device's own — already in the device's history, not ours to preserve.
+            return .proceed
+        case .keepDevice:
+            return .superseded
+        case .askTheUser:
+            return .failed(.conflict(currentProviderVersion: currentVersion))
+        }
     }
 
     /// Which writable fields the device changed, measured from the state this edit was based on.

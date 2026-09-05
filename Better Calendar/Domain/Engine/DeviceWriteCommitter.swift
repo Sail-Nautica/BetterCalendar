@@ -15,9 +15,13 @@ enum DeviceWriteCommitter {
         var parked = 0
         var failed = 0
         var conflicted = 0
+        /// Spec 3.25: resolved automatically in the device's favour, with the losing local edit
+        /// written to history first.
+        var superseded = 0
 
         var isNoOp: Bool {
-            applied == 0 && adopted == 0 && retried == 0 && parked == 0 && failed == 0 && conflicted == 0
+            applied == 0 && adopted == 0 && retried == 0 && parked == 0 && failed == 0
+                && conflicted == 0 && superseded == 0
         }
     }
 
@@ -91,6 +95,8 @@ enum DeviceWriteCommitter {
         }
         var entityChanges: [EntityChange] = []
         var tombstones: [DeletedObjectTombstone] = []
+        var journalEntries: [ChangeJournalEntry] = []
+        var eventVersions: [EventVersion] = []
 
         for planned in writes {
             guard let outcome = outcomes[planned.mutationID],
@@ -109,6 +115,26 @@ enum DeviceWriteCommitter {
                 jitter: jitter,
                 validate: { _, _ in validationResult(for: outcome) }
             )
+            // Spec 3.25's automatic resolution in the device's favour. The mutation is retired
+            // because the need it represented is gone — but the version it carried is written to
+            // `EventVersion` first, because "never discard" has no exception for a decision the
+            // engine made on the user's behalf.
+            if case .supersededByDevice = outcome {
+                var resolved = mutation
+                resolved.status = .applied
+                resolved.failureClass = nil
+                resolved.nextRetryAt = nil
+                resolved.lastAttemptAt = now
+                outboxRows.append(resolved)
+                result.summary.superseded += 1
+
+                if let losing = supersededVersion(for: planned, mutation: mutation, in: database, now: now) {
+                    journalEntries.append(losing.entry)
+                    eventVersions.append(losing.version)
+                }
+                continue
+            }
+
             if let updated = decision.updatedMutation {
                 outboxRows.append(updated)
             }
@@ -151,9 +177,47 @@ enum DeviceWriteCommitter {
         result.transaction = EngineTransaction(
             entityChanges: entityChanges,
             outboxRows: outboxRows,
+            journalEntries: journalEntries,
+            eventVersions: eventVersions,
             tombstones: tombstones
         )
         return result
+    }
+
+    /// The losing local edit, as durable history.
+    ///
+    /// Snapshotted from the **outbox payload** rather than from the current row: the row is about
+    /// to be — or has already been — mapped back to the device's state by a mirror pass, whereas
+    /// the payload is the edit exactly as the user made it. That is the version spec 3.25 says
+    /// must survive.
+    private static func supersededVersion(
+        for planned: DeviceWritePlanner.PlannedWrite,
+        mutation: PendingMutation,
+        in database: LocalCalendarDatabase,
+        now: Date
+    ) -> (entry: ChangeJournalEntry, version: EventVersion)? {
+        guard let payload = mutation.payload, let losing = CalendarEvent(snapshotJSON: payload) else { return nil }
+
+        let entry = ChangeJournalEntry(
+            id: UUID(),
+            entityType: .event,
+            entityID: planned.eventID,
+            operation: .update,
+            fieldDiff: nil,
+            // The device told us this, and the engine acted on it — not the user.
+            source: .reconciliation,
+            occurredAt: now,
+            appliedMutationID: mutation.id
+        )
+        let version = EventVersion(
+            id: UUID(),
+            eventID: planned.eventID,
+            versionNumber: losing.versionNumber,
+            snapshotJSON: payload,
+            createdAt: now,
+            changeJournalEntryID: entry.id
+        )
+        return (entry, version)
     }
 
     /// Spec 3.19: the device's identity, written onto the local row.
@@ -182,7 +246,7 @@ enum DeviceWriteCommitter {
 
     private static func validationResult(for outcome: DeviceMutationAdapter.Outcome) -> MutationProcessor.ValidationResult {
         switch outcome {
-        case .applied, .adopted:
+        case .applied, .adopted, .supersededByDevice:
             return .valid
         case .failed(let failure):
             switch failure {
@@ -199,7 +263,7 @@ private extension DeviceMutationAdapter.Outcome {
     var receipt: DeviceWriteReceipt? {
         switch self {
         case .applied(let receipt), .adopted(let receipt): receipt
-        case .failed: nil
+        case .failed, .supersededByDevice: nil
         }
     }
 
