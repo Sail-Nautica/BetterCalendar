@@ -128,6 +128,58 @@ enum DeviceEventMirror {
         )
     }
 
+    /// Spec 3.26/3E.5: how long a mirrored calendar may be gone before its events are purged.
+    ///
+    /// 90 days. It has to comfortably exceed any plausible sync outage, a long holiday, or a
+    /// phone left in a drawer — days would be wrong and weeks are marginal — and it is only ever
+    /// allowed to remove rows that are **reconstructible**, which is exactly ADR 0008's second
+    /// property. Re-adding the account re-mirrors everything. See ADR 0010.
+    static let unavailableRetentionInterval: TimeInterval = 90 * 24 * 60 * 60
+
+    /// Events to purge for calendars that have been off the device long enough.
+    ///
+    /// Deliberately separate from `plan`: a reconciliation pass reconciles against what the
+    /// device says *now*, and an unavailable calendar is precisely one the device is saying
+    /// nothing about. Folding this into the pass would put a destructive rule on the same code
+    /// path as the one that has to be conservative about absence.
+    ///
+    /// The calendar row itself is never removed. It carries the user's own choices — visibility,
+    /// sort order, whether it was the default (spec 3.8) — and those are the one thing here that
+    /// re-mirroring cannot reconstruct. Keeping them is what makes re-adding an account feel like
+    /// reconnecting rather than starting over.
+    static func purgePlan(calendars: [BetterCalendar], events: [CalendarEvent], now: Date) -> Plan {
+        var plan = Plan()
+
+        let expiredCalendarIDs = Set(
+            calendars
+                .filter { calendar in
+                    guard calendar.connectionMethod == .device, calendar.isUnavailable else { return false }
+                    guard let since = calendar.unavailableSince else { return false }
+                    return now.timeIntervalSince(since) > unavailableRetentionInterval
+                }
+                .map(\.id)
+        )
+        guard !expiredCalendarIDs.isEmpty else { return plan }
+
+        for event in events where expiredCalendarIDs.contains(event.calendarID) {
+            // A Better Calendar-owned event is never purged by this, whatever calendar it is on:
+            // it is not reconstructible, and nothing would bring it back.
+            guard event.providerMetadata.providerObjectID != nil else { continue }
+
+            plan.changes.append(.deleteEvent(event.id))
+            plan.journalEntries.append(
+                journalEntry(entityID: event.id, operation: .delete, fieldDiff: nil, now: now)
+            )
+            plan.summary.deleted += 1
+        }
+
+        // No tombstones. A tombstone exists to stop a late change resurrecting something the user
+        // deleted (spec 2.13); this is retention housekeeping on a calendar nobody is reporting
+        // anything about, and writing thousands of them would be a bigger database than the one
+        // being trimmed. If the account comes back, re-mirroring is the correct outcome.
+        return plan
+    }
+
     static func plan(_ input: Input, now: Date) -> Plan {
         var plan = Plan()
 

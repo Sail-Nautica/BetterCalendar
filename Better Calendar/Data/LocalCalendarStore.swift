@@ -970,6 +970,13 @@ final class BetterCalendarStore {
             .sorted { $0.createdAt > $1.createdAt }
     }
 
+    /// Spec 3E.7: the most recent moment any mirrored calendar was reconciled, from the state
+    /// table rather than from a timestamp held in memory — so it survives a relaunch and says
+    /// something true about the database rather than about this process.
+    var lastReconciledAt: Date? {
+        reconciliationStates.values.compactMap(\.lastReconciledAt).max()
+    }
+
     var outboxDepthByStatus: [MutationStatus: Int] {
         Dictionary(grouping: pendingMutations, by: \.status).mapValues(\.count)
     }
@@ -1204,6 +1211,11 @@ final class BetterCalendarStore {
             return true
         }
 
+        // Spec 3.26/3E.5: housekeeping for calendars that have been gone long enough. Run here
+        // rather than inside the mirror pass, because the pass has to be conservative about
+        // absence and this is the one rule that acts on it.
+        purgeLongUnavailableMirroredEvents(now: now)
+
         // Spec 3D.6: access is back, so anything parked for want of it goes back in the queue.
         // Done before planning, so a resumed row is drained by this pass rather than the next.
         let resumed = DeviceWriteCommitter.unpark(in: database, now: now)
@@ -1243,6 +1255,16 @@ final class BetterCalendarStore {
         }
 
         return committed
+    }
+
+    /// Spec 3.26/3E.5's retention limit.
+    @discardableResult
+    func purgeLongUnavailableMirroredEvents(now: Date = .now) -> Bool {
+        let plan = DeviceEventMirror.purgePlan(calendars: calendars, events: events, now: now)
+        guard !plan.isEmpty else { return true }
+
+        PrivacyLog.debug("Purged mirrored events for a long-unavailable calendar")
+        return withPersistedMutation(plan.transaction)
     }
 
     /// Spec 3E.3: the window this pass should cover — the default span around now, grown to

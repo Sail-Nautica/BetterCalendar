@@ -277,10 +277,16 @@ Runs on the macOS destination against `FakeEventKitStore`.
 
 | Milestone | Contents |
 |---|---|
-| **3E-M1** | Observation and coalescing: the seam's change stream, the fake's ability to post one, the debounce, the single-pass guarantee, `refreshSourcesIfNecessary`, and the selection-change trigger. |
-| **3E-M2** | The window as state: migration `v023`, the reconciliation-state table, the visible-range trigger, and the widened-window safety rules. |
-| **3E-M3** | The conflict policy: classification, automatic resolution, and the `EventVersion` preservation that makes "never discard" true. |
-| **3E-M4** | The surfaces, the retention limit and its ADR, and the cost assertion. |
+| **3E-M1** | Observation and coalescing: the seam's change stream, the fake's ability to post one, the debounce, the single-pass guarantee, `refreshSourcesIfNecessary`, and the selection-change trigger. **Landed.** |
+| **3E-M2** | The window as state: migration `v023`, the reconciliation-state table, the visible-range trigger, and the widened-window safety rules. **Landed.** |
+| **3E-M3** | The conflict policy: classification, automatic resolution, and the `EventVersion` preservation that makes "never discard" true. **Landed.** |
+| **3E-M4** | The surfaces, the retention limit and its ADR, and the cost assertion. **Landed.** |
+
+One thing M1 needed that this document did not anticipate: `BetterCalendarStore` is now
+`@MainActor`. "Never run two passes concurrently" is a guard flag, and a flag can only promise
+that on an isolated type — otherwise a second pass begins during the first one's `await`. The
+isolation was already true of every caller; making it explicit is what makes the guarantee real.
+See ADR 0010.
 
 M1 first because it is the trigger, and a trigger that fires too often is the thing most likely to
 turn a small bug into a fast one — coalescing and the single-pass guarantee are what keep the rest
@@ -288,7 +294,7 @@ of the phase debuggable.
 
 ## 3E.11 Exit criteria
 
-Phase 3E is complete when:
+**Every criterion below is met.** Phase 3E is complete when:
 
 * An event created, edited or deleted in Apple Calendar reaches Better Calendar without the user
   foregrounding the app, and a burst of changes produces one pass rather than a storm

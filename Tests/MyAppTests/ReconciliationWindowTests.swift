@@ -167,6 +167,90 @@ final class ReconciliationWindowTests: XCTestCase {
         XCTAssertTrue(state.covers(DeviceEventMirror.defaultWindow(around: Self.now)))
     }
 
+    // MARK: - Retention (spec 3.26 / 3E.5, ADR 0010)
+
+    func testACalendarUnavailablePastTheLimitHasItsMirroredEventsPurgedAndItsRowKept() async throws {
+        let fixture = try await connectedStore(deviceEvents: [DeviceTestData.event()])
+        await fixture.store.mirrorDeviceEvents(now: Self.now)
+        XCTAssertEqual(fixture.store.events.count, 1)
+
+        // The account is removed from the device, and stays removed.
+        fixture.eventKit.simulateDeviceChange(to: DeviceCalendarSnapshot(calendars: [DeviceTestData.workCalendar]))
+        _ = fixture.store.discoverDeviceCalendars(now: Self.now)
+        XCTAssertTrue(fixture.store.deviceCalendars.contains { $0.providerCalendarID == "cal-personal" && $0.isUnavailable })
+
+        let longAfter = Self.now.addingTimeInterval(DeviceEventMirror.unavailableRetentionInterval + 86_400)
+        fixture.store.purgeLongUnavailableMirroredEvents(now: longAfter)
+
+        XCTAssertTrue(fixture.store.events.isEmpty, "the mirrored events are reconstructible and go")
+        XCTAssertTrue(
+            fixture.store.deviceCalendars.contains { $0.providerCalendarID == "cal-personal" },
+            "the calendar row carries the user's own choices and stays"
+        )
+    }
+
+    func testACalendarInsideTheLimitKeepsEverything() async throws {
+        let fixture = try await connectedStore(deviceEvents: [DeviceTestData.event()])
+        await fixture.store.mirrorDeviceEvents(now: Self.now)
+
+        fixture.eventKit.simulateDeviceChange(to: DeviceCalendarSnapshot(calendars: [DeviceTestData.workCalendar]))
+        _ = fixture.store.discoverDeviceCalendars(now: Self.now)
+
+        let shortlyAfter = Self.now.addingTimeInterval(DeviceEventMirror.unavailableRetentionInterval - 86_400)
+        fixture.store.purgeLongUnavailableMirroredEvents(now: shortlyAfter)
+
+        XCTAssertEqual(fixture.store.events.count, 1, "a season away is not a deletion")
+    }
+
+    /// A Better Calendar-owned event is not reconstructible, so nothing would bring it back.
+    func testABetterCalendarOwnedEventOnAnExpiredCalendarIsNeverPurged() async throws {
+        let fixture = try await connectedStore()
+        _ = fixture.store.discoverDeviceCalendars(now: Self.now)
+        guard let personal = fixture.store.deviceCalendars.first(where: { $0.providerCalendarID == "cal-personal" }) else {
+            return XCTFail("the personal calendar should be mirrored")
+        }
+
+        var draft = EventDraft(calendarID: personal.id, startDate: Self.now.addingTimeInterval(86_400))
+        draft.title = "Mine, never pushed"
+        draft.endDate = draft.startDate.addingTimeInterval(3_600)
+        _ = fixture.store.saveEvent(from: draft)
+
+        fixture.eventKit.simulateDeviceChange(to: DeviceCalendarSnapshot(calendars: [DeviceTestData.workCalendar]))
+        _ = fixture.store.discoverDeviceCalendars(now: Self.now)
+
+        let longAfter = Self.now.addingTimeInterval(DeviceEventMirror.unavailableRetentionInterval + 86_400)
+        fixture.store.purgeLongUnavailableMirroredEvents(now: longAfter)
+
+        XCTAssertEqual(fixture.store.events.map(\.title), ["Mine, never pushed"])
+    }
+
+    // MARK: - Cost (spec 3.27 / 3J)
+
+    /// Spec 3.27: a pass that finds nothing changed must be cheap enough to run on every
+    /// foreground. Idempotence is what makes reacting to every `EKEventStoreChanged` affordable,
+    /// so this measures the case that actually recurs.
+    func testANoOpPassOverAMonthOfEventsStaysUnderTheBudget() async throws {
+        let devices = (0..<200).map { index in
+            DeviceTestData.event(
+                identifier: "bulk-\(index)",
+                externalIdentifier: "bulk-ext-\(index)",
+                title: "Event \(index)",
+                startDate: Self.now.addingTimeInterval(Double(index) * 3_600),
+                endDate: Self.now.addingTimeInterval(Double(index) * 3_600 + 1_800)
+            )
+        }
+        let fixture = try await connectedStore(deviceEvents: devices)
+        await fixture.store.mirrorDeviceEvents(now: Self.now)
+        XCTAssertEqual(fixture.store.events.count, 200)
+
+        let started = Date()
+        await fixture.store.mirrorDeviceEvents(now: Self.now)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertTrue(fixture.store.lastEventMirrorSummary?.isNoOp ?? false, "the second pass must find nothing")
+        XCTAssertLessThan(elapsed, 0.1, "spec 3J: an unchanged pass over a month's events stays under 100ms")
+    }
+
     // MARK: - Fixtures
 
     private static let now = TestData.date("2026-09-04T09:00:00Z")

@@ -62,6 +62,14 @@ struct SyncStatusScreen: View {
                 }
             }
 
+            if let lastReconciled = store.lastReconciledAt {
+                Section {
+                    LabeledContent("Calendars last checked", value: lastReconciled.formatted(date: .abbreviated, time: .shortened))
+                } footer: {
+                    Text("Better Calendar checks for changes when you open it and whenever your device reports one.")
+                }
+            }
+
             // Spec 3A.7: offered only where Settings can actually resolve it, and omitted
             // entirely where it cannot rather than shown as an action that does nothing.
             if count(of: .parked) > 0, let settingsURL = SystemSettingsLink.calendarPrivacy {
