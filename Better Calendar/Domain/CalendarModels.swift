@@ -107,6 +107,24 @@ struct BetterCalendar: Identifiable, Hashable {
     /// of its own. The column exists now so 3E writes a policy rather than a migration.
     var unavailableSince: Date?
 
+    // MARK: - Duplicate connections (spec 3.29, Phase 3F)
+
+    /// Spec 3F.3: this row lost a duplicate-connection choice.
+    ///
+    /// Distinct from `connectionMethod`, and both are needed. `connectionMethod` records *how*
+    /// this calendar is reached and is the whole answer in Phase 5, where the choice is between
+    /// two different transports. Phase 3's only reachable case is the degenerate one — the same
+    /// account configured twice on the device — where both rows carry `.device` and that field
+    /// cannot say which of them won.
+    ///
+    /// A superseded calendar mirrors nothing, writes nothing and is listed nowhere but
+    /// `SRC-CONN-01`. It is never deleted: superseding is a choice, and a choice the user can
+    /// change.
+    var isSupersededByDuplicateConnection: Bool = false
+    /// When the user answered. Present so the detector can tell "not yet asked" from "asked", and
+    /// not re-prompt for a decision already made.
+    var duplicateConnectionResolvedAt: Date?
+
     /// The single question every mutation path actually asks. Read-only is the coarse switch the
     /// user sees; `capabilities` is the fine-grained truth a provider reports.
     var allowsEventEditing: Bool {
@@ -130,7 +148,9 @@ struct BetterCalendar: Identifiable, Hashable {
     /// calendar permits: an available read-only calendar and an unavailable writable one are
     /// both unusable destinations, for different reasons and with different copy.
     var isWritableDestination: Bool {
-        !isUnavailable && allowsEventCreation
+        // Spec 3F.3: a superseded connection is not a destination. A queued edit must not reach
+        // the device through a transport the user has switched off.
+        !isUnavailable && !isSupersededByDuplicateConnection && allowsEventCreation
     }
 
     static func localDefault(now: Date = .now) -> BetterCalendar {
@@ -153,6 +173,7 @@ extension BetterCalendar: Codable {
         case provider, connectionMethod, providerAccountID, providerCalendarID, accountName
         case colorHex, isReadOnly, timeZoneIdentifier, capabilities
         case isUnavailable, unavailableSince
+        case isSupersededByDuplicateConnection, duplicateConnectionResolvedAt
     }
 
     /// Decodes tolerantly so calendars written before `sortOrder` existed still load,
@@ -183,6 +204,8 @@ extension BetterCalendar: Codable {
         // Spec 3B.4: a calendar written before availability existed decodes as available, which
         // is what it was — the same tolerance every field above already establishes.
         isUnavailable = try container.decodeIfPresent(Bool.self, forKey: .isUnavailable) ?? false
+        isSupersededByDuplicateConnection = try container.decodeIfPresent(Bool.self, forKey: .isSupersededByDuplicateConnection) ?? false
+        duplicateConnectionResolvedAt = try container.decodeIfPresent(Date.self, forKey: .duplicateConnectionResolvedAt)
         unavailableSince = try container.decodeIfPresent(Date.self, forKey: .unavailableSince)
     }
 
@@ -207,6 +230,8 @@ extension BetterCalendar: Codable {
         try container.encodeIfPresent(timeZoneIdentifier, forKey: .timeZoneIdentifier)
         try container.encode(capabilities, forKey: .capabilities)
         try container.encode(isUnavailable, forKey: .isUnavailable)
+        try container.encode(isSupersededByDuplicateConnection, forKey: .isSupersededByDuplicateConnection)
+        try container.encodeIfPresent(duplicateConnectionResolvedAt, forKey: .duplicateConnectionResolvedAt)
         try container.encodeIfPresent(unavailableSince, forKey: .unavailableSince)
     }
 }
@@ -317,6 +342,10 @@ struct CapabilityViolation: Equatable, Hashable {
         /// account was removed, or the calendar was deleted elsewhere. Distinct from `readOnly`
         /// because the calendar has not refused anything; it is simply not there to write to.
         case unavailable
+        /// Spec 3.29/3F.3: the user chose a different connection to this calendar, so this one
+        /// is not the way to reach it. Distinct from `unavailable` — the calendar is right there,
+        /// it is just not the copy Better Calendar is using.
+        case supersededConnection
         /// Spec 3.13/3C.3: the *event's* repeat pattern is one `RecurrenceRule` cannot express,
         /// so it was mirrored raw. Editing it would mean writing back an approximation of the
         /// user's series, which is how a series gets destroyed.
@@ -332,6 +361,8 @@ struct CapabilityViolation: Equatable, Hashable {
             "\"\(calendarName)\" doesn't allow new events."
         case .unavailable:
             "\"\(calendarName)\" isn't available on this device right now, so this event can't be saved to it."
+        case .supersededConnection:
+            "You chose a different connection to \"\(calendarName)\", so this copy of it is no longer in use."
         case .unrepresentableRecurrence:
             "This event repeats in a way Better Calendar can't edit yet. Change it in the app that owns \"\(calendarName)\"."
         }

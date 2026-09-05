@@ -486,6 +486,12 @@ enum EventMutationUseCases {
         guard !calendar.isUnavailable else {
             return CapabilityViolation(calendarID: calendarID, calendarName: calendar.name, reason: .unavailable)
         }
+        // Spec 3F.3: refused at the model layer, not merely hidden from the pickers — the same
+        // discipline spec 3.10 applies to a read-only calendar, and for the same reason. A queued
+        // edit that predates the choice must not reach the device through the losing transport.
+        guard !calendar.isSupersededByDuplicateConnection else {
+            return CapabilityViolation(calendarID: calendarID, calendarName: calendar.name, reason: .supersededConnection)
+        }
         if creating {
             guard calendar.allowsEventCreation else {
                 return CapabilityViolation(calendarID: calendarID, calendarName: calendar.name, reason: .creationNotAllowed)

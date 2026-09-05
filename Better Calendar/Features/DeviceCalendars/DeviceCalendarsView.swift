@@ -18,6 +18,28 @@ struct DeviceCalendarsView: View {
 
     var body: some View {
         List {
+                // Spec 3.29/BC-EK-020: a calendar reaching us more than once would show its
+                // events twice, so the choice is surfaced where the calendars are — not left to
+                // be discovered.
+                if !store.unresolvedDuplicateConnections.isEmpty {
+                    Section {
+                        NavigationLink {
+                            ConnectionChoiceView(store: store)
+                        } label: {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Choose a connection")
+                                    Text("^[\(store.unresolvedDuplicateConnections.count) calendar](inflect: true) is reaching Better Calendar more than once.")
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } icon: {
+                                Image(systemName: "arrow.triangle.branch")
+                            }
+                        }
+                    }
+                }
+
             if access.canReadDeviceEvents {
                 connectedContent
             } else {

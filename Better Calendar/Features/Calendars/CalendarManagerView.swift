@@ -45,6 +45,21 @@ struct CalendarManagerView: View {
                 // list above, because almost nothing the manager offers a local calendar —
                 // rename, recolour, reorder, delete — may be done to one. This row is the entry
                 // point; `SRC-LIST-01` owns the access states and the visibility toggles.
+                // Spec 3.29 names the calendar manager as where the choice is changeable, so the
+                // entry point is here as well as on `SRC-LIST-01`.
+                if !store.allDuplicateConnections.isEmpty {
+                    Section("Connections") {
+                        NavigationLink {
+                            ConnectionChoiceView(store: store)
+                        } label: {
+                            LabeledContent(
+                                "Duplicate Connections",
+                                value: store.unresolvedDuplicateConnections.isEmpty ? "Resolved" : "\(store.unresolvedDuplicateConnections.count) to choose"
+                            )
+                        }
+                    }
+                }
+
                 Section("Device Calendars") {
                     NavigationLink {
                         DeviceCalendarsView(store: store)

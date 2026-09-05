@@ -117,6 +117,14 @@ protocol EventKitStore: CalendarAccessAuthorizing {
     /// Spec 3.19: remove an event, with the span that says how much of a series goes with it.
     func remove(identifier: String, span: DeviceEventSpan) async throws
 
+    /// Spec 3.2/3F.2: the device's accounts, independent of the calendars on them.
+    ///
+    /// Reserved for this phase from the start, and Phase 3B was right to defer it: every consumer
+    /// there wanted the source *of a calendar*, which `DeviceCalendar` carries, and a source with
+    /// no calendars has nothing to list or toggle. It does have something to *compare* — the
+    /// duplicate-connection rule matches accounts, not calendars.
+    func sources() throws -> [DeviceCalendarSource]
+
     /// Spec 3.23: `EKEventStoreChanged`, as a stream.
     ///
     /// The notification carries no payload — it means "something changed, re-query", never "this
@@ -189,6 +197,23 @@ final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
             throw discoveryError
         }
         return snapshot
+    }
+
+    /// Scriptable independently of `snapshot`, so a test can model an account that exists on the
+    /// device with no calendars on it — which is exactly the shape the duplicate-connection rule
+    /// has to compare and the calendar list cannot see.
+    var extraSources: [DeviceCalendarSource] = []
+
+    func sources() throws -> [DeviceCalendarSource] {
+        if let discoveryError {
+            throw discoveryError
+        }
+        let fromCalendars = snapshot.calendars.map(\.source)
+        return (fromCalendars + extraSources).reduce(into: [DeviceCalendarSource]()) { unique, source in
+            if !unique.contains(where: { $0.identifier == source.identifier }) {
+                unique.append(source)
+            }
+        }
     }
 
     /// Filters the same way the real adapter's predicate does, rather than returning everything

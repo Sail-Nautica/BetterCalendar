@@ -26,7 +26,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v020_create_event_attendees",
         "v021_extend_pending_mutations_for_write_back",
         "v022_add_pending_mutation_edit_scope",
-        "v023_create_calendar_reconciliation_state"
+        "v023_create_calendar_reconciliation_state",
+        "v024_add_calendar_duplicate_connection"
     ]
 
     /// Spec 2.17: a checksum over the migration set, stored alongside the applied migration
@@ -969,6 +970,18 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 """)
         }
 
+        // Spec 3F.8. Nothing is added for the connection *identity* itself: `provider`,
+        // `provider_account_id`, `account_name` and the calendar's own `name` have all been
+        // carried since `v018`, and the identity is computed from them. That is what spec 3.29
+        // meant by "record enough identity at discovery" — the recording already happened, in the
+        // prerequisites.
+        migrator.registerMigration("v024_add_calendar_duplicate_connection") { db in
+            try db.execute(sql: "ALTER TABLE calendars ADD COLUMN is_superseded_by_duplicate_connection INTEGER NOT NULL DEFAULT 0")
+            // Distinguishes "not yet asked" from "asked, and this is the answer", so the prompt
+            // does not return every launch for a decision already made.
+            try db.execute(sql: "ALTER TABLE calendars ADD COLUMN duplicate_connection_resolved_at TEXT")
+        }
+
         return migrator
     }
 
@@ -1111,7 +1124,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "is_visible", "is_read_only", "is_default", "time_zone_id", "sort_order",
         "created_at", "updated_at", "deleted_at", "version_number",
         "account_name", "connection_method", "capabilities_json",
-        "is_unavailable", "unavailable_since"
+        "is_unavailable", "unavailable_since",
+        "is_superseded_by_duplicate_connection", "duplicate_connection_resolved_at"
     ]
 
     private static let eventColumns = [
@@ -1166,7 +1180,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             calendar.connectionMethod.rawValue,
             encodeCapabilities(calendar.capabilities),
             calendar.isUnavailable.databaseInt,
-            calendar.unavailableSince.map(encodeInstant)
+            calendar.unavailableSince.map(encodeInstant),
+            calendar.isSupersededByDuplicateConnection.databaseInt,
+            calendar.duplicateConnectionResolvedAt.map(encodeInstant)
         ]
     }
 
@@ -1565,7 +1581,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 timeZoneIdentifier: row["time_zone_id"],
                 capabilities: decodeCapabilities(row["capabilities_json"]),
                 isUnavailable: row.boolValue("is_unavailable"),
-                unavailableSince: (row["unavailable_since"] as String?).flatMap(decodeInstant)
+                unavailableSince: (row["unavailable_since"] as String?).flatMap(decodeInstant),
+                isSupersededByDuplicateConnection: row.boolValue("is_superseded_by_duplicate_connection"),
+                duplicateConnectionResolvedAt: (row["duplicate_connection_resolved_at"] as String?).flatMap(decodeInstant)
             )
         }
     }

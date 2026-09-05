@@ -129,7 +129,16 @@ final class BetterCalendarStore {
     }
 
     /// Mirrored device calendars, in display order.
+    ///
+    /// Spec 3F.3: a superseded connection "must not appear as a separate calendar". It is still a
+    /// row, and still reachable through `duplicateConnectionGroups` — which is where the choice
+    /// can be changed — but it is not one of the user's calendars any more.
     var deviceCalendars: [BetterCalendar] {
+        calendars.filter { $0.connectionMethod == .device && !$0.isSupersededByDuplicateConnection }
+    }
+
+    /// Every mirrored row including superseded ones, for the surfaces that exist to show them.
+    var allDeviceCalendarRows: [BetterCalendar] {
         calendars.filter { $0.connectionMethod == .device }
     }
 
@@ -958,6 +967,37 @@ final class BetterCalendarStore {
     func editRefusal(for event: CalendarEvent) -> CapabilityViolation? {
         EventMutationUseCases.capabilityViolation(writingTo: event.calendarID, creating: false, in: database)
             ?? EventMutationUseCases.recurrenceViolation(editing: event, in: database)
+    }
+
+    // MARK: - Duplicate connections (spec 3.29, Phase 3F)
+
+    /// Spec 3F.2: calendars reachable more than one way, awaiting the user's choice.
+    ///
+    /// Empty for almost every user in Phase 3 — the only reachable case is the same account
+    /// configured twice on the device (spec 3F.4). The mechanism ships now because retrofitting
+    /// it after Phase 5 adds a direct connection would mean migrating live user data.
+    var unresolvedDuplicateConnections: [DuplicateConnectionDetector.DuplicateGroup] {
+        DuplicateConnectionDetector.duplicateGroups(among: calendars)
+    }
+
+    /// The same, plus choices already made — which is what `SRC-CONN-01` lists so one can be
+    /// changed.
+    var allDuplicateConnections: [DuplicateConnectionDetector.DuplicateGroup] {
+        DuplicateConnectionDetector.duplicateGroups(among: calendars, includingResolved: true)
+    }
+
+    /// Spec 3.29/BC-EK-020: record which connection to keep. The others are superseded, never
+    /// deleted — the events, visibility and sort order on a losing row survive, so changing the
+    /// answer restores them.
+    @discardableResult
+    func resolveDuplicateConnection(
+        _ group: DuplicateConnectionDetector.DuplicateGroup,
+        keeping calendarID: UUID,
+        now: Date = .now
+    ) -> Bool {
+        let transaction = DuplicateConnectionDetector.resolution(for: group, keeping: calendarID, now: now)
+        guard !transaction.isEmpty else { return true }
+        return withPersistedMutation(transaction)
     }
 
     // MARK: - Sync status (spec 3D.8, `SRC-STAT-01`)

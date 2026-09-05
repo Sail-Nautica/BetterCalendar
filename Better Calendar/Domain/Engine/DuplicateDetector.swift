@@ -21,6 +21,19 @@ enum DuplicateDetector {
         /// over every other signal: an event whose UID already exists locally is the same event
         /// even if its title or time has since changed underneath it.
         case providerUID
+        /// Spec 3.30 (3F.6): the same underlying event reached two ways.
+        ///
+        /// The insight it encodes is that the *account-level* identifier survives a change of
+        /// transport even when the local one does not. For EventKit that is
+        /// `calendarItemExternalIdentifier`, which for a CalDAV or Google calendar is derived
+        /// from the iCalendar UID — the same string an ICS file carries, and the same string a
+        /// direct connection would see.
+        ///
+        /// This is not only a Phase 5 hypothetical. Phase 1's ICS import writes that UID to
+        /// `providerObjectID` while Phase 3C's mirror writes it to `providerExternalID`, so
+        /// without this reason re-importing an ICS file over mirrored events gives the user two
+        /// of everything — today.
+        case sameEventDifferentTransport
         /// `(calendarID, normalizedTitle, startInstant, endInstant)` within `timeTolerance`. Used
         /// for plain events and recurring masters alike — a master's own `startDate`/`endDate` is
         /// a legitimate single-instant identity, the same as any non-recurring event's.
@@ -45,6 +58,24 @@ enum DuplicateDetector {
             let matches = existingEvents.filter { $0.providerMetadata.providerObjectID == uid }
             if !matches.isEmpty {
                 return matches.map { Candidate(matchedEventID: $0.id, confidence: 1.0, reason: .providerUID) }
+            }
+        }
+
+        // Spec 3.30: the same identifier reached through a different transport. Compared in both
+        // directions because the two sides store it in different fields — an imported ICS event
+        // carries the UID as its object id, a mirrored device event as its external id — and
+        // matching only one way would miss exactly the overlap this exists to catch.
+        let transportKeys = Set([event.providerMetadata.providerObjectID, event.providerMetadata.providerExternalID].compactMap { $0 }.filter { !$0.isEmpty })
+        if !transportKeys.isEmpty {
+            let matches = existingEvents.filter { candidate in
+                let candidateKeys = Set([candidate.providerMetadata.providerObjectID, candidate.providerMetadata.providerExternalID].compactMap { $0 }.filter { !$0.isEmpty })
+                return !candidateKeys.isDisjoint(with: transportKeys)
+            }
+            if !matches.isEmpty {
+                // Spec 2.15's precedence rule generalises: an identifier match is the same event
+                // however much else has since diverged. Still a *candidate* — this returns
+                // confidence, and never merges (BC-EK-021).
+                return matches.map { Candidate(matchedEventID: $0.id, confidence: 1.0, reason: .sameEventDifferentTransport) }
             }
         }
 

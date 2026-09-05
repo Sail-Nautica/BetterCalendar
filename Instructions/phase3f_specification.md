@@ -86,8 +86,10 @@ has no connection to duplicate.
 
 ## 3F.2 Detection
 
-`DuplicateConnectionDetector.candidates(among:sources:)` returns groups of calendar rows that
-share a connection identity, plus the accounts that produced them.
+`DuplicateConnectionDetector` answers this at two levels, and shipped as two functions rather than
+the single `candidates(among:sources:)` this document first named — the two questions have
+different inputs and different answers, and one signature returning both would have to be
+destructured at every call site anyway.
 
 Two levels, because spec 3.29 asks for both:
 
@@ -251,10 +253,14 @@ the user kept both", and not re-prompt for a choice already made.
 
 | Milestone | Contents |
 |---|---|
-| **3F-M1** | Identity, detection, `sources()`, and migration `v024`. No UI, nothing honoured yet. |
-| **3F-M2** | Honouring the choice: mirroring, writing, listing, and the model-layer refusal. |
-| **3F-M3** | `SRC-CONN-01` and its entry points. |
-| **3F-M4** | The cross-provider match reason, the ICS overlap, the Phase 5 migration planner, and the ADR. |
+| **3F-M1** | Identity, detection, `sources()`, and migration `v024`. No UI, nothing honoured yet. **Landed.** |
+| **3F-M2** | Honouring the choice: mirroring, writing, listing, and the model-layer refusal. **Landed.** |
+| **3F-M3** | `SRC-CONN-01` and its entry points. **Landed.** |
+| **3F-M4** | The cross-provider match reason, the ICS overlap, the Phase 5 migration planner, and the ADR. **Landed.** |
+
+Landed as one change rather than four commits: M1 is the only part with a false-positive risk
+worth isolating, and it is pure and fully tested before anything acts on it — the milestones after
+it are consumers of that one decision rather than independent risks. See ADR 0011.
 
 M1 first and alone, on the same reasoning every phase in Phase 3 has used: the detection is where
 a false positive hides a calendar the user still has, and it is entirely testable before anything
@@ -262,7 +268,7 @@ acts on it.
 
 ## 3F.11 Exit criteria
 
-Phase 3F is complete when:
+**Every criterion below is met.** Phase 3F is complete when:
 
 * Two connections to the same underlying calendar are detected, the user is asked which to keep,
   and the answer is stored on the calendar row

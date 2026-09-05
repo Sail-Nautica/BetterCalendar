@@ -341,6 +341,15 @@ final class MigrationTests: XCTestCase {
             XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT MIN(version_number) FROM events"), 1, "event version not backfilled \(context)")
             XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT MIN(version_number) FROM calendars"), 1, "calendar version not backfilled \(context)")
 
+            // v024: a calendar migrated from an older database has never been offered a
+            // duplicate-connection choice, so it is neither superseded nor resolved. Inventing
+            // either would hide a calendar the user still has.
+            XCTAssertEqual(
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM calendars WHERE is_superseded_by_duplicate_connection != 0 OR duplicate_connection_resolved_at IS NOT NULL"),
+                0,
+                "duplicate-connection state invented \(context)"
+            )
+
             // v019: every pre-existing calendar backfills as available, with no timestamp.
             XCTAssertEqual(
                 try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM calendars WHERE is_unavailable != 0 OR unavailable_since IS NOT NULL"),

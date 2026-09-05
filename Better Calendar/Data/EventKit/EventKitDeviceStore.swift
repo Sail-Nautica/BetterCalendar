@@ -217,6 +217,13 @@ struct EventKitDeviceStore: EventKitStore {
         }
     }
 
+    /// Spec 3.2/3F.2. Every account the device has configured, including one with no calendars —
+    /// which `calendars(for:)` cannot report and the duplicate-connection rule needs to see.
+    func sources() throws -> [DeviceCalendarSource] {
+        guard authorizationStatus.canReadDeviceEvents else { return [] }
+        return EKEventStore().sources.map(DeviceCalendarSource.init(_:))
+    }
+
     /// Spec 3.23. Subscribes for as long as the stream is held, which is the lifetime of the app.
     ///
     /// A fresh `EKEventStore` is created and **retained by the observer closure** on purpose:
@@ -660,6 +667,14 @@ private extension DeviceRecurrenceEnd {
 }
 
 private extension DeviceCalendarSource {
+    init(_ source: EKSource) {
+        self.init(
+            identifier: source.sourceIdentifier,
+            title: source.title,
+            type: DeviceCalendarSourceType(source.sourceType)
+        )
+    }
+
     init(_ source: EKSource?) {
         // `EKCalendar.source` is `null_unspecified` in the header. A calendar with no source is
         // not a state EventKit is expected to produce, but it is expressible, and a crash on it

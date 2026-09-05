@@ -104,7 +104,16 @@ enum DeviceEventMirror {
     /// its events cannot be deleted by a pass that did not ask about them, so toggling a calendar
     /// off removes its events from every view without deleting them.
     static func fetchableCalendars(from calendars: [BetterCalendar]) -> [BetterCalendar] {
-        calendars.filter { $0.connectionMethod == .device && $0.isVisible && !$0.isUnavailable }
+        calendars.filter {
+            $0.connectionMethod == .device
+                && $0.isVisible
+                && !$0.isUnavailable
+                // Spec 3F.3: a connection the user switched off contributes no events. Excluding
+                // it here rather than filtering its events later is what also makes its existing
+                // rows safe — the bounded-window rule refuses to delete from a calendar a pass
+                // did not fetch, so they are retained and hidden exactly as spec 3.26 requires.
+                && !$0.isSupersededByDuplicateConnection
+        }
     }
 
     /// Spec 3C.8 step 1: the window a pass covers when the caller does not name one.
