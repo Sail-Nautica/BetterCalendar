@@ -385,6 +385,15 @@ final class MigrationTests: XCTestCase {
                 "write-back columns invented a value \(context)"
             )
 
+            // v022: a mutation written before scoped write-back existed was an ordinary edit, so
+            // it has no scope and no occurrence. Reading back a fabricated `.thisEventOnly` here
+            // would make the planner address an occurrence that does not exist.
+            XCTAssertEqual(
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM pending_mutations WHERE edit_scope IS NOT NULL OR occurrence_date IS NOT NULL"),
+                0,
+                "edit scope invented a value \(context)"
+            )
+
             // Columns with a DEFAULT are populated for every row regardless of when it was
             // written, so these hold at every fixture version.
             let mutation = try Row.fetchOne(db, sql: "SELECT * FROM pending_mutations WHERE id = ?", arguments: [Self.mutationID.uuidString])
