@@ -25,7 +25,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v019_add_calendar_availability",
         "v020_create_event_attendees",
         "v021_extend_pending_mutations_for_write_back",
-        "v022_add_pending_mutation_edit_scope"
+        "v022_add_pending_mutation_edit_scope",
+        "v023_create_calendar_reconciliation_state"
     ]
 
     /// Spec 2.17: a checksum over the migration set, stored alongside the applied migration
@@ -302,6 +303,48 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             return rows.reduce(into: [UUID: String]()) { result, row in
                 guard let id = UUID(uuidString: row["change_journal_entry_id"]), let snapshot: String = row["snapshot_json"] else { return }
                 result[id] = snapshot
+            }
+        }
+    }
+
+    func reconciliationStates() throws -> [UUID: CalendarReconciliationState] {
+        let databaseQueue = try openDatabase()
+        return try databaseQueue.read { db in
+            guard try db.tableExists("calendar_reconciliation_state") else { return [:] }
+            let rows = try Row.fetchAll(db, sql: "SELECT * FROM calendar_reconciliation_state")
+            return rows.reduce(into: [UUID: CalendarReconciliationState]()) { result, row in
+                guard let id = UUID(uuidString: row["calendar_id"]) else { return }
+                result[id] = CalendarReconciliationState(
+                    calendarID: id,
+                    windowStart: decodeInstant(row["window_start"]),
+                    windowEnd: decodeInstant(row["window_end"]),
+                    lastReconciledAt: decodeInstant(row["last_reconciled_at"])
+                )
+            }
+        }
+    }
+
+    func saveReconciliationStates(_ states: [CalendarReconciliationState]) throws {
+        guard !states.isEmpty else { return }
+        let databaseQueue = try openDatabase()
+        try databaseQueue.write { db in
+            for state in states {
+                try db.execute(
+                    sql: """
+                        INSERT INTO calendar_reconciliation_state (calendar_id, window_start, window_end, last_reconciled_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(calendar_id) DO UPDATE SET
+                            window_start = excluded.window_start,
+                            window_end = excluded.window_end,
+                            last_reconciled_at = excluded.last_reconciled_at
+                        """,
+                    arguments: [
+                        state.calendarID.uuidString,
+                        state.windowStart.map(encodeInstant),
+                        state.windowEnd.map(encodeInstant),
+                        state.lastReconciledAt.map(encodeInstant)
+                    ]
+                )
             }
         }
     }
@@ -911,6 +954,19 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         migrator.registerMigration("v022_add_pending_mutation_edit_scope") { db in
             try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN edit_scope TEXT")
             try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN occurrence_date TEXT")
+        }
+
+        // Spec 3E.3/3E.8. Per calendar, because visibility is per calendar: one toggled on this
+        // morning has been reconciled over a different range than one that has been on a week.
+        migrator.registerMigration("v023_create_calendar_reconciliation_state") { db in
+            try db.execute(sql: """
+                CREATE TABLE calendar_reconciliation_state (
+                    calendar_id TEXT PRIMARY KEY NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
+                    window_start TEXT,
+                    window_end TEXT,
+                    last_reconciled_at TEXT
+                )
+                """)
         }
 
         return migrator

@@ -278,3 +278,61 @@ enum DeviceRecurrenceEnd: Hashable {
     case occurrenceCount(Int)
     case endDate(Date)
 }
+
+/// Spec 3E.3: what a calendar's mirror has actually been reconciled over.
+///
+/// The reason this is *state* rather than a computation is the whole of 3E.3. Phase 3C's window
+/// was a fixed span around now, and its deletion rule — a row is deleted only when its own start
+/// lies inside the range that was fetched — was safe because that window never moved. A window
+/// driven by what the user is looking at moves constantly: scroll to next March, fetch a window
+/// around next March, and every mirrored event in this month is suddenly "absent from the fetch".
+///
+/// Recording the range makes that legible. It does **not** widen the permission to delete: that
+/// stays pinned to the range a given pass actually asked for. What it buys is knowing whether a
+/// range has ever been covered, so the next pass can fetch the union of what is newly visible and
+/// what has not been seen.
+struct CalendarReconciliationState: Equatable, Identifiable {
+    var calendarID: UUID
+    /// `nil` until the calendar's first pass.
+    var windowStart: Date?
+    var windowEnd: Date?
+    var lastReconciledAt: Date?
+
+    var id: UUID { calendarID }
+
+    init(calendarID: UUID, windowStart: Date? = nil, windowEnd: Date? = nil, lastReconciledAt: Date? = nil) {
+        self.calendarID = calendarID
+        self.windowStart = windowStart
+        self.windowEnd = windowEnd
+        self.lastReconciledAt = lastReconciledAt
+    }
+
+    var window: DateInterval? {
+        guard let windowStart, let windowEnd, windowStart <= windowEnd else { return nil }
+        return DateInterval(start: windowStart, end: windowEnd)
+    }
+
+    /// The stored window grown to include `newWindow`.
+    ///
+    /// A union rather than a replacement: a calendar reconciled over March and then over
+    /// September has been reconciled over both, and forgetting the first would mean the next
+    /// widening pass re-fetches a range it already holds.
+    func unioned(with newWindow: DateInterval, at date: Date) -> CalendarReconciliationState {
+        guard let existing = window else {
+            return CalendarReconciliationState(calendarID: calendarID, windowStart: newWindow.start, windowEnd: newWindow.end, lastReconciledAt: date)
+        }
+        return CalendarReconciliationState(
+            calendarID: calendarID,
+            windowStart: min(existing.start, newWindow.start),
+            windowEnd: max(existing.end, newWindow.end),
+            lastReconciledAt: date
+        )
+    }
+
+    /// Whether `range` is already inside what this calendar has been reconciled over — the
+    /// question the visible-range trigger asks before deciding a pass is needed at all.
+    func covers(_ range: DateInterval) -> Bool {
+        guard let window else { return false }
+        return window.start <= range.start && window.end >= range.end
+    }
+}

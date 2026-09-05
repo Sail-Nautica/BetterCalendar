@@ -36,6 +36,15 @@ final class BetterCalendarStore {
     /// Counts from the last write-back drain — never content (spec 3.24/3D.8). What
     /// `SRC-STAT-01` reads.
     private(set) var lastWriteBackSummary: DeviceWriteCommitter.Summary?
+    /// Spec 3E.3: what each calendar's mirror has been reconciled over, read once at launch and
+    /// kept current by every pass.
+    private(set) var reconciliationStates: [UUID: CalendarReconciliationState] = [:]
+    /// The visible range a pass still has to cover, set by `visibleRangeDidChange` and folded
+    /// into the next pass's window.
+    private var visibleRangeNeedingMirror: DateInterval?
+    /// How far either side of what the user can see to fetch, so scrolling by a day does not
+    /// cost a pass.
+    static let visibleRangePrefetchMargin: TimeInterval = 30 * 24 * 60 * 60
     /// The window the last event-mirroring pass actually covered. Held so a diagnostics surface
     /// can say what was reconciled rather than implying the whole calendar was — and so Phase 3E
     /// has the value it needs to persist per calendar.
@@ -149,6 +158,10 @@ final class BetterCalendarStore {
         apply(outcome.database)
         occurrenceCache.invalidateAll()
         conflictIndex.rebuild(from: events)
+        // Spec 3E.3. Read here rather than on first use so a pass never has to decide what an
+        // absent value means — an unread table and a genuinely-unreconciled calendar look the
+        // same, and only one of them is safe to widen a window from.
+        reconciliationStates = (try? repository.reconciliationStates()) ?? [:]
         ensureDefaultCalendar()
 
         if outcome.usedFallbackSeed {
@@ -1154,6 +1167,45 @@ final class BetterCalendarStore {
         return committed
     }
 
+    /// Spec 3E.3: the window this pass should cover — the default span around now, grown to
+    /// include whatever the user is currently looking at.
+    ///
+    /// A union rather than a replacement. Fetching *only* the visible range would mean scrolling
+    /// to next March fetched a window around next March, and then every mirrored event in this
+    /// month would be absent from the fetch — which the deletion rule would be entitled to read
+    /// as a mass deletion if it were keyed to anything but the range actually asked for.
+    func mirrorWindow(around date: Date) -> DateInterval {
+        let base = DeviceEventMirror.defaultWindow(around: date)
+        guard let visible = visibleRangeNeedingMirror else { return base }
+        return DateInterval(start: min(base.start, visible.start), end: max(base.end, visible.end))
+    }
+
+    /// Spec 3.23's fourth trigger: the visible date range moving outside the mirrored window.
+    ///
+    /// Called by the calendar screen as the user scrolls. Cheap and idempotent — it does nothing
+    /// at all while the range stays inside what has already been reconciled, which is the common
+    /// case and the reason this can be called on every range change.
+    func visibleRangeDidChange(to range: DateInterval, now: Date = .now) {
+        let padded = DateInterval(
+            start: range.start.addingTimeInterval(-Self.visibleRangePrefetchMargin),
+            end: range.end.addingTimeInterval(Self.visibleRangePrefetchMargin)
+        )
+        guard !mirrorWindow(around: now).contains(padded.start) || !mirrorWindow(around: now).contains(padded.end) else { return }
+        guard needsMirroring(padded) else { return }
+
+        visibleRangeNeedingMirror = padded
+        Task { [weak self] in
+            await self?.reconcileDeviceCalendars(refreshingSources: false, now: now)
+        }
+    }
+
+    /// Whether any fetchable calendar has *not* already been reconciled over `range`.
+    private func needsMirroring(_ range: DateInterval) -> Bool {
+        DeviceEventMirror.fetchableCalendars(from: calendars).contains { calendar in
+            !(reconciliationStates[calendar.id]?.covers(range) ?? false)
+        }
+    }
+
     /// Spec 3C.8: mirrors the device's events for one bounded window into local rows, through
     /// `DeviceEventMirror`.
     ///
@@ -1175,7 +1227,7 @@ final class BetterCalendarStore {
         let fetchable = DeviceEventMirror.fetchableCalendars(from: calendars)
         guard !fetchable.isEmpty else { return true }
 
-        let window = requestedWindow ?? DeviceEventMirror.defaultWindow(around: now)
+        let window = requestedWindow ?? mirrorWindow(around: now)
         let identifiers = Set(fetchable.compactMap(\.providerCalendarID))
         guard !identifiers.isEmpty else { return true }
 
@@ -1206,6 +1258,20 @@ final class BetterCalendarStore {
 
         lastEventMirrorSummary = plan.summary
         lastEventMirrorWindow = window
+
+        // Spec 3E.3: record what was actually fetched, per calendar. This does **not** widen the
+        // permission to delete — that stays pinned to the range this pass asked for, which is
+        // `window` and is what the planner was given. It records that the range has now been
+        // covered, so a later pass can fetch the union of what is newly visible and what has not
+        // been seen instead of re-fetching from scratch.
+        let existingStates = (try? repository.reconciliationStates()) ?? [:]
+        let updatedStates = fetchable.map { calendar in
+            (existingStates[calendar.id] ?? CalendarReconciliationState(calendarID: calendar.id))
+                .unioned(with: window, at: now)
+        }
+        try? repository.saveReconciliationStates(updatedStates)
+        reconciliationStates = Dictionary(uniqueKeysWithValues: updatedStates.map { ($0.calendarID, $0) })
+            .merging(existingStates) { updated, _ in updated }
         guard !plan.isEmpty else { return true }
 
         // The same atomic path a user edit takes — and, like discovery, carrying no outbox row:
@@ -1836,11 +1902,22 @@ protocol LocalCalendarRepository {
     /// field looked like when the edit was made — and the local row no longer says, because the
     /// edit itself changed it.
     func eventVersionSnapshots(forJournalEntryIDs entryIDs: Set<UUID>) throws -> [UUID: String]
+
+    /// Spec 3E.3: what each calendar's mirror has been reconciled over.
+    ///
+    /// Durable bookkeeping about the mirror rather than part of what the UI shows, so it lives
+    /// here beside the journal rather than in `LocalCalendarDatabase`.
+    func reconciliationStates() throws -> [UUID: CalendarReconciliationState]
+    func saveReconciliationStates(_ states: [CalendarReconciliationState]) throws
 }
 
 extension LocalCalendarRepository {
     func changeJournalFieldDiffs(forEntryIDs entryIDs: Set<UUID>) throws -> [UUID: String] { [:] }
     func eventVersionSnapshots(forJournalEntryIDs entryIDs: Set<UUID>) throws -> [UUID: String] { [:] }
+    /// A repository with no reconciliation table reports nothing reconciled, which makes every
+    /// pass behave exactly as it did in Phase 3C — a fixed window, and no widening.
+    func reconciliationStates() throws -> [UUID: CalendarReconciliationState] { [:] }
+    func saveReconciliationStates(_ states: [CalendarReconciliationState]) throws {}
 }
 
 struct RepositoryDiagnostics: Equatable {

@@ -394,6 +394,15 @@ final class MigrationTests: XCTestCase {
                 "edit scope invented a value \(context)"
             )
 
+            // v023: the table exists and is empty. A calendar migrated from an older database has
+            // never been reconciled, and inventing a covered window for one would let the first
+            // pass widen from a range it had not actually fetched.
+            XCTAssertEqual(
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM calendar_reconciliation_state"),
+                0,
+                "reconciliation state invented \(context)"
+            )
+
             // Columns with a DEFAULT are populated for every row regardless of when it was
             // written, so these hold at every fixture version.
             let mutation = try Row.fetchOne(db, sql: "SELECT * FROM pending_mutations WHERE id = ?", arguments: [Self.mutationID.uuidString])

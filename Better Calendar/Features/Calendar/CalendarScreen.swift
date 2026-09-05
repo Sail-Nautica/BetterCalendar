@@ -111,6 +111,12 @@ struct CalendarScreen: View {
             .onChange(of: editingEvent == nil) { _, isClosed in
                 if isClosed { futureSplitOccurrenceStart = nil }
             }
+            // Spec 3.23's fourth trigger: the visible date range moving outside the mirrored
+            // window. Called on every change of the selected date because it costs nothing while
+            // the range stays inside what has already been reconciled, which is almost always.
+            .onChange(of: selectedDate) { _, newDate in
+                store.visibleRangeDidChange(to: Self.mirrorRange(around: newDate))
+            }
             .sheet(item: $editingEvent) { event in
                 editor(for: event, startDate: event.startDate)
             }
@@ -182,6 +188,17 @@ struct CalendarScreen: View {
         }
 
         return "\(interval.start.formatted(.dateTime.month(.abbreviated).day())) – \(endDate.formatted(.dateTime.month(.abbreviated).day().year()))"
+    }
+
+    /// A month either side of what the user is looking at — enough that paging by a month lands
+    /// on already-mirrored events rather than on a fetch.
+    static func mirrorRange(around date: Date) -> DateInterval {
+        let calendar = Calendar.current
+        let month = calendar.dateInterval(of: .month, for: date) ?? DateInterval(start: date, end: date)
+        return DateInterval(
+            start: calendar.date(byAdding: .month, value: -1, to: month.start) ?? month.start,
+            end: calendar.date(byAdding: .month, value: 1, to: month.end) ?? month.end
+        )
     }
 
     private var selectedDateOccurrences: [CalendarOccurrence] {
