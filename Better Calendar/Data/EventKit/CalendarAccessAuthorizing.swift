@@ -116,6 +116,22 @@ protocol EventKitStore: CalendarAccessAuthorizing {
 
     /// Spec 3.19: remove an event, with the span that says how much of a series goes with it.
     func remove(identifier: String, span: DeviceEventSpan) async throws
+
+    /// Spec 3.23: `EKEventStoreChanged`, as a stream.
+    ///
+    /// The notification carries no payload — it means "something changed, re-query", never "this
+    /// event changed" — so an element of this stream is a signal to run a pass, not a description
+    /// of what to do. Exposed through the seam rather than read from `NotificationCenter` at the
+    /// call site so a test can post one and prove the wiring with no device (BC-EK-024).
+    func changeObservations() -> AsyncStream<Void>
+
+    /// Spec 3.23: ask the device to pull from its servers rather than only reporting what it
+    /// already holds.
+    ///
+    /// Triggers network activity, so it is **not** run on every pass — only on a foreground and
+    /// on an explicit user refresh. A pass reacting to `EKEventStoreChanged` never calls it: that
+    /// notification is by definition the device telling us about something it already knows.
+    func refreshSources() async
 }
 
 /// What the device reports about its calendars at one moment.
@@ -152,6 +168,9 @@ final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
     /// not the answer.
     private(set) var lastRequestedRange: DateInterval?
     private(set) var lastRequestedCalendarIdentifiers: Set<String> = []
+    private var concurrentEventFetches = 0
+    /// The most passes that were ever inside `events(in:)` at once. Must never exceed 1.
+    private(set) var peakConcurrentEventFetches = 0
 
     init(
         status: CalendarAccessStatus = .fullAccess,
@@ -179,6 +198,16 @@ final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
         eventFetchCount += 1
         lastRequestedRange = range
         lastRequestedCalendarIdentifiers = calendarIdentifiers
+
+        // Spec 3.23's "never run two passes concurrently", made observable. The suspension is
+        // what gives a broken guard the chance to fail: without it every pass would complete
+        // inside one actor hop and overlap would be impossible to produce, so a test asserting
+        // the invariant would pass whether or not the guard existed.
+        concurrentEventFetches += 1
+        peakConcurrentEventFetches = max(peakConcurrentEventFetches, concurrentEventFetches)
+        await Task.yield()
+        defer { concurrentEventFetches -= 1 }
+
         if let eventFetchError {
             throw eventFetchError
         }
@@ -204,6 +233,35 @@ final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
     /// Someone created, edited or deleted an event in Apple Calendar between passes.
     func simulateDeviceEventChange(to events: [DeviceEvent]) {
         deviceEvents = events
+    }
+
+    // MARK: - Phase 3E: change observation
+
+    private var changeContinuations: [UUID: AsyncStream<Void>.Continuation] = [:]
+    private(set) var refreshSourcesCount = 0
+
+    func changeObservations() -> AsyncStream<Void> {
+        AsyncStream { continuation in
+            let id = UUID()
+            changeContinuations[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.changeContinuations[id] = nil }
+            }
+        }
+    }
+
+    func refreshSources() async {
+        refreshSourcesCount += 1
+    }
+
+    /// The device telling us something changed — one `EKEventStoreChanged`. Post several in a row
+    /// to model the burst an account sync produces, which is the case coalescing exists for.
+    func simulateExternalChangeNotification(count: Int = 1) {
+        for _ in 0..<count {
+            for continuation in changeContinuations.values {
+                continuation.yield(())
+            }
+        }
     }
 
     // MARK: - Phase 3D: writes

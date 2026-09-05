@@ -68,7 +68,10 @@ struct AppRootView: View {
             // here rather than in `load()` — launch itself touches nothing from EventKit. Spec
             // 3C.8: the event-mirroring pass rides the same trigger, after the calendars it needs
             // to attach events to exist.
-            await store.refreshDeviceCalendars()
+            // Spec 3.23: subscribed for the lifetime of the app, from here rather than from
+            // `load()` — launch still touches nothing from EventKit.
+            store.observeDeviceCalendarChanges()
+            await store.reconcileDeviceCalendars(refreshingSources: true)
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
@@ -80,7 +83,10 @@ struct AppRootView: View {
                 // explicit discovery triggers — an unchanged device costs one comparison.
                 // Spec 3.27: the event fetch that follows it runs off the main thread, so a
                 // foreground never blocks the first frame on reconciliation.
-                Task { await store.refreshDeviceCalendars() }
+                // Spec 3.23: a foreground is one of the two places `refreshSourcesIfNecessary`
+                // earns its network cost — the user has come back and wants to see the truth,
+                // rather than what the device happened to have cached.
+                Task { await store.reconcileDeviceCalendars(refreshingSources: true) }
             }
         }
         .onChange(of: selectedTab) { _, newTab in

@@ -1,6 +1,13 @@
 import Foundation
 import Observation
 
+/// Spec 3.23 requires that two reconciliation passes never run concurrently, and a guard flag can
+/// only promise that on an isolated type — otherwise a second pass can begin during the first
+/// one's `await` and both will diff against a database the other is writing.
+///
+/// Making that isolation explicit costs nothing: every caller is already a SwiftUI view or a
+/// main-actor test, and it was only ever implicit.
+@MainActor
 @Observable
 final class BetterCalendarStore {
     private(set) var calendars: [BetterCalendar] = []
@@ -52,6 +59,21 @@ final class BetterCalendarStore {
     /// maintained state that mirrors `events`, not a lazily-recomputed memoisation, so a rolled
     /// back mutation must never touch it).
     private let conflictIndex = ConflictIndex()
+    /// Spec 3.23. Held for the lifetime of the app; cancelled only by `stopObserving…`.
+    private var changeObservationTask: Task<Void, Never>?
+    private var coalescingTask: Task<Void, Never>?
+    /// Spec 3.23's "never run two passes concurrently".
+    private var isReconciling = false
+    private var hasPendingReconciliation = false
+    /// Checked when a notification arrives rather than relied on through task cancellation: an
+    /// `AsyncStream` element already buffered when the task is cancelled would still be
+    /// delivered, and "stopped observing" has to mean stopped.
+    private var isObservingDeviceChanges = false
+
+    /// How long a burst of `EKEventStoreChanged` notifications is allowed to keep resetting the
+    /// timer before a pass runs. Long enough to absorb an account sync's burst, short enough that
+    /// a change made in Apple Calendar shows up while the user is still looking for it.
+    static let changeCoalescingInterval: TimeInterval = 1.0
 
     init(
         repository: LocalCalendarRepository = SQLiteCalendarRepository(),
@@ -640,6 +662,17 @@ final class BetterCalendarStore {
             .count
     }
 
+    /// Spec 3.23: turning a device calendar on is a reconciliation trigger — its events have
+    /// never been fetched, and waiting for the next foreground to show them is a worse answer
+    /// than a pass that costs one fetch. Turning one off deletes nothing: the planner already
+    /// refuses to delete from a calendar it did not fetch (spec 3C.8).
+    private func reconcileAfterVisibilityChange(_ calendar: BetterCalendar) {
+        guard calendar.connectionMethod == .device else { return }
+        Task { [weak self] in
+            await self?.reconcileDeviceCalendars(refreshingSources: false)
+        }
+    }
+
     func toggleCalendarVisibility(_ calendar: BetterCalendar) {
         guard let index = calendars.firstIndex(where: { $0.id == calendar.id }) else { return }
 
@@ -648,7 +681,13 @@ final class BetterCalendarStore {
         updated.updatedAt = .now
         updated.versionNumber += 1
 
-        _ = performCalendarTransaction(changes: [.upsertCalendar(updated)], journalEntityID: calendar.id, journalOperation: .update, outboxOperation: .update)
+        let didSave = performCalendarTransaction(changes: [.upsertCalendar(updated)], journalEntityID: calendar.id, journalOperation: .update, outboxOperation: .update)
+
+        // Spec 3.23's calendar-selection trigger. Only on the way *on*: turning one off has
+        // nothing to fetch, and the pass that follows would be a no-op.
+        if didSave, updated.isVisible {
+            reconcileAfterVisibilityChange(updated)
+        }
     }
 
     func deleteCalendar(_ calendar: BetterCalendar, moveEventsTo replacementID: UUID?) {
@@ -957,6 +996,87 @@ final class BetterCalendarStore {
     }
 
     // MARK: - Device event mirroring (spec 3C.8, Phase 3C)
+
+    // MARK: - Change observation (spec 3.23, Phase 3E)
+
+    /// Spec 3.23: start listening for `EKEventStoreChanged` for the lifetime of the app.
+    ///
+    /// Called once, from the root view's `task`. Not from `load()` — launch still touches nothing
+    /// from EventKit, which has been the rule since Phase 3A.
+    func observeDeviceCalendarChanges() {
+        guard changeObservationTask == nil else { return }
+        isObservingDeviceChanges = true
+
+        // Subscribed *here*, synchronously, rather than inside the task below. A stream created
+        // on the task's first scheduling would miss any change that arrived between this call
+        // and that scheduling — which is exactly the window an app finishing launch sits in.
+        let stream = eventKitStore.changeObservations()
+        changeObservationTask = Task { [weak self] in
+            for await _ in stream {
+                guard let self else { return }
+                self.deviceChangeDidArrive()
+            }
+        }
+    }
+
+    func stopObservingDeviceCalendarChanges() {
+        isObservingDeviceChanges = false
+        changeObservationTask?.cancel()
+        changeObservationTask = nil
+        coalescingTask?.cancel()
+        coalescingTask = nil
+    }
+
+    /// Spec 3.23's coalescing rule, and the reason it is not optional.
+    ///
+    /// `EKEventStoreChanged` arrives in bursts during an account sync — a dozen in a second is
+    /// ordinary — and each one means only "re-query". Running a pass per notification would spend
+    /// a dozen device fetches to answer one question, so a burst is debounced into one pass.
+    ///
+    /// A notification that arrives *during* a pass schedules exactly one more, never one per
+    /// notification: two passes running at once would each diff against a database the other is
+    /// writing, and the loser would compute its deletions from a window the winner had already
+    /// changed.
+    private func deviceChangeDidArrive() {
+        guard isObservingDeviceChanges else { return }
+        coalescingTask?.cancel()
+        coalescingTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.changeCoalescingInterval))
+            guard !Task.isCancelled, let self else { return }
+            self.coalescingTask = nil
+            // Spec 3.23: a change notification is the device reporting something it already
+            // knows, so this pass does not ask it to go to the network.
+            await self.reconcileDeviceCalendars(refreshingSources: false)
+        }
+    }
+
+    /// One pass, and never two at once.
+    ///
+    /// The re-entrancy guard is a stored flag rather than an actor because every caller is
+    /// already on this store's actor; what has to be prevented is not concurrent *threads* but a
+    /// second pass starting during the first one's `await`.
+    @discardableResult
+    func reconcileDeviceCalendars(refreshingSources: Bool, now: Date = .now) async -> Bool {
+        guard !isReconciling else {
+            // Spec 3.23: exactly one more, not one per caller.
+            hasPendingReconciliation = true
+            return true
+        }
+
+        isReconciling = true
+        defer { isReconciling = false }
+
+        if refreshingSources {
+            await eventKitStore.refreshSources()
+        }
+        await refreshDeviceCalendars(now: now)
+
+        if hasPendingReconciliation {
+            hasPendingReconciliation = false
+            await refreshDeviceCalendars(now: now)
+        }
+        return true
+    }
 
     /// Spec 3B.0/3C.0/3D.2: one pass over everything the device owes us and everything we owe
     /// the device, on the triggers Phase 3B established — a foreground transition, a fresh grant,

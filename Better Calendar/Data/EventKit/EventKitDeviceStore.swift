@@ -217,6 +217,42 @@ struct EventKitDeviceStore: EventKitStore {
         }
     }
 
+    /// Spec 3.23. Subscribes for as long as the stream is held, which is the lifetime of the app.
+    ///
+    /// A fresh `EKEventStore` is created and **retained by the observer closure** on purpose:
+    /// EventKit posts `EKEventStoreChanged` from the store instance, so a store that is released
+    /// stops notifying, and a subscription that silently stops is worse than none — the app would
+    /// look up to date while drifting.
+    func changeObservations() -> AsyncStream<Void> {
+        AsyncStream { continuation in
+            let eventStore = EKEventStore()
+            let observer = NotificationCenter.default.addObserver(
+                forName: .EKEventStoreChanged,
+                object: eventStore,
+                queue: nil
+            ) { _ in
+                continuation.yield(())
+            }
+
+            continuation.onTermination = { _ in
+                NotificationCenter.default.removeObserver(observer)
+                // Referenced here so the store outlives the subscription rather than the
+                // notification it was registered for.
+                _ = eventStore
+            }
+        }
+    }
+
+    func refreshSources() async {
+        guard authorizationStatus.canReadDeviceEvents else { return }
+
+        await Task.detached(priority: .utility) {
+            // Network-triggering, which is why spec 3.23 restricts where this is called from
+            // rather than folding it into every pass.
+            EKEventStore().refreshSourcesIfNecessary()
+        }.value
+    }
+
     func remove(identifier: String, span: DeviceEventSpan) async throws {
         guard authorizationStatus.canCreateDeviceEvents else { throw DeviceWriteFailure.permission }
 
