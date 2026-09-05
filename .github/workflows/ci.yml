@@ -5,10 +5,9 @@ on:
   push:
     branches: [main]
   schedule:
-    # 09:00 UTC nightly — spec 2.20's full 1,000-cycle crash/forced-retry stress loops
-    # (CrashRecoveryStressTests) run only here, behind BC_STRESS=1. The PR/push gates below
-    # run a 50-cycle smoke variant of the same tests instead: 2,000 full cycles on every PR
-    # would dominate CI time for no added signal (see Tests/MyAppTests/CrashRecoveryStressTests.swift).
+    # 09:00 UTC nightly — the full-cycle stress loops (spec 2.20 and spec 3J) run only here.
+    # The PR/push gates run smoke variants instead: several thousand full cycles on every PR
+    # would dominate CI time for no added signal.
     - cron: '0 9 * * *'
 
 jobs:
@@ -21,7 +20,9 @@ jobs:
       - name: xcodebuild test (macOS)
         run: |
           xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp \
-            -destination 'platform=macOS,arch=arm64' test
+            -destination 'platform=macOS,arch=arm64' \
+            -skip-testing:MyAppTests/DeviceWriteFullStressTests \
+            test
 
   platform-gate:
     name: iOS Simulator test
@@ -32,7 +33,9 @@ jobs:
       - name: xcodebuild test (iOS Simulator)
         run: |
           xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp \
-            -destination 'platform=iOS Simulator,name=iPhone 16' test
+            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -skip-testing:MyAppTests/DeviceWriteFullStressTests \
+            test
 
   nightly-stress:
     name: Nightly stress suite
@@ -41,7 +44,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: xcodebuild test (BC_STRESS=1)
+      # Spec 3J's full loops are selected by name, not by an environment variable, because
+      # xcodebuild does not forward its own environment to the macOS test runner — see the
+      # doc comment on `DeviceWriteStressTests`.
+      - name: xcodebuild test (full write-back stress loops)
+        run: |
+          xcodebuild -project "Better Calendar.xcodeproj" -scheme MyApp \
+            -destination 'platform=macOS,arch=arm64' \
+            -only-testing:MyAppTests/DeviceWriteFullStressTests \
+            test
+
+      # Spec 2.20's loops still read `BC_STRESS` from `ProcessInfo`, which this does not
+      # actually deliver: the variable never reaches the test process, so these run their
+      # 50-cycle smoke variant despite the name. Left as-is rather than quietly changed —
+      # converting them to the by-name selection above is its own change, with its own
+      # decision about what the nightly should cost.
+      - name: xcodebuild test (whole suite)
         env:
           BC_STRESS: "1"
         run: |

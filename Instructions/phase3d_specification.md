@@ -120,9 +120,13 @@ The `validate` closure stays exactly the shape Phase 2 gave it. It becomes a loo
 already-computed dictionary rather than a source of truth, which is why `decide` stays pure and
 `LaunchRecovery` stays synchronous.
 
-`MutationProcessorActor` is where phases 1–3 are driven together, off the main thread. Launch does
-**not** call it: launch reconciles the outbox without provider I/O (device rows defer, per 3D.1),
-and the store kicks the actor shortly afterwards.
+**Correction (as built).** Phases 1–3 are driven from `BetterCalendarStore.drainDeviceWrites`, not
+from `MutationProcessorActor`. The actor loads and writes through the repository directly, behind
+the store's back, so a receipt written that way leaves `events` stale and the user keeps seeing an
+event marked pending after it synced. The property the actor exists to protect — that launch is not
+blocked on EventKit — is supplied by the seam itself being `async` and by nothing calling the drain
+from `load()`. `MutationProcessor.decide` stays pure and synchronous, which is the constraint that
+actually mattered. See ADR 0009, Decision 1.
 
 ### The receipt
 
@@ -177,6 +181,8 @@ So an update is:
    diff computed at write time against a possibly-stale local copy. It is the **change journal's
    `FieldDiff`**, which the outbox row already points at through `changeJournalEntryID`. The
    journal has recorded exactly this since Phase 2 §2.8; this is the first consumer that needs it.
+   A mutation with no journal entry, or an entry with no diff, falls back to writing every
+   modelled field — the pre-journal shape, still correct, just less surgical.
 4. **Save** with the correct span (3D.5).
 
 Fields Better Calendar does not model are never written. They are not ours to write, and the
@@ -384,10 +390,14 @@ fetch and the save.
 
 | Milestone | Contents |
 |---|---|
-| **3D-M1** | The deferral rule and the safety it buys: `decide` refuses to retire a device-calendar mutation without a provider result; launch does no provider I/O; `MutationStatus.parked`; migration `v021`. No writer yet. |
-| **3D-M2** | The adapter: `EventKitStore.save`/`remove`, the writable fake, `DeviceWritePlanner`, `DeviceMutationAdapter`, create with crash-idempotency, delete. |
-| **3D-M3** | Update as a patch, the failure taxonomy, optimistic concurrency, and un-parking. |
-| **3D-M4** | Recurrence scopes and the third button; `SRC-STAT-01`; the mirror's identifier-first matching; the stress loops; ADR. |
+| **3D-M1** | The deferral rule and the safety it buys: `decide` refuses to retire a device-calendar mutation without a provider result; launch does no provider I/O; `MutationStatus.parked`; migration `v021`. No writer yet. **Landed.** |
+| **3D-M2** | The adapter: `EventKitStore.save`/`remove`, the writable fake, `DeviceWritePlanner`, `DeviceMutationAdapter`, create with crash-idempotency, delete. **Landed.** |
+| **3D-M3** | Update as a patch, the failure taxonomy, optimistic concurrency, and un-parking. **Landed.** |
+| **3D-M4** | Recurrence scopes and the third button; `SRC-STAT-01`; the mirror's identifier-first matching; the stress loops; ADR. **Landed.** |
+
+Migration `v022` was not anticipated by 3D.10 and is required by 3D.5: the scope of an edit has to
+be recorded on the outbox row, because nothing in the local transaction a scope edit produces
+distinguishes it from an ordinary create or update. See ADR 0009, Decision 5.
 
 M1 is the whole of the *safety*, and it is the part that fixes a defect that exists today, so it
 lands first and alone — the same order Phase 2 used for the outbox, the prerequisites used for
@@ -396,7 +406,7 @@ pipeline that is already refusing to lie about what it has done.
 
 ## 3D.13 Exit criteria
 
-Phase 3D is complete when:
+**Every criterion below is met.** Phase 3D is complete when:
 
 * An event created in Better Calendar on a device calendar appears in Apple Calendar, and one
   edited or deleted there is edited or deleted in Apple Calendar

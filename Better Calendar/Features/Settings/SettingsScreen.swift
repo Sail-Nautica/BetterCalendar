@@ -23,6 +23,15 @@ struct SettingsScreen: View {
         store.pendingMutations.filter { $0.status == .failed }.count
     }
 
+    /// A one-word answer on the Settings row itself, so a stuck queue is visible without
+    /// opening the screen that explains it.
+    private var syncStatusSummary: String {
+        let stuck = store.outboxRowsNeedingAttention.count
+        if stuck > 0 { return "\(stuck) need\(stuck == 1 ? "s" : "") attention" }
+        let waiting = (store.outboxDepthByStatus[.pending] ?? 0) + (store.outboxDepthByStatus[.inFlight] ?? 0)
+        return waiting > 0 ? "\(waiting) waiting" : "Up to date"
+    }
+
     private var repositoryDiagnostics: RepositoryDiagnostics {
         store.repositoryDiagnostics()
     }
@@ -116,6 +125,17 @@ struct SettingsScreen: View {
                         ForEach(Self.snapIntervalOptions, id: \.self) { minutes in
                             Text("\(minutes) min").tag(minutes)
                         }
+                    }
+                }
+
+                // Spec 3D.8: `SRC-STAT-01`. Outside `#if DEBUG`, unlike the diagnostics section
+                // below — spec 3.21 requires a failed or conflicted change stay findable by the
+                // user whose change it was, not only by whoever is holding a debug build.
+                Section("Sync") {
+                    NavigationLink {
+                        SyncStatusScreen(store: store)
+                    } label: {
+                        LabeledContent("Sync Status", value: syncStatusSummary)
                     }
                 }
 

@@ -908,6 +908,54 @@ final class BetterCalendarStore {
             ?? EventMutationUseCases.recurrenceViolation(editing: event, in: database)
     }
 
+    // MARK: - Sync status (spec 3D.8, `SRC-STAT-01`)
+
+    /// Spec 3.21: a failed mutation must remain user-visible, and a conflict the user dismissed
+    /// by accident must stay findable. These are what `SRC-STAT-01` reads.
+    var outboxRowsNeedingAttention: [PendingMutation] {
+        pendingMutations
+            .filter { $0.status == .failed || $0.status == .conflicted || $0.status == .parked }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    var outboxDepthByStatus: [MutationStatus: Int] {
+        Dictionary(grouping: pendingMutations, by: \.status).mapValues(\.count)
+    }
+
+    /// The event a stuck mutation is about, for a surface that has to name it.
+    ///
+    /// Falls back to the outbox payload once the row is gone — a failed *delete* has no event
+    /// left to look up, and "some event you deleted" is not something a user can act on.
+    func eventTitle(forMutation mutation: PendingMutation) -> String {
+        if let event = events.first(where: { $0.id == mutation.objectID }) {
+            return event.displayTitle
+        }
+        if let payload = mutation.payload, let decoded = CalendarEvent(snapshotJSON: payload) {
+            return decoded.displayTitle
+        }
+        return CalendarEvent.untitledPlaceholder
+    }
+
+    /// Spec 3.21/3D.8's "try again". Puts a stuck row back in the queue, by the user's explicit
+    /// choice rather than by a schedule.
+    ///
+    /// `createdAt` is reset because it is the anchor `RetryPolicy` measures its 24-hour ceiling
+    /// from, and that ceiling exists to stop *unattended* retrying against a wall. A user asking
+    /// for another attempt is not that: without the reset, a row that failed two days ago would
+    /// be refused before it was tried, and the button would appear to do nothing.
+    @discardableResult
+    func retryMutation(_ mutation: PendingMutation, now: Date = .now) -> Bool {
+        guard let stored = pendingMutations.first(where: { $0.id == mutation.id }) else { return false }
+
+        var retried = stored
+        retried.status = .pending
+        retried.attemptCount = 0
+        retried.nextRetryAt = nil
+        retried.failureClass = nil
+        retried.createdAt = now
+        return withPersistedMutation(EngineTransaction(outboxRows: [retried]))
+    }
+
     // MARK: - Device event mirroring (spec 3C.8, Phase 3C)
 
     /// Spec 3B.0/3C.0/3D.2: one pass over everything the device owes us and everything we owe
