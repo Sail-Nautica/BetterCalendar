@@ -57,7 +57,7 @@ released schema version.
 | **3C — Reading events** | 3.11–3.17 | **Done.** Specified in `Instructions/phase3c_specification.md`; see ADR 0008, ADR 0002's Phase 3C amendment, and `DeviceEventMappingTests` / `DeviceEventMirrorTests` / `DeviceEventStoreTests` / `DeviceEventPersistenceTests`. Delivers BC-EK-006, BC-EK-012, BC-EK-013, BC-EK-016 and BC-EK-018 in full, completes BC-EK-003, and delivers the preservation half of BC-EK-017. Nothing in it writes to EventKit |
 | **3D — Writing back** | 3.18–3.22 | **Done.** Specified in `Instructions/phase3d_specification.md`; see ADR 0009 and `DeviceWriteBackTests` / `DeviceWriteAdapterTests` / `DeviceWriteStressTests`. Delivers BC-EK-007, BC-EK-008, BC-EK-009, BC-EK-014 and BC-EK-015 in full, completes BC-EK-010 and BC-EK-017, and delivers the detection half of BC-EK-011 |
 | **3E — Change detection** | 3.23–3.27 | **Done.** Specified in `Instructions/phase3e_specification.md`; see ADR 0010 and `DeviceChangeObservationTests` / `ReconciliationWindowTests` / `ConflictResolutionTests`. Completes BC-EK-006 and BC-EK-011, and reinforces BC-EK-012 |
-| 3F — Duplicate connections | 3.28–3.30 | Not started |
+| 3F — Duplicate connections | 3.28–3.30 | In progress. Specified in `Instructions/phase3f_specification.md` |
 | 3G — Reminders | 3.31–3.32 | Not started |
 
 ---
