@@ -104,7 +104,16 @@ final class DeviceEventStoreTests: XCTestCase {
         await store.refreshDeviceCalendars(now: DeviceTestData.now)
 
         eventKit.simulateDeviceEventChange(to: Self.deviceEvents + [
-            DeviceTestData.event(identifier: "evt-new", title: "Dentist", startDate: TestData.date("2026-09-15T13:00:00Z"), endDate: TestData.date("2026-09-15T14:00:00Z"))
+            // Its own external identifier: that value is the cross-device identity of *one*
+            // event (spec 3C.1), and the mirror matches on it, so two fixtures sharing one would
+            // be describing the same event twice rather than two events.
+            DeviceTestData.event(
+                identifier: "evt-new",
+                externalIdentifier: "ext-new",
+                title: "Dentist",
+                startDate: TestData.date("2026-09-15T13:00:00Z"),
+                endDate: TestData.date("2026-09-15T14:00:00Z")
+            )
         ])
         await store.mirrorDeviceEvents(now: DeviceTestData.now)
 

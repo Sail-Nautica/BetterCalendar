@@ -11,6 +11,10 @@ struct AgendaScreen: View {
 
     @State private var selectedOccurrence: CalendarOccurrence?
     @State private var editingEvent: CalendarEvent?
+    /// Spec 3D.5: set when the user picks "This and Future Events", and read by the editor's
+    /// draft so the save applies the split at that occurrence instead of editing the master
+    /// outright. Cleared whenever the editor closes, so it cannot leak into the next edit.
+    @State private var futureSplitOccurrenceStart: Date?
     @State private var isAddingEvent = false
     @State private var futureHorizon = Date.now.addingTimeInterval(AgendaScreen.initialFutureWindow)
 
@@ -90,11 +94,14 @@ struct AgendaScreen: View {
                 .sheet(item: $editingEvent) { event in
                     EventEditorView(
                         calendars: store.calendars,
-                        draft: EventDraft(event: event),
+                        draft: scopedDraft(for: event),
                         event: event,
                         onSave: store.saveEvent,
                         onDelete: store.deleteEvent
                     )
+                }
+                .onChange(of: editingEvent == nil) { _, isClosed in
+                    if isClosed { futureSplitOccurrenceStart = nil }
                 }
                 .sheet(item: $selectedOccurrence) { occurrence in
                     EventDetailsView(
@@ -108,6 +115,11 @@ struct AgendaScreen: View {
                         onEditOccurrence: { occurrence in
                             selectedOccurrence = nil
                             editingEvent = store.eventForEditingOccurrence(occurrence)
+                        },
+                        onEditFuture: { occurrence in
+                            selectedOccurrence = nil
+                            futureSplitOccurrenceStart = occurrence.occurrenceStartDate
+                            editingEvent = occurrence.event
                         },
                         onDelete: store.deleteEvent,
                         onDeleteOccurrence: store.deleteOccurrence,
@@ -185,6 +197,14 @@ struct AgendaScreen: View {
 
     private func calendar(for event: CalendarEvent) -> BetterCalendar? {
         store.calendars.first { $0.id == event.calendarID }
+    }
+
+    /// Spec 3D.5: carries the "This and Future" choice from the confirmation dialog into the
+    /// draft, so the save applies a split at that occurrence rather than editing the master.
+    private func scopedDraft(for event: CalendarEvent) -> EventDraft {
+        var draft = EventDraft(event: event)
+        draft.scopedSplitOccurrenceStart = futureSplitOccurrenceStart
+        return draft
     }
 }
 

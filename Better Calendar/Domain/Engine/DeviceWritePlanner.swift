@@ -43,16 +43,47 @@ enum DeviceWritePlanner {
         }
     }
 
+    /// Whether this write addresses one occurrence of a series — the writes spec 3D.5 requires
+    /// be followed by a re-mirror.
+    static func addressesAnOccurrence(_ write: PlannedWrite) -> Bool {
+        switch write.operation {
+        case .create(let request, _), .update(let request): request.occurrenceDate != nil
+        case .delete: false
+        }
+    }
+
     /// Rows that are due, target a device calendar, and can be resolved into an operation.
     ///
     /// A row this returns is one the adapter will attempt. A row it *skips* is left exactly as it
     /// is — `MutationProcessor`'s default validator will defer it again on the next pass, which
     /// is the conservative outcome and never a claim that anything was written.
+    /// What a pass intends to do. `writes` reach the device; `locallyRetired` do not, and must
+    /// still be closed out — an outbox row nobody will ever process is a queue that never drains
+    /// and a diagnostics surface that never stops saying "pending".
+    struct Plan: Equatable {
+        var writes: [PlannedWrite] = []
+        var locallyRetired: [UUID] = []
+
+        var isEmpty: Bool { writes.isEmpty && locallyRetired.isEmpty }
+    }
+
     static func plan(
         database: LocalCalendarDatabase,
         fieldDiffs: [UUID: String] = [:],
         baseSnapshots: [UUID: String] = [:],
         now: Date
+    ) -> Plan {
+        var plan = Plan()
+        plan.writes = writes(database: database, fieldDiffs: fieldDiffs, baseSnapshots: baseSnapshots, now: now, locallyRetired: &plan.locallyRetired)
+        return plan
+    }
+
+    private static func writes(
+        database: LocalCalendarDatabase,
+        fieldDiffs: [UUID: String],
+        baseSnapshots: [UUID: String],
+        now: Date,
+        locallyRetired: inout [UUID]
     ) -> [PlannedWrite] {
         let calendarsByID = Dictionary(database.calendars.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
 
@@ -69,6 +100,22 @@ enum DeviceWritePlanner {
                 return nil
             }
 
+            // Spec 3D.5: a `.thisAndFuture` split is one device write, not two. The truncation
+            // row carries it; the new master's create row is a purely local projection of what
+            // EventKit will do for itself, and issuing it would leave a second series behind.
+            if mutation.editScope == .thisAndFuture, mutation.operation == .create {
+                guard let event = database.events.first(where: { $0.id == mutation.objectID }),
+                      let calendar = calendarsByID[event.calendarID],
+                      calendar.connectionMethod == .device else {
+                    return nil
+                }
+                // Retired rather than merely skipped: the sibling future-span write *is* this
+                // row's effect, and leaving it pending would queue a create that no pass will
+                // ever issue.
+                locallyRetired.append(mutation.id)
+                return nil
+            }
+
             switch mutation.operation {
             case .create, .update:
                 guard let event = database.events.first(where: { $0.id == mutation.objectID }),
@@ -77,7 +124,7 @@ enum DeviceWritePlanner {
                       let calendarIdentifier = calendar.providerCalendarID else {
                     return nil
                 }
-                return plannedWrite(for: mutation, event: event, calendarIdentifier: calendarIdentifier, fieldDiffs: fieldDiffs, baseSnapshots: baseSnapshots)
+                return plannedWrite(for: mutation, event: event, calendarIdentifier: calendarIdentifier, fieldDiffs: fieldDiffs, baseSnapshots: baseSnapshots, in: database)
 
             case .delete:
                 // The event row is gone by now, so both the identifier and the calendar come
@@ -105,9 +152,17 @@ enum DeviceWritePlanner {
         event: CalendarEvent,
         calendarIdentifier: String,
         fieldDiffs: [UUID: String],
-        baseSnapshots: [UUID: String]
+        baseSnapshots: [UUID: String],
+        in database: LocalCalendarDatabase
     ) -> PlannedWrite? {
         let deviceEvent = DeviceEventMapper.deviceEvent(for: event, calendarIdentifier: calendarIdentifier)
+
+        // Spec 3.20's table, for the two scopes whose device shape differs from their local one.
+        // `.allEvents` is absent because it needs no special case: it edits the master directly,
+        // and a this-event save addressed to a master *is* how EventKit changes a whole series.
+        if let scoped = scopedWrite(for: mutation, event: event, calendarIdentifier: calendarIdentifier, deviceEvent: deviceEvent, fieldDiffs: fieldDiffs, in: database) {
+            return scoped
+        }
 
         // A row is a create until the device has named the event, whatever the outbox says. An
         // update whose event carries no provider identifier has never landed — treating it as an
@@ -165,6 +220,53 @@ enum DeviceWritePlanner {
             return nil
         }
         return DeviceEventMapper.deviceEvent(for: previous, calendarIdentifier: calendarIdentifier)
+    }
+
+    /// The two scopes whose device write does not look like the local transaction that produced
+    /// it. Both address the **series master** — the local row here is a replacement event or a
+    /// truncated master, but the device only knows the series.
+    private static func scopedWrite(
+        for mutation: PendingMutation,
+        event: CalendarEvent,
+        calendarIdentifier: String,
+        deviceEvent: DeviceEvent,
+        fieldDiffs: [UUID: String],
+        in database: LocalCalendarDatabase
+    ) -> PlannedWrite? {
+        guard let scope = mutation.editScope, scope != .allEvents, let occurrenceDate = mutation.occurrenceDate else { return nil }
+
+        // For `.thisEventOnly` the master is the event's own; for `.thisAndFuture` the row *is*
+        // the (truncated) master.
+        let master = event.recurrenceMasterID.flatMap { id in database.events.first { $0.id == id } } ?? event
+        guard let masterIdentifier = master.providerMetadata.providerObjectID, !masterIdentifier.isEmpty else {
+            // The series has never reached the device. Nothing to detach or split from — the
+            // ordinary create path will push the whole thing.
+            return nil
+        }
+
+        let fields = mutation.editScope == .thisEventOnly && mutation.operation == .create
+            // A detachment is a whole occurrence being replaced, not a patch of one field.
+            ? DeviceEventField.all
+            : patchFields(for: mutation, fieldDiffs: fieldDiffs)
+        guard !fields.isEmpty else { return nil }
+
+        return PlannedWrite(
+            mutationID: mutation.id,
+            eventID: event.id,
+            operation: .update(
+                DeviceEventWrite(
+                    identifier: masterIdentifier,
+                    calendarIdentifier: calendarIdentifier,
+                    span: scope == .thisAndFuture ? .futureEvents : .thisEvent,
+                    event: deviceEvent,
+                    fields: fields,
+                    occurrenceDate: occurrenceDate
+                )
+            ),
+            // Spec 3D.5: after a scope write the device is re-mirrored rather than trusted to
+            // have done what we predicted, so there is nothing to concurrency-check against here.
+            baseProviderVersion: nil
+        )
     }
 
     /// Spec 3D.4: the patch set comes from the **change journal**, not from a diff computed here.

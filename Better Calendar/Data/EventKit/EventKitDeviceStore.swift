@@ -165,7 +165,17 @@ struct EventKitDeviceStore: EventKitStore {
                     // is nothing left to update.
                     throw DeviceWriteFailure.permanent
                 }
-                event = existing
+                // Spec 3.20: a scoped write addresses one *occurrence*, and EventKit needs that
+                // occurrence's own `EKEvent` — saving the master with a future span would split
+                // at the master's start rather than where the user asked.
+                if let occurrenceDate = write.occurrenceDate {
+                    guard let occurrence = Self.occurrence(of: existing, at: occurrenceDate, in: eventStore) else {
+                        throw DeviceWriteFailure.permanent
+                    }
+                    event = occurrence
+                } else {
+                    event = existing
+                }
             } else {
                 guard let calendar = eventStore.calendars(for: .event).first(where: { $0.calendarIdentifier == write.calendarIdentifier }) else {
                     throw DeviceWriteFailure.permanent
@@ -189,6 +199,22 @@ struct EventKitDeviceStore: EventKitStore {
                 lastModified: event.lastModifiedDate
             )
         }.value
+    }
+
+    /// The `EKEvent` for one occurrence of a series, found by expanding a narrow window around
+    /// the slot rather than by an identifier — EventKit has no "occurrence at date" lookup, and
+    /// every occurrence of a series shares the series' identifier.
+    private static func occurrence(of master: EKEvent, at occurrenceDate: Date, in eventStore: EKEventStore) -> EKEvent? {
+        guard let calendar = master.calendar else { return nil }
+        let predicate = eventStore.predicateForEvents(
+            withStart: occurrenceDate.addingTimeInterval(-1),
+            end: occurrenceDate.addingTimeInterval(1),
+            calendars: [calendar]
+        )
+        return eventStore.events(matching: predicate).first { candidate in
+            candidate.eventIdentifier == master.eventIdentifier
+                && abs((candidate.occurrenceDate ?? candidate.startDate).timeIntervalSince(occurrenceDate)) < 1
+        }
     }
 
     func remove(identifier: String, span: DeviceEventSpan) async throws {

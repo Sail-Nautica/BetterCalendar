@@ -1271,6 +1271,20 @@ struct PendingMutation: Identifiable, Hashable {
     /// never failed.
     var failureClass: MutationFailureClass?
     var lastFailureAt: Date?
+    /// Spec 3.20/3D.5: which edit scope produced this row.
+    ///
+    /// The local transaction a scope edit produces and the device write it implies are different
+    /// shapes, and only the scope connects them. A "this event only" edit creates a *replacement
+    /// event* locally but is a save of one **occurrence** on the device; a "this and future" edit
+    /// truncates one master and creates another locally but is a single **future-span** write on
+    /// the device. Without this the planner would read those local rows literally and write a
+    /// duplicate event, or a second series, onto the user's calendar.
+    ///
+    /// `nil` for an ordinary, non-scoped edit — which is every row Phase 1 and 2 ever wrote.
+    var editScope: EditScope?
+    /// The occurrence a scoped write addresses: the slot being detached for `.thisEventOnly`, or
+    /// the split point for `.thisAndFuture`.
+    var occurrenceDate: Date?
 
     init(
         id: UUID,
@@ -1287,7 +1301,9 @@ struct PendingMutation: Identifiable, Hashable {
         changeJournalEntryID: UUID? = nil,
         baseProviderVersion: String? = nil,
         failureClass: MutationFailureClass? = nil,
-        lastFailureAt: Date? = nil
+        lastFailureAt: Date? = nil,
+        editScope: EditScope? = nil,
+        occurrenceDate: Date? = nil
     ) {
         self.id = id
         self.objectID = objectID
@@ -1304,6 +1320,8 @@ struct PendingMutation: Identifiable, Hashable {
         self.baseProviderVersion = baseProviderVersion
         self.failureClass = failureClass
         self.lastFailureAt = lastFailureAt
+        self.editScope = editScope
+        self.occurrenceDate = occurrenceDate
     }
 }
 
@@ -1311,7 +1329,7 @@ extension PendingMutation: Codable {
     private enum CodingKeys: String, CodingKey {
         case id, objectID, objectType, operation, createdAt
         case payload, idempotencyKey, status, attemptCount, lastAttemptAt, nextRetryAt, changeJournalEntryID
-        case baseProviderVersion, failureClass, lastFailureAt
+        case baseProviderVersion, failureClass, lastFailureAt, editScope, occurrenceDate
     }
 
     /// Decodes tolerantly so mutations written before the Phase 2 columns existed still load —
@@ -1333,6 +1351,8 @@ extension PendingMutation: Codable {
         baseProviderVersion = try container.decodeIfPresent(String.self, forKey: .baseProviderVersion)
         failureClass = try container.decodeIfPresent(MutationFailureClass.self, forKey: .failureClass)
         lastFailureAt = try container.decodeIfPresent(Date.self, forKey: .lastFailureAt)
+        editScope = try container.decodeIfPresent(EditScope.self, forKey: .editScope)
+        occurrenceDate = try container.decodeIfPresent(Date.self, forKey: .occurrenceDate)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1352,6 +1372,8 @@ extension PendingMutation: Codable {
         try container.encodeIfPresent(baseProviderVersion, forKey: .baseProviderVersion)
         try container.encodeIfPresent(failureClass, forKey: .failureClass)
         try container.encodeIfPresent(lastFailureAt, forKey: .lastFailureAt)
+        try container.encodeIfPresent(editScope, forKey: .editScope)
+        try container.encodeIfPresent(occurrenceDate, forKey: .occurrenceDate)
     }
 }
 
@@ -1545,6 +1567,13 @@ struct EventDraft: Equatable {
     /// "This Event" occurrence edit apart from an ordinary event edit (BC-REC-010).
     var recurrenceMasterID: UUID?
     var recurrenceOriginalStart: Date?
+    /// Spec 3D.5's "This and Future" scope, carried from the confirmation dialog to the save.
+    ///
+    /// The other two scopes are inferable from the draft itself — a master id and an original
+    /// start mean "this event only", their absence means "all events". A future split is not:
+    /// it edits the master's own fields but applies them from one occurrence onward, and only
+    /// the user's answer to the dialog says which. `nil` for every ordinary edit.
+    var scopedSplitOccurrenceStart: Date?
 
     nonisolated init(event: CalendarEvent) {
         id = event.id
@@ -1562,6 +1591,7 @@ struct EventDraft: Equatable {
         recurrence = event.recurrence ?? .never
         recurrenceMasterID = event.recurrenceMasterID
         recurrenceOriginalStart = event.recurrenceOriginalStart
+        scopedSplitOccurrenceStart = nil
     }
 
     /// - Parameter roundingMinutes: rounds `startDate` up to the next boundary of this many
@@ -1585,6 +1615,7 @@ struct EventDraft: Equatable {
         recurrence = .never
         recurrenceMasterID = nil
         recurrenceOriginalStart = nil
+        scopedSplitOccurrenceStart = nil
     }
 
     private static func roundedUp(_ date: Date, toNearestMinutes minutes: Int, calendar: Calendar = .current) -> Date {

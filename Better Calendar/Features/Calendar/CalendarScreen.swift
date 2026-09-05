@@ -11,6 +11,10 @@ struct CalendarScreen: View {
     @State private var selectedDate: Date
     @State private var selectedOccurrence: CalendarOccurrence?
     @State private var editingEvent: CalendarEvent?
+    /// Spec 3D.5: set when the user picks "This and Future Events", and read by the editor's
+    /// draft so the save applies the split at that occurrence instead of editing the master
+    /// outright. Cleared whenever the editor closes, so it cannot leak into the next edit.
+    @State private var futureSplitOccurrenceStart: Date?
     @State private var isAddingEvent = false
     @State private var newEventStartDate = Date.now
     @State private var isShowingCalendars = false
@@ -104,6 +108,9 @@ struct CalendarScreen: View {
             .sheet(isPresented: $isAddingEvent) {
                 editor(for: nil, startDate: newEventStartDate)
             }
+            .onChange(of: editingEvent == nil) { _, isClosed in
+                if isClosed { futureSplitOccurrenceStart = nil }
+            }
             .sheet(item: $editingEvent) { event in
                 editor(for: event, startDate: event.startDate)
             }
@@ -119,6 +126,11 @@ struct CalendarScreen: View {
                     onEditOccurrence: { occurrence in
                         selectedOccurrence = nil
                         editingEvent = store.eventForEditingOccurrence(occurrence)
+                    },
+                    onEditFuture: { occurrence in
+                        selectedOccurrence = nil
+                        futureSplitOccurrenceStart = occurrence.occurrenceStartDate
+                        editingEvent = occurrence.event
                     },
                     onDelete: store.deleteEvent,
                     onDeleteOccurrence: store.deleteOccurrence,
@@ -252,12 +264,21 @@ struct CalendarScreen: View {
         Calendar.current.date(bySettingHour: 9, minute: 0, second: 0, of: date) ?? date
     }
 
+    /// Spec 3D.5: carries the "This and Future" choice from the confirmation dialog into the
+    /// draft, so the save applies a split at that occurrence rather than editing the master.
+    private func draft(for event: CalendarEvent?, defaultCalendarID: UUID, startDate: Date) -> EventDraft {
+        guard let event else { return EventDraft(calendarID: defaultCalendarID, startDate: startDate) }
+        var draft = EventDraft(event: event)
+        draft.scopedSplitOccurrenceStart = futureSplitOccurrenceStart
+        return draft
+    }
+
     @ViewBuilder
     private func editor(for event: CalendarEvent?, startDate: Date) -> some View {
         if let defaultCalendarID = store.defaultCalendarID {
             EventEditorView(
                 calendars: store.calendars,
-                draft: event.map(EventDraft.init) ?? EventDraft(calendarID: defaultCalendarID, startDate: startDate),
+                draft: draft(for: event, defaultCalendarID: defaultCalendarID, startDate: startDate),
                 event: event,
                 onSave: store.saveEvent,
                 onDelete: store.deleteEvent

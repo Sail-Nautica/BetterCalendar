@@ -24,7 +24,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "v018_add_calendar_provider_identity",
         "v019_add_calendar_availability",
         "v020_create_event_attendees",
-        "v021_extend_pending_mutations_for_write_back"
+        "v021_extend_pending_mutations_for_write_back",
+        "v022_add_pending_mutation_edit_scope"
     ]
 
     /// Spec 2.17: a checksum over the migration set, stored alongside the applied migration
@@ -905,6 +906,13 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             // write and buy nothing.
         }
 
+        // Spec 3D.5. The local shape of a scope edit and the device write it implies are
+        // different, and only the scope connects them — see `PendingMutation.editScope`.
+        migrator.registerMigration("v022_add_pending_mutation_edit_scope") { db in
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN edit_scope TEXT")
+            try db.execute(sql: "ALTER TABLE pending_mutations ADD COLUMN occurrence_date TEXT")
+        }
+
         return migrator
     }
 
@@ -1297,7 +1305,8 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
         "id", "object_id", "object_type", "operation", "created_at",
         "payload", "idempotency_key", "status", "attempt_count",
         "last_attempt_at", "next_retry_at", "change_journal_entry_id",
-        "base_provider_version", "failure_class", "last_failure_at"
+        "base_provider_version", "failure_class", "last_failure_at",
+        "edit_scope", "occurrence_date"
     ]
 
     private func pendingMutationArguments(_ mutation: PendingMutation) -> StatementArguments {
@@ -1316,7 +1325,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
             mutation.changeJournalEntryID?.uuidString,
             mutation.baseProviderVersion,
             mutation.failureClass?.rawValue,
-            mutation.lastFailureAt.map(encodeInstant)
+            mutation.lastFailureAt.map(encodeInstant),
+            mutation.editScope?.rawValue,
+            mutation.occurrenceDate.map(encodeInstant)
         ]
     }
 
@@ -1694,7 +1705,9 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
                 changeJournalEntryID: (row["change_journal_entry_id"] as String?).flatMap(UUID.init(uuidString:)),
                 baseProviderVersion: row["base_provider_version"],
                 failureClass: (row["failure_class"] as String?).flatMap(MutationFailureClass.init(rawValue:)),
-                lastFailureAt: decodeInstant(row["last_failure_at"])
+                lastFailureAt: decodeInstant(row["last_failure_at"]),
+                editScope: (row["edit_scope"] as String?).flatMap(EditScope.init(rawValue:)),
+                occurrenceDate: decodeInstant(row["occurrence_date"])
             )
         }
     }

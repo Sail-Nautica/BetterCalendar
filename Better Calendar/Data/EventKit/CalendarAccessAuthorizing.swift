@@ -247,8 +247,15 @@ final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
             return DeviceWriteReceipt(identifier: created.identifier, externalIdentifier: created.externalIdentifier, lastModified: created.lastModified)
         }
 
-        guard let index = deviceEvents.firstIndex(where: { $0.identifier == identifier }) else {
+        guard let index = deviceEvents.firstIndex(where: { $0.identifier == identifier && !$0.isDetached }) else {
             throw DeviceWriteFailure.permanent
+        }
+
+        // Spec 3.20's two spans, modelled the way EventKit behaves — because a fake that treated
+        // an occurrence-addressed save as an ordinary one would let the bug it exists to catch
+        // (a "this event only" edit creating a second event) pass CI.
+        if let occurrenceDate = write.occurrenceDate {
+            return try applySpan(write, to: index, occurrenceDate: occurrenceDate)
         }
 
         var updated = deviceEvents[index]
@@ -256,6 +263,58 @@ final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
         updated.lastModified = (updated.lastModified ?? Date(timeIntervalSinceReferenceDate: 800_000_000)).addingTimeInterval(1)
         deviceEvents[index] = updated
         return DeviceWriteReceipt(identifier: updated.identifier, externalIdentifier: updated.externalIdentifier, lastModified: updated.lastModified)
+    }
+
+    /// `.thisEvent` on an occurrence **detaches** it — the series keeps its identifier and gains
+    /// a detachment. `.futureEvents` **splits** the series: the master is truncated to end before
+    /// the occurrence, and a new series takes over from there with its own identifier.
+    private func applySpan(_ write: DeviceEventWrite, to index: Int, occurrenceDate: Date) throws -> DeviceWriteReceipt {
+        let master = deviceEvents[index]
+
+        switch write.span {
+        case .thisEvent:
+            if let existing = deviceEvents.firstIndex(where: { $0.identifier == master.identifier && $0.isDetached && $0.occurrenceDate == occurrenceDate }) {
+                var detached = deviceEvents[existing]
+                detached.apply(write.event, fields: write.fields)
+                detached.lastModified = (detached.lastModified ?? Date(timeIntervalSinceReferenceDate: 800_000_000)).addingTimeInterval(1)
+                deviceEvents[existing] = detached
+                return DeviceWriteReceipt(identifier: detached.identifier, externalIdentifier: detached.externalIdentifier, lastModified: detached.lastModified)
+            }
+
+            var detached = master
+            detached.apply(write.event, fields: write.fields)
+            detached.isDetached = true
+            detached.occurrenceDate = occurrenceDate
+            detached.recurrenceRules = master.recurrenceRules
+            detached.lastModified = (master.lastModified ?? Date(timeIntervalSinceReferenceDate: 800_000_000)).addingTimeInterval(1)
+            deviceEvents.append(detached)
+            // EventKit keeps the series' identifier on a detachment; the occurrence date is the
+            // other half of its identity (spec 3C.1).
+            return DeviceWriteReceipt(identifier: detached.identifier, externalIdentifier: detached.externalIdentifier, lastModified: detached.lastModified)
+
+        case .futureEvents:
+            nextIdentifierNumber += 1
+            var truncated = master
+            truncated.recurrenceRules = master.recurrenceRules.map { rule in
+                var bounded = rule
+                bounded.end = .endDate(occurrenceDate.addingTimeInterval(-1))
+                return bounded
+            }
+            truncated.lastModified = (master.lastModified ?? Date(timeIntervalSinceReferenceDate: 800_000_000)).addingTimeInterval(1)
+            deviceEvents[index] = truncated
+
+            var newSeries = master
+            newSeries.apply(write.event, fields: write.fields)
+            newSeries.identifier = "fake-series-\(nextIdentifierNumber)"
+            newSeries.externalIdentifier = "fake-series-external-\(nextIdentifierNumber)"
+            newSeries.startDate = write.event.startDate
+            newSeries.endDate = write.event.endDate
+            newSeries.isDetached = false
+            newSeries.occurrenceDate = nil
+            newSeries.lastModified = truncated.lastModified
+            deviceEvents.append(newSeries)
+            return DeviceWriteReceipt(identifier: newSeries.identifier, externalIdentifier: newSeries.externalIdentifier, lastModified: newSeries.lastModified)
+        }
     }
 
     func remove(identifier: String, span: DeviceEventSpan) async throws {

@@ -15,11 +15,13 @@ struct OccurrenceKey: Hashable {
 /// (BC-REC-010's "This Event"/"All Events" dialog choice, generalized with the middle option
 /// spec 1.11 always described but Phase 1 never implemented).
 ///
-/// `.thisAndFuture` is engine-API only in Phase 2 — `RecurrenceSplitter` implements and tests it
-/// fully, but there is deliberately no third button on `EventDetailsView`'s confirmation dialog
-/// yet (`Instructions/phase2plan.md`'s M4 section). The split logic ships ready for Phase 3 to
-/// wire up rather than being built twice.
-enum EditScope: Hashable {
+/// `.thisAndFuture` was engine-API only in Phase 2 — `RecurrenceSplitter` implemented and tested
+/// it fully, with deliberately no third button on `EventDetailsView`'s confirmation dialog
+/// (`Instructions/phase2plan.md`'s M4 section), because the split logic should ship ready to wire
+/// up rather than be built twice. Phase 3D wires it up: spec 3.20 gives the scope a device
+/// meaning (a future-span write, which EventKit splits for itself), which is the provider that
+/// justified the complexity.
+enum EditScope: String, Codable, Hashable, CaseIterable {
     /// Only the single selected occurrence. Leaves the master and every other occurrence
     /// untouched — today's "This Event" behavior (BC-REC-010).
     case thisEventOnly

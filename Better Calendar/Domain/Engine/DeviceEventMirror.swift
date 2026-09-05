@@ -138,6 +138,22 @@ enum DeviceEventMirror {
             uniquingKeysWith: { first, _ in first }
         )
         let existingByID = Dictionary(input.existingEvents.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        // Spec 3D.9: identifier first, derived id second.
+        //
+        // Phase 3C could assume every mirrored row was named by this pass, because its local id
+        // was a pure function of the provider identifier. Phase 3D breaks that assumption: an
+        // event Better Calendar created and then pushed has a local id of its own — one that
+        // views, undo actions and the conflict index all reference — *and* a provider identifier.
+        // Matching only on the derived id would not recognise it, and the pass would insert a
+        // second row for an event it already had.
+        let existingByProviderID = Dictionary(
+            input.existingEvents.compactMap { event in event.providerMetadata.providerObjectID.map { ($0, event) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let existingByExternalID = Dictionary(
+            input.existingEvents.compactMap { event in event.providerMetadata.providerExternalID.map { ($0, event) } },
+            uniquingKeysWith: { first, _ in first }
+        )
         let exceptionsByID = Dictionary(input.existingExceptions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let liveTombstoneEntityIDs = Set(input.tombstones.map(\.entityID))
 
@@ -158,7 +174,33 @@ enum DeviceEventMirror {
                 continue
             }
 
-            let localID = DeviceEventIdentity.eventID(for: device.key)
+            // A row already bound to this device event keeps its own id, whatever that id is;
+            // only an event this app has never seen gets a derived one. Detachments are excluded
+            // from identifier matching because a series' detachments all share the identifier —
+            // the pair is their identity (spec 3C.1), and the derived id already encodes it.
+            let matched: CalendarEvent?
+            if device.isDetached {
+                // A detachment shares its series' identifier, so it cannot be matched by one.
+                // What it *can* be matched by is its slot — and a "this event only" edit made
+                // here has already created a local replacement event sitting in exactly that
+                // slot, waiting to be recognised as the thing the device just detached. Without
+                // this the pass would add a second row beside it (spec 3D.5/3D.9).
+                let masterID = DeviceEventIdentity.eventID(for: DeviceEventKey(identifier: device.identifier, occurrenceDate: nil))
+                let masterLocalID = existingByProviderID[device.identifier]?.id ?? masterID
+                let slot = device.occurrenceDate
+                matched = input.existingEvents.first { candidate in
+                    candidate.recurrenceMasterID == masterLocalID
+                        && zip([candidate.recurrenceOriginalStart], [slot]).allSatisfy { local, remote in
+                            guard let local, let remote else { return false }
+                            return abs(local.timeIntervalSince(remote)) < 1
+                        }
+                }
+            } else {
+                matched = existingByProviderID[device.identifier]
+                    ?? device.externalIdentifier.flatMap { existingByExternalID[$0] }
+            }
+            let localID = matched?.id ?? DeviceEventIdentity.eventID(for: device.key)
+
             guard !liveTombstoneEntityIDs.contains(localID) else {
                 // Spec 3C.8: the resurrection guard applies to inbound changes too. The delete
                 // that produced the tombstone always wins until it is purged.
@@ -166,7 +208,7 @@ enum DeviceEventMirror {
                 continue
             }
 
-            let existing = existingByID[localID]
+            let existing = matched ?? existingByID[localID]
             let context = DeviceEventMapper.Context(
                 calendarID: calendar.id,
                 provider: calendar.provider,

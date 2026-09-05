@@ -47,16 +47,48 @@ enum DeviceWriteCommitter {
         return rows.isEmpty ? .empty : EngineTransaction(outboxRows: rows)
     }
 
+    /// Spec 3D.6: a parked mutation returns to `pending` when the permission that blocked it
+    /// comes back.
+    ///
+    /// Without this, parking would be a quieter way of losing the edit than failing — the row
+    /// would sit untouched forever, and the user who re-granted access would see nothing happen.
+    /// The retry budget is deliberately left as it was: parking never spent one, so un-parking
+    /// has none to restore, and the 24-hour ceiling still measures from the original attempt.
+    static func unpark(in database: LocalCalendarDatabase, now: Date) -> EngineTransaction {
+        let rows = database.pendingMutations
+            .filter { $0.status == .parked }
+            .map { mutation -> PendingMutation in
+                var resumed = mutation
+                resumed.status = .pending
+                resumed.failureClass = nil
+                return resumed
+            }
+
+        return rows.isEmpty ? .empty : EngineTransaction(outboxRows: rows)
+    }
+
     /// One transaction carrying every status change and every receipt.
     static func commit(
-        _ writes: [DeviceWritePlanner.PlannedWrite],
+        _ plan: DeviceWritePlanner.Plan,
         outcomes: [UUID: DeviceMutationAdapter.Outcome],
         in database: LocalCalendarDatabase,
         now: Date,
         jitter: @escaping () -> Double = { Double.random(in: 0..<1) }
     ) -> Result {
+        let writes = plan.writes
         var result = Result(transaction: .empty)
         var outboxRows: [PendingMutation] = []
+
+        // Rows whose effect was carried by a sibling write. Marked applied because they *were*
+        // applied — by the write that stood in for them.
+        for mutationID in plan.locallyRetired {
+            guard var mutation = database.pendingMutations.first(where: { $0.id == mutationID }) else { continue }
+            mutation.status = .applied
+            mutation.lastAttemptAt = now
+            mutation.nextRetryAt = nil
+            outboxRows.append(mutation)
+            result.summary.applied += 1
+        }
         var entityChanges: [EntityChange] = []
         var tombstones: [DeletedObjectTombstone] = []
 
@@ -105,6 +137,12 @@ enum DeviceWriteCommitter {
                 }
                 continue
             }
+
+            // Spec 3D.5: a scoped write's receipt does not name this row. A future-span split
+            // returns the identifier of the *new* series EventKit made, and a detachment returns
+            // the series' own identifier — writing either onto the local row would bind it to
+            // the wrong thing. The device is re-mirrored instead, and its answer wins.
+            guard !planned.isScoped else { continue }
 
             guard let event = database.events.first(where: { $0.id == planned.eventID }) else { continue }
             entityChanges.append(.upsertEvent(applying(receipt, to: event, now: now)))
@@ -175,5 +213,13 @@ private extension DeviceWritePlanner.PlannedWrite {
     var isDelete: Bool {
         if case .delete = operation { return true }
         return false
+    }
+
+    /// A write that addresses one occurrence of a series rather than an event.
+    var isScoped: Bool {
+        switch operation {
+        case .create(let write, _), .update(let write): write.occurrenceDate != nil
+        case .delete: false
+        }
     }
 }

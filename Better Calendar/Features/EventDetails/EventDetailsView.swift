@@ -12,6 +12,10 @@ struct EventDetailsView: View {
     /// "This Event" edit scope (BC-REC-010, spec 1.11) — the caller resolves which event to
     /// open via `store.eventForEditingOccurrence(_:)`.
     let onEditOccurrence: (CalendarOccurrence) -> Void
+    /// Spec 3D.5's "This and Future" scope. Separate from `onEditOccurrence` because the editor
+    /// opens on the *master* and the split is applied on save, rather than on a per-occurrence
+    /// seed.
+    var onEditFuture: (CalendarOccurrence) -> Void = { _ in }
     let onDelete: (CalendarEvent) -> Void
     /// "This Event" delete scope (BC-REC-010, spec 1.11) — the caller calls
     /// `store.deleteOccurrence(_:)`.
@@ -301,10 +305,16 @@ struct EventDetailsView: View {
                 titleVisibility: .visible
             ) {
                 Button("This Event") {
-                    performScopedAction(applyToThisEventOnly: true)
+                    performScopedAction(scope: .thisEventOnly)
+                }
+                // Spec 3D.5: Phase 2 built `.thisAndFuture` in the engine and deliberately
+                // withheld the button "until Phase 3 has a provider to justify the added
+                // complexity". It does now.
+                Button("This and Future Events") {
+                    performScopedAction(scope: .thisAndFuture)
                 }
                 Button("All Events") {
-                    performScopedAction(applyToThisEventOnly: false)
+                    performScopedAction(scope: .allEvents)
                 }
                 Button("Cancel", role: .cancel) {
                     pendingScopeAction = nil
@@ -314,16 +324,28 @@ struct EventDetailsView: View {
         .macSheetFrame()
     }
 
-    private func performScopedAction(applyToThisEventOnly: Bool) {
+    private func performScopedAction(scope: EditScope) {
         defer { pendingScopeAction = nil }
         dismiss()
 
-        switch pendingScopeAction {
-        case .edit:
-            applyToThisEventOnly ? onEditOccurrence(occurrence) : onEdit(occurrence.event)
-        case .delete:
-            applyToThisEventOnly ? onDeleteOccurrence(occurrence) : onDelete(occurrence.event)
-        case nil:
+        switch (pendingScopeAction, scope) {
+        case (.edit, .thisEventOnly):
+            onEditOccurrence(occurrence)
+        case (.edit, .allEvents):
+            onEdit(occurrence.event)
+        case (.edit, .thisAndFuture):
+            // Unlike the other two, this one has no seed to hand the editor: the split happens on
+            // save, from the selected occurrence forward. So the master opens for editing and the
+            // store applies the result at this occurrence — see `editSeriesFromOccurrence`.
+            onEditFuture(occurrence)
+        case (.delete, .thisEventOnly):
+            onDeleteOccurrence(occurrence)
+        case (.delete, .allEvents):
+            onDelete(occurrence.event)
+        case (.delete, .thisAndFuture):
+            // The engine has handled this since Phase 2 M4; only the button was withheld.
+            store.deleteSeries(occurrence, scope: .thisAndFuture)
+        case (nil, _):
             break
         }
     }

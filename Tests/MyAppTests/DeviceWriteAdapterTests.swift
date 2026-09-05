@@ -55,13 +55,13 @@ final class DeviceWriteAdapterTests: XCTestCase {
         let fixture = Self.crashedCreateFixture()
 
         let planned = DeviceWritePlanner.plan(database: fixture.database, now: Self.now)
-        XCTAssertEqual(planned.count, 1)
-        guard case .create(_, let mightAlreadyExist) = try XCTUnwrap(planned.first).operation else {
+        XCTAssertEqual(planned.writes.count, 1)
+        guard case .create(_, let mightAlreadyExist) = try XCTUnwrap(planned.writes.first).operation else {
             return XCTFail("expected a create")
         }
         XCTAssertTrue(mightAlreadyExist, "an in-flight row is one that may already have landed")
 
-        let outcomes = await DeviceMutationAdapter(store: fixture.eventKit).perform(planned)
+        let outcomes = await DeviceMutationAdapter(store: fixture.eventKit).perform(planned.writes)
 
         guard case .adopted(let receipt) = try XCTUnwrap(outcomes.values.first) else {
             return XCTFail("expected the existing device event to be adopted, got \(String(describing: outcomes.values.first))")
@@ -78,7 +78,7 @@ final class DeviceWriteAdapterTests: XCTestCase {
         let fixture = Self.crashedCreateFixture(deviceTitle: "Team lunch")
 
         let planned = DeviceWritePlanner.plan(database: fixture.database, now: Self.now)
-        let outcomes = await DeviceMutationAdapter(store: fixture.eventKit).perform(planned)
+        let outcomes = await DeviceMutationAdapter(store: fixture.eventKit).perform(planned.writes)
 
         guard case .applied = try XCTUnwrap(outcomes.values.first) else {
             return XCTFail("a weak match must fall through to creating")
@@ -98,7 +98,7 @@ final class DeviceWriteAdapterTests: XCTestCase {
         }
 
         let planned = DeviceWritePlanner.plan(database: fixture.database, now: Self.now)
-        _ = await DeviceMutationAdapter(store: fixture.eventKit).perform(planned)
+        _ = await DeviceMutationAdapter(store: fixture.eventKit).perform(planned.writes)
 
         XCTAssertEqual(fixture.eventKit.eventFetchCount, 0, "no adoption search for a create that was never issued")
         XCTAssertEqual(fixture.eventKit.writeLog.count, 1)
@@ -252,6 +252,141 @@ final class DeviceWriteAdapterTests: XCTestCase {
         XCTAssertNotNil(row.payload)
     }
 
+    /// Spec 3D.6: parking must not be a quieter way of losing the edit. When access comes back,
+    /// the row goes back in the queue with its retry budget as it was.
+    func testAParkedRowResumesWhenAccessReturns() async throws {
+        let fixture = try await mirroredEventStore()
+        let mirrored = try XCTUnwrap(fixture.store.events.first)
+        Self.rename(mirrored, to: "Renamed", in: fixture.store)
+        fixture.eventKit.saveFailure = .permission
+        await fixture.store.drainDeviceWrites(now: Self.now)
+        XCTAssertEqual(fixture.store.pendingMutations.first?.status, .parked)
+
+        fixture.eventKit.saveFailure = nil
+        await fixture.store.drainDeviceWrites(now: Self.now)
+
+        let row = try XCTUnwrap(fixture.store.pendingMutations.first)
+        XCTAssertEqual(row.status, .applied)
+        XCTAssertNil(row.failureClass)
+        XCTAssertEqual(row.attemptCount, 0, "parking never spent an attempt, so resuming has none to restore")
+        XCTAssertEqual(fixture.eventKit.deviceEvents.first?.title, "Renamed")
+    }
+
+    // MARK: - Recurrence scopes (spec 3.20 / 3D.5, BC-EK-014 and BC-EK-015)
+
+    /// BC-EK-014. Locally a "this event only" edit creates a replacement event; on the device it
+    /// is a save of one **occurrence**, which detaches it. Reading the local row literally would
+    /// create a second event on the user's calendar beside the one the series still generates.
+    func testAThisEventOnlyEditDetachesOneOccurrenceRatherThanCreatingASecondEvent() async throws {
+        let fixture = try await seriesStore()
+        let occurrence = try XCTUnwrap(fixture.store.visibleOccurrences(in: Self.seriesWindow).dropFirst().first)
+
+        _ = fixture.store.editSeries(occurrence, scope: .thisEventOnly) { $0.title = "Moved this one" }
+        await fixture.store.drainDeviceWrites(now: Self.now)
+
+        let write = try XCTUnwrap(fixture.eventKit.writeLog.first)
+        XCTAssertEqual(write.identifier, "series-1", "the write addresses the series, not a new event")
+        XCTAssertEqual(write.span, .thisEvent)
+        XCTAssertEqual(write.occurrenceDate, occurrence.occurrenceStartDate)
+
+        let masters = fixture.eventKit.deviceEvents.filter { !$0.isDetached }
+        let detachments = fixture.eventKit.deviceEvents.filter(\.isDetached)
+        XCTAssertEqual(masters.count, 1, "the series is still one series")
+        XCTAssertEqual(detachments.count, 1, "and has gained exactly one detachment")
+        XCTAssertEqual(detachments.first?.title, "Moved this one")
+    }
+
+    /// And the re-mirror that follows recognises the detachment as the replacement row we already
+    /// have, rather than adding a second one beside it (spec 3D.9).
+    func testTheDetachedOccurrenceIsRecognisedRatherThanDuplicatedOnReMirror() async throws {
+        let fixture = try await seriesStore()
+        let occurrence = try XCTUnwrap(fixture.store.visibleOccurrences(in: Self.seriesWindow).dropFirst().first)
+        _ = fixture.store.editSeries(occurrence, scope: .thisEventOnly) { $0.title = "Moved this one" }
+
+        await fixture.store.drainDeviceWrites(now: Self.now)
+
+        XCTAssertEqual(
+            fixture.store.events.filter { $0.title == "Moved this one" }.count,
+            1,
+            "the drain re-mirrors, and the re-mirror must recognise the replacement it already has"
+        )
+    }
+
+    /// BC-EK-015. Locally a split is two rows; on the device it is one future-span write, and
+    /// EventKit does its own splitting. Issuing both would leave a truncated series *and* a
+    /// separate new one that EventKit never made.
+    func testAThisAndFutureEditIssuesOneFutureSpanWriteAndNotASecondCreate() async throws {
+        let fixture = try await seriesStore()
+        let occurrence = try XCTUnwrap(fixture.store.visibleOccurrences(in: Self.seriesWindow).dropFirst().first)
+
+        _ = fixture.store.editSeries(occurrence, scope: .thisAndFuture) { $0.title = "From here on" }
+        await fixture.store.drainDeviceWrites(now: Self.now)
+
+        XCTAssertEqual(fixture.eventKit.writeLog.count, 1, "one write, not two")
+        let write = try XCTUnwrap(fixture.eventKit.writeLog.first)
+        XCTAssertEqual(write.identifier, "series-1")
+        XCTAssertEqual(write.span, .futureEvents)
+        XCTAssertEqual(write.occurrenceDate, occurrence.occurrenceStartDate)
+
+        // Both local rows are retired: the one that was written, and the one that was EventKit's
+        // to make rather than ours to send.
+        XCTAssertTrue(
+            fixture.store.pendingMutations.allSatisfy { $0.status == .applied },
+            "the local projection's row is retired without a device write, not left pending forever"
+        )
+    }
+
+    /// Spec 3.20: `.allEvents` needs no special case at all — editing the master with the
+    /// this-event span *is* how EventKit changes a whole series. This pins that, because the
+    /// obvious wrong implementation (a future span from the first occurrence) also looks right.
+    func testAnAllEventsEditAddressesTheMasterWithTheThisEventSpan() async throws {
+        let fixture = try await seriesStore()
+        let occurrence = try XCTUnwrap(fixture.store.visibleOccurrences(in: Self.seriesWindow).first)
+
+        _ = fixture.store.editSeries(occurrence, scope: .allEvents) { $0.title = "Renamed series" }
+        await fixture.store.drainDeviceWrites(now: Self.now)
+
+        let write = try XCTUnwrap(fixture.eventKit.writeLog.first)
+        XCTAssertEqual(write.identifier, "series-1")
+        XCTAssertEqual(write.span, .thisEvent)
+        XCTAssertNil(write.occurrenceDate, "a whole-series change addresses the master itself")
+        XCTAssertEqual(fixture.eventKit.deviceEvents.filter { !$0.isDetached }.first?.title, "Renamed series")
+    }
+
+    // MARK: - Spec 3D.9: the mirror has to recognise what we pushed
+
+    /// The bug this closes: an event Better Calendar created has a local id of its own *and*, once
+    /// pushed, a provider identifier. Phase 3C's mirror matched only on the id it derives from the
+    /// provider identifier, so on the next pass it would not recognise the row it already had —
+    /// and would insert a second one for the same event.
+    func testAPushedCreateIsRecognisedByTheNextMirrorPassRatherThanDuplicated() async throws {
+        let fixture = try await Self.connectedStore()
+        _ = fixture.store.saveEvent(from: Self.draft(calendarID: fixture.deviceCalendarID))
+        await fixture.store.drainDeviceWrites(now: Self.now)
+        let pushed = try XCTUnwrap(fixture.store.events.first { $0.title == "Dentist" })
+
+        await fixture.store.mirrorDeviceEvents(now: Self.now)
+
+        XCTAssertEqual(fixture.store.events.filter { $0.title == "Dentist" }.count, 1, "the mirror must not insert a second row")
+        XCTAssertEqual(fixture.store.events.first { $0.title == "Dentist" }?.id, pushed.id, "and must not re-key the one it has")
+        XCTAssertTrue(fixture.store.deletedEventTombstones.isEmpty, "nor delete it and re-import it")
+    }
+
+    /// And the pass after that changes nothing at all — the idempotence property 3C established,
+    /// still holding now that a row can arrive from either direction.
+    func testAPushedCreateSettlesAfterOneMirrorPass() async throws {
+        let fixture = try await Self.connectedStore()
+        _ = fixture.store.saveEvent(from: Self.draft(calendarID: fixture.deviceCalendarID))
+        await fixture.store.drainDeviceWrites(now: Self.now)
+        await fixture.store.mirrorDeviceEvents(now: Self.now)
+        let settled = fixture.store.events
+
+        await fixture.store.mirrorDeviceEvents(now: Self.now)
+
+        XCTAssertEqual(fixture.store.events, settled)
+        XCTAssertTrue(fixture.store.lastEventMirrorSummary?.isNoOp ?? false)
+    }
+
     // MARK: - The drain as a whole
 
     func testASecondDrainWithNothingQueuedWritesNothing() async throws {
@@ -343,6 +478,43 @@ final class DeviceWriteAdapterTests: XCTestCase {
         )
         await store.refreshDeviceCalendars(now: Self.now)
         XCTAssertEqual(store.events.count, 1, "the fixture should have mirrored exactly one event")
+
+        let deviceCalendarID = try XCTUnwrap(store.deviceCalendars.first { $0.providerCalendarID == "cal-personal" }?.id)
+        return Fixture(store: store, eventKit: eventKit, deviceCalendarID: deviceCalendarID)
+    }
+
+    private static let seriesStart = TestData.date("2026-09-10T14:00:00Z")
+    static let seriesWindow = DateInterval(
+        start: TestData.date("2026-09-01T00:00:00Z"),
+        end: TestData.date("2026-10-01T00:00:00Z")
+    )
+
+    /// A store holding one mirrored weekly series, which is what every scope test needs.
+    private func seriesStore() async throws -> Fixture {
+        let eventKit = FakeEventKitStore(
+            status: .fullAccess,
+            snapshot: DeviceTestData.snapshot(),
+            deviceEvents: [
+                DeviceTestData.event(
+                    identifier: "series-1",
+                    externalIdentifier: "series-external-1",
+                    calendarIdentifier: "cal-personal",
+                    title: "Weekly sync",
+                    startDate: Self.seriesStart,
+                    endDate: Self.seriesStart.addingTimeInterval(1_800),
+                    timeZoneIdentifier: "UTC",
+                    recurrenceRules: [DeviceRecurrenceRule(frequency: .weekly)]
+                )
+            ]
+        )
+        let repository = try makeRepository()
+        try repository.save(TestData.database(calendars: [TestData.calendar()], events: []))
+        let store = BetterCalendarStore(
+            repository: repository,
+            notificationScheduler: NoopNotificationScheduler(),
+            eventKitStore: eventKit
+        )
+        await store.refreshDeviceCalendars(now: Self.now)
 
         let deviceCalendarID = try XCTUnwrap(store.deviceCalendars.first { $0.providerCalendarID == "cal-personal" }?.id)
         return Fixture(store: store, eventKit: eventKit, deviceCalendarID: deviceCalendarID)

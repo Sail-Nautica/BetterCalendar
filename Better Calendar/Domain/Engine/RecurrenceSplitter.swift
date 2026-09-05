@@ -118,7 +118,18 @@ enum RecurrenceSplitter {
             exceptionType: .modified,
             replacementEventID: seed.id
         )
-        return wrap(EventMutationUseCases.createEvent(seed, exception: exception, idempotencyKey: idempotencyKey, in: context))
+        // Spec 3D.5: locally this is a new replacement event; on the device it is a save of one
+        // *occurrence* of the existing series, which detaches it. Tagging the row is what lets
+        // the write-back planner tell those apart — untagged, it would create a second event on
+        // the user's calendar alongside the occurrence the series still generates.
+        return wrap(EventMutationUseCases.createEvent(
+            seed,
+            exception: exception,
+            idempotencyKey: idempotencyKey,
+            in: context,
+            editScope: .thisEventOnly,
+            occurrenceDate: occurrenceKey.originalStart
+        ))
     }
 
     /// If this occurrence already has a standalone replacement, it already has a `.modified`
@@ -321,8 +332,13 @@ enum RecurrenceSplitter {
             context: context
         )
         let version = EventVersion(id: UUID(), eventID: master.id, versionNumber: master.versionNumber, snapshotJSON: master.encodedSnapshotJSON() ?? "{}", createdAt: context.now, changeJournalEntryID: entry.id)
-        let truncateOutbox = EventMutationUseCases.outboxRow(objectID: master.id, operation: .update, payload: truncatedMaster, idempotencyKey: idempotencyKey, journalEntryID: entry.id, context: context)
-        let createOutbox = EventMutationUseCases.outboxRow(objectID: newMaster.id, operation: .create, payload: newMaster, idempotencyKey: UUID(), journalEntryID: entry.id, context: context)
+        // Spec 3D.5: locally a split is two rows — truncate one master, create another. On the
+        // device it is **one** future-span write, and EventKit performs its own split. Both rows
+        // carry the scope so the planner issues exactly that one write and retires the other
+        // without touching the device; writing both would leave the user with a truncated series
+        // *and* a separate new one that EventKit never made.
+        let truncateOutbox = EventMutationUseCases.outboxRow(objectID: master.id, operation: .update, payload: truncatedMaster, idempotencyKey: idempotencyKey, journalEntryID: entry.id, context: context, editScope: .thisAndFuture, occurrenceDate: occurrenceKey.originalStart)
+        let createOutbox = EventMutationUseCases.outboxRow(objectID: newMaster.id, operation: .create, payload: newMaster, idempotencyKey: UUID(), journalEntryID: entry.id, context: context, editScope: .thisAndFuture, occurrenceDate: occurrenceKey.originalStart)
 
         return .applied(Result(transaction: EngineTransaction(
             entityChanges: changes,

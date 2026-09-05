@@ -57,7 +57,9 @@ enum EventMutationUseCases {
         _ event: CalendarEvent,
         exception: RecurrenceException? = nil,
         idempotencyKey: UUID = UUID(),
-        in context: Context
+        in context: Context,
+        editScope: EditScope? = nil,
+        occurrenceDate: Date? = nil
     ) -> Outcome {
         if let outcome = existingOutcome(forIdempotencyKey: idempotencyKey, in: context.database) { return outcome }
         if hasLiveTombstone(forEntityID: event.id, in: context.database) { return .duplicate }
@@ -77,7 +79,7 @@ enum EventMutationUseCases {
             fieldDiff: FieldDiff.compute(from: Optional<CalendarEvent>.none, to: event),
             context: context
         )
-        let mutation = outboxRow(objectID: event.id, operation: .create, payload: event, idempotencyKey: idempotencyKey, journalEntryID: entry.id, context: context)
+        let mutation = outboxRow(objectID: event.id, operation: .create, payload: event, idempotencyKey: idempotencyKey, journalEntryID: entry.id, context: context, editScope: editScope, occurrenceDate: occurrenceDate)
 
         return .applied(EngineTransaction(entityChanges: changes, outboxRows: [mutation], journalEntries: [entry]))
     }
@@ -562,7 +564,9 @@ enum EventMutationUseCases {
         payload: CalendarEvent,
         idempotencyKey: UUID,
         journalEntryID: UUID,
-        context: Context
+        context: Context,
+        editScope: EditScope? = nil,
+        occurrenceDate: Date? = nil
     ) -> PendingMutation {
         PendingMutation(
             id: UUID(),
@@ -572,7 +576,9 @@ enum EventMutationUseCases {
             createdAt: context.now,
             payload: payload.encodedSnapshotJSON(),
             idempotencyKey: idempotencyKey,
-            changeJournalEntryID: journalEntryID
+            changeJournalEntryID: journalEntryID,
+            editScope: editScope,
+            occurrenceDate: occurrenceDate
         )
     }
 }

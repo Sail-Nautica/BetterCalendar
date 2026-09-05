@@ -82,8 +82,31 @@ struct DeviceEventWrite: Hashable {
     var event: DeviceEvent
     /// The subset of `event` the adapter may apply. See `DeviceEventField`.
     var fields: Set<DeviceEventField>
+    /// Spec 3.20/3D.5: the occurrence of `identifier`'s series this write addresses.
+    ///
+    /// `nil` addresses the event itself — an ordinary event, or a series **master**, which with
+    /// the this-event span is how EventKit expresses a whole-series change. Non-nil addresses one
+    /// occurrence: with `.thisEvent` EventKit detaches it, with `.futureEvents` it splits the
+    /// series there.
+    var occurrenceDate: Date?
 
     var isCreate: Bool { identifier == nil }
+
+    init(
+        identifier: String?,
+        calendarIdentifier: String,
+        span: DeviceEventSpan,
+        event: DeviceEvent,
+        fields: Set<DeviceEventField>,
+        occurrenceDate: Date? = nil
+    ) {
+        self.identifier = identifier
+        self.calendarIdentifier = calendarIdentifier
+        self.span = span
+        self.event = event
+        self.fields = fields
+        self.occurrenceDate = occurrenceDate
+    }
 }
 
 /// What the device says after a successful write. Spec 3.19: persisted onto the local row **in

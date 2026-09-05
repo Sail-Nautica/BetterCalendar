@@ -156,6 +156,35 @@ final class BetterCalendarStore {
         // silently drop a `.floating` lock-to-timezone toggle.
         let resolvedTimeType: EventTimeType = draft.isAllDay ? .allDay : (draft.isLockedToTimeZone ? .floating : .timed)
 
+        // Spec 3D.5: a future split is not an edit of this event, it is an edit of the series
+        // from one occurrence onward — a different transaction shape entirely, and one
+        // `RecurrenceSplitter` has produced since Phase 2 M4.
+        if let splitStart = draft.scopedSplitOccurrenceStart,
+           let eventID = draft.id,
+           let master = events.first(where: { $0.id == eventID }) {
+            let didSplit = applySeriesEdit(
+                master: master,
+                occurrenceStart: splitStart,
+                scope: .thisAndFuture
+            ) { updated in
+                updated.title = trimmedTitle
+                updated.calendarID = draft.calendarID
+                updated.startDate = draft.startDate
+                updated.endDate = self.normalizedEndDate(for: draft)
+                updated.timeType = resolvedTimeType
+                updated.timeZoneIdentifier = draft.timeZoneIdentifier
+                updated.location = draft.location.nilIfBlank
+                updated.urlString = draft.urlString.nilIfBlank
+                updated.notes = draft.notes.nilIfBlank
+                updated.reminders = reminders
+                updated.recurrence = recurrence
+            }
+            if didSplit {
+                PrivacyLog.track(.eventSaved)
+            }
+            return didSplit
+        }
+
         let outcome: EventMutationUseCases.Outcome
         if let eventID = draft.id, let existing = events.first(where: { $0.id == eventID }) {
             outcome = EventMutationUseCases.updateEvent(eventID: eventID, expectedVersionNumber: existing.versionNumber, in: engineContext()) { updated in
@@ -211,7 +240,18 @@ final class BetterCalendarStore {
                 )
             }
 
-            outcome = EventMutationUseCases.createEvent(newEvent, exception: exception, in: engineContext())
+            // Spec 3D.5: a draft carrying a master and an original start *is* a "this event only"
+            // edit, whichever screen produced it. Tagging it here as well as in
+            // `RecurrenceSplitter` is what stops the editor's own path — the one the UI actually
+            // uses — from being written to the device as a brand-new event beside the occurrence
+            // the series still generates.
+            outcome = EventMutationUseCases.createEvent(
+                newEvent,
+                exception: exception,
+                in: engineContext(),
+                editScope: exception == nil ? nil : .thisEventOnly,
+                occurrenceDate: exception == nil ? nil : draft.recurrenceOriginalStart
+            )
         }
 
         let didSave = perform(outcome)
@@ -310,6 +350,17 @@ final class BetterCalendarStore {
             ?? occurrence.event.seedForOccurrenceEdit(occurrenceStartDate: occurrence.occurrenceStartDate, occurrenceEndDate: occurrence.occurrenceEndDate)
     }
 
+    /// Spec 3D.5's third scope, through the editor.
+    ///
+    /// `.thisAndFuture` has no seed event to hand the editor the way `.thisEventOnly` does — it
+    /// edits the series from a point forward, and the split happens on save. So the caller edits
+    /// the master's own fields and this applies them at the chosen occurrence, through
+    /// `RecurrenceSplitter`, which is where the split has lived since Phase 2 M4.
+    @discardableResult
+    func editSeriesFromOccurrence(_ occurrence: CalendarOccurrence, edits: (inout CalendarEvent) -> Void) -> Bool {
+        editSeries(occurrence, scope: .thisAndFuture, edits: edits)
+    }
+
     /// Reconstructs a soft-deleted event from its tombstone's durable snapshot (spec 0.12).
     /// This is the recovery path for when the app was force-quit before the in-memory Undo
     /// banner was tapped — the undo closure itself does not survive a relaunch.
@@ -398,6 +449,21 @@ final class BetterCalendarStore {
             master: master,
             occurrenceKey: occurrenceKey,
             expectedVersionNumber: expectedVersionNumber(for: occurrence, master: master, scope: scope),
+            in: engineContext(),
+            edits: edits
+        )
+        return performSplit(outcome)
+    }
+
+    /// `editSeries` addressed by master and occurrence start rather than by a
+    /// `CalendarOccurrence`, for the save path — which holds a draft, not an occurrence.
+    @discardableResult
+    func applySeriesEdit(master: CalendarEvent, occurrenceStart: Date, scope: EditScope, edits: (inout CalendarEvent) -> Void) -> Bool {
+        let outcome = RecurrenceSplitter.planEdit(
+            scope: scope,
+            master: master,
+            occurrenceKey: OccurrenceKey(recurrenceMasterID: master.id, originalStart: occurrenceStart),
+            expectedVersionNumber: master.versionNumber,
             in: engineContext(),
             edits: edits
         )
@@ -879,6 +945,13 @@ final class BetterCalendarStore {
             return true
         }
 
+        // Spec 3D.6: access is back, so anything parked for want of it goes back in the queue.
+        // Done before planning, so a resumed row is drained by this pass rather than the next.
+        let resumed = DeviceWriteCommitter.unpark(in: database, now: now)
+        if !resumed.isEmpty, !withPersistedMutation(resumed) {
+            return false
+        }
+
         // Spec 3D.4: the patch set comes from the change journal, which is append-only storage
         // rather than part of the in-memory database, so it is read before planning begins.
         let journalEntryIDs = DeviceWritePlanner.journalEntryIDs(in: database, now: now)
@@ -891,17 +964,26 @@ final class BetterCalendarStore {
 
         // Marked in flight *before* any device write is issued, so a crash mid-drain is
         // distinguishable from a create that was never attempted (spec 3D.3).
-        let inFlight = DeviceWriteCommitter.markInFlight(planned, in: database, now: now)
+        let inFlight = DeviceWriteCommitter.markInFlight(planned.writes, in: database, now: now)
         if !inFlight.isEmpty, !withPersistedMutation(inFlight) {
             return false
         }
 
-        let outcomes = await DeviceMutationAdapter(store: eventKitStore).perform(planned)
+        let outcomes = await DeviceMutationAdapter(store: eventKitStore).perform(planned.writes)
         let result = DeviceWriteCommitter.commit(planned, outcomes: outcomes, in: database, now: now)
         lastWriteBackSummary = result.summary
         guard !result.transaction.isEmpty else { return true }
 
-        return withPersistedMutation(result.transaction)
+        let committed = withPersistedMutation(result.transaction)
+
+        // Spec 3D.5: after a scope write, re-mirror the series rather than trusting the local
+        // projection. EventKit performs its own split, and `RecurrenceSplitter`'s version of it
+        // is a prediction — the device is the authority for what the series now looks like.
+        if committed, planned.writes.contains(where: DeviceWritePlanner.addressesAnOccurrence) {
+            await mirrorDeviceEvents(now: now)
+        }
+
+        return committed
     }
 
     /// Spec 3C.8: mirrors the device's events for one bounded window into local rows, through
