@@ -133,6 +133,81 @@ struct EventKitDeviceStore: EventKitStore {
             lhs.isDetached == rhs.isDetached ? lhs.startDate < rhs.startDate : !lhs.isDetached
         }
     }
+
+    func event(withIdentifier identifier: String) async throws -> DeviceEvent? {
+        guard authorizationStatus.canReadDeviceEvents else { return nil }
+
+        return await Task.detached(priority: .userInitiated) {
+            let eventStore = EKEventStore()
+            guard let event = eventStore.event(withIdentifier: identifier) else { return nil }
+            return DeviceEvent(event, calendarIdentifier: event.calendar?.calendarIdentifier)
+        }.value
+    }
+
+    /// Spec 3.19/3.17. Two rules are enforced here rather than left to the caller, because this
+    /// is the only place they *can* be enforced:
+    ///
+    /// * An update **fetches the live event and patches it**. It never constructs a fresh
+    ///   `EKEvent` from our model and saves that, which would write back every field we do not
+    ///   model as absent — the failure that strips a video-call link off a meeting.
+    /// * Only `write.fields` is applied. A field the planner did not name is not written, even
+    ///   though `write.event` carries a value for it.
+    func save(_ write: DeviceEventWrite) async throws -> DeviceWriteReceipt {
+        guard authorizationStatus.canCreateDeviceEvents else { throw DeviceWriteFailure.permission }
+
+        return try await Task.detached(priority: .userInitiated) {
+            let eventStore = EKEventStore()
+
+            let event: EKEvent
+            if let identifier = write.identifier {
+                guard let existing = eventStore.event(withIdentifier: identifier) else {
+                    // Gone from the device between the plan and the write. Not retryable: there
+                    // is nothing left to update.
+                    throw DeviceWriteFailure.permanent
+                }
+                event = existing
+            } else {
+                guard let calendar = eventStore.calendars(for: .event).first(where: { $0.calendarIdentifier == write.calendarIdentifier }) else {
+                    throw DeviceWriteFailure.permanent
+                }
+                guard calendar.allowsContentModifications else { throw DeviceWriteFailure.permission }
+                event = EKEvent(eventStore: eventStore)
+                event.calendar = calendar
+            }
+
+            event.apply(write.event, fields: write.fields)
+
+            do {
+                try eventStore.save(event, span: write.span.ekSpan, commit: true)
+            } catch {
+                throw DeviceWriteFailure(error)
+            }
+
+            return DeviceWriteReceipt(
+                identifier: event.eventIdentifier ?? "",
+                externalIdentifier: event.calendarItemExternalIdentifier,
+                lastModified: event.lastModifiedDate
+            )
+        }.value
+    }
+
+    func remove(identifier: String, span: DeviceEventSpan) async throws {
+        guard authorizationStatus.canCreateDeviceEvents else { throw DeviceWriteFailure.permission }
+
+        try await Task.detached(priority: .userInitiated) {
+            let eventStore = EKEventStore()
+            guard let event = eventStore.event(withIdentifier: identifier) else {
+                // Already gone. Spec 3D.11: a delete for an event the device no longer has is a
+                // success, not a failure — the effect this mutation wanted already exists.
+                return
+            }
+            do {
+                try eventStore.remove(event, span: span.ekSpan, commit: true)
+            } catch {
+                throw DeviceWriteFailure(error)
+            }
+        }.value
+    }
 }
 
 // MARK: - Translation
@@ -173,6 +248,126 @@ private extension DeviceCalendar {
             allowsContentModifications: calendar.allowsContentModifications,
             allowedAvailabilities: calendar.supportedEventAvailabilities.betterCalendarAvailabilities
         )
+    }
+}
+
+private extension DeviceEventSpan {
+    var ekSpan: EKSpan {
+        switch self {
+        case .thisEvent: .thisEvent
+        case .futureEvents: .futureEvents
+        }
+    }
+}
+
+private extension EKEvent {
+    /// The write half of spec 3C.2's table: exactly `fields`, onto a live `EKEvent`.
+    ///
+    /// Attendees are absent by construction — EventKit exposes no setter, and
+    /// `DeviceEventField` has no case for them, so this cannot be asked to try.
+    func apply(_ source: DeviceEvent, fields: Set<DeviceEventField>) {
+        for field in fields {
+            switch field {
+            case .title: title = source.title
+            case .notes: notes = source.notes
+            case .location: location = source.location
+            case .url: url = source.urlString.flatMap(URL.init(string:))
+            case .startDate: startDate = source.startDate
+            case .endDate: endDate = source.endDate
+            case .isAllDay: isAllDay = source.isAllDay
+            case .timeZone: timeZone = source.timeZoneIdentifier.flatMap(TimeZone.init(identifier:))
+            case .availability: availability = source.availability.ekAvailability
+            case .alarms: alarms = source.alarms.map { EKAlarm(relativeOffset: $0.relativeOffset) }
+            case .recurrence: recurrenceRules = source.recurrenceRules.map(EKRecurrenceRule.init(_:))
+            }
+        }
+    }
+}
+
+private extension DeviceEventAvailability {
+    var ekAvailability: EKEventAvailability {
+        switch self {
+        case .busy: .busy
+        case .free: .free
+        case .tentative: .tentative
+        case .unavailable: .unavailable
+        case .notSupported: .notSupported
+        }
+    }
+}
+
+private extension EKRecurrenceRule {
+    convenience init(_ rule: DeviceRecurrenceRule) {
+        self.init(
+            recurrenceWith: rule.frequency.ekFrequency,
+            interval: max(rule.interval, 1),
+            daysOfTheWeek: rule.daysOfTheWeek.isEmpty ? nil : rule.daysOfTheWeek.map { EKRecurrenceDayOfWeek($0.weekday.ekWeekday, weekNumber: $0.weekNumber) },
+            daysOfTheMonth: rule.daysOfTheMonth.isEmpty ? nil : rule.daysOfTheMonth.map(NSNumber.init(value:)),
+            monthsOfTheYear: nil,
+            weeksOfTheYear: nil,
+            daysOfTheYear: nil,
+            setPositions: nil,
+            end: rule.end.ekEnd
+        )
+    }
+}
+
+private extension DeviceRecurrenceFrequency {
+    var ekFrequency: EKRecurrenceFrequency {
+        switch self {
+        case .daily: .daily
+        case .weekly: .weekly
+        case .monthly: .monthly
+        case .yearly: .yearly
+        }
+    }
+}
+
+private extension Weekday {
+    var ekWeekday: EKWeekday {
+        // `EKWeekday` and `Weekday` share RFC 5545's Sunday-is-1 numbering.
+        EKWeekday(rawValue: rawValue) ?? .sunday
+    }
+}
+
+private extension DeviceRecurrenceEnd {
+    var ekEnd: EKRecurrenceEnd? {
+        switch self {
+        case .never: nil
+        case .occurrenceCount(let count): EKRecurrenceEnd(occurrenceCount: count)
+        case .endDate(let date): EKRecurrenceEnd(end: date)
+        }
+    }
+}
+
+private extension DeviceWriteFailure {
+    /// Spec 3.21: classify, rather than collapsing every `NSError` into "retry".
+    ///
+    /// EventKit's error domain is the only signal available, and it is coarse — so anything not
+    /// positively recognised is treated as **transient**. That is the safe default here: a
+    /// transient classification costs a retry, whereas a wrong `permanent` throws away the
+    /// user's edit and a wrong `permission` parks it until they change a setting they never
+    /// touched.
+    init(_ error: Error) {
+        if let failure = error as? DeviceWriteFailure {
+            self = failure
+            return
+        }
+
+        let nsError = error as NSError
+        guard nsError.domain == EKErrorDomain, let code = EKError.Code(rawValue: nsError.code) else {
+            self = .transient
+            return
+        }
+
+        switch code {
+        case .calendarReadOnly, .calendarIsImmutable, .sourceDoesNotAllowCalendarAddDelete, .calendarDoesNotAllowEvents:
+            self = .permission
+        case .eventNotMutable, .objectBelongsToDifferentStore, .invalidSpan, .calendarHasNoSource, .noCalendar, .noStartDate, .noEndDate, .datesInverted:
+            self = .permanent
+        default:
+            self = .transient
+        }
     }
 }
 

@@ -259,6 +259,56 @@ struct SQLiteCalendarRepository: LocalCalendarRepository {
     /// M7's Settings diagnostics surface (spec 2.20): reads live `change_journal`/
     /// `schema_metadata` state rather than recomputing what *this build* expects to find — the
     /// whole point is to reveal drift, not restate the build's own assumptions.
+    /// Spec 3D.4. Read straight from `change_journal` rather than through the domain snapshot,
+    /// because the journal is deliberately not part of it.
+    func changeJournalFieldDiffs(forEntryIDs entryIDs: Set<UUID>) throws -> [UUID: String] {
+        guard !entryIDs.isEmpty else { return [:] }
+        let databaseQueue = try openDatabase()
+
+        return try databaseQueue.read { db in
+            guard try db.tableExists("change_journal") else { return [:] }
+            let identifiers = entryIDs.map(\.uuidString)
+            let placeholders = databaseQuestionMarks(count: identifiers.count)
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT id, field_diff FROM change_journal WHERE id IN (\(placeholders))",
+                arguments: StatementArguments(identifiers)
+            )
+
+            return rows.reduce(into: [UUID: String]()) { result, row in
+                guard let id = UUID(uuidString: row["id"]), let diff: String = row["field_diff"] else { return }
+                result[id] = diff
+            }
+        }
+    }
+
+    /// Spec 2.9/3.22, the counterpart of `changeJournalFieldDiffs`. Both are keyed by journal
+    /// entry id because that is the id the outbox row already carries.
+    func eventVersionSnapshots(forJournalEntryIDs entryIDs: Set<UUID>) throws -> [UUID: String] {
+        guard !entryIDs.isEmpty else { return [:] }
+        let databaseQueue = try openDatabase()
+
+        return try databaseQueue.read { db in
+            guard try db.tableExists("event_versions") else { return [:] }
+            let identifiers = entryIDs.map(\.uuidString)
+            let placeholders = databaseQuestionMarks(count: identifiers.count)
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT change_journal_entry_id, snapshot_json FROM event_versions WHERE change_journal_entry_id IN (\(placeholders))",
+                arguments: StatementArguments(identifiers)
+            )
+
+            return rows.reduce(into: [UUID: String]()) { result, row in
+                guard let id = UUID(uuidString: row["change_journal_entry_id"]), let snapshot: String = row["snapshot_json"] else { return }
+                result[id] = snapshot
+            }
+        }
+    }
+
+    private func databaseQuestionMarks(count: Int) -> String {
+        Array(repeating: "?", count: count).joined(separator: ", ")
+    }
+
     func diagnostics() throws -> RepositoryDiagnostics {
         let databaseQueue = try openDatabase()
         return try databaseQueue.read { db in

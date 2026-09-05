@@ -26,6 +26,9 @@ final class BetterCalendarStore {
     private(set) var lastDiscoverySummary: DeviceCalendarMirror.Summary?
     /// The same, for the last event-mirroring pass (spec 3C.8).
     private(set) var lastEventMirrorSummary: DeviceEventMirror.Summary?
+    /// Counts from the last write-back drain — never content (spec 3.24/3D.8). What
+    /// `SRC-STAT-01` reads.
+    private(set) var lastWriteBackSummary: DeviceWriteCommitter.Summary?
     /// The window the last event-mirroring pass actually covered. Held so a diagnostics surface
     /// can say what was reconciled rather than implying the whole calendar was — and so Phase 3E
     /// has the value it needs to persist per calendar.
@@ -841,15 +844,64 @@ final class BetterCalendarStore {
 
     // MARK: - Device event mirroring (spec 3C.8, Phase 3C)
 
-    /// Spec 3B.0/3C.0: the two halves of one pass, on the triggers Phase 3B established — a
-    /// foreground transition, a fresh grant, or a device-calendar surface appearing.
+    /// Spec 3B.0/3C.0/3D.2: one pass over everything the device owes us and everything we owe
+    /// the device, on the triggers Phase 3B established — a foreground transition, a fresh grant,
+    /// or a device-calendar surface appearing.
     ///
-    /// Calendars first, always. An event whose calendar is not mirrored yet has nowhere to go and
-    /// is skipped, so discovering a newly-added account and then mirroring its events in the
-    /// other order would silently drop everything on it until the next pass.
+    /// The order is not arbitrary:
+    ///
+    /// 1. **Calendars**, because an event whose calendar is not mirrored yet has nowhere to go.
+    /// 2. **Our writes**, because a queued local edit should reach the device before we read the
+    ///    device back — otherwise the mirror pass sees the pre-edit state, writes it over the
+    ///    local row, and the user watches their change revert before it is sent.
+    /// 3. **The mirror**, which then reconciles against a device that already has our changes.
     func refreshDeviceCalendars(now: Date = .now) async {
         discoverDeviceCalendars(now: now)
+        await drainDeviceWrites(now: now)
         await mirrorDeviceEvents(now: now)
+    }
+
+    /// Spec 3.18/3D.2: the write-back drain — plan, perform, commit.
+    ///
+    /// Driven from the store rather than through `MutationProcessorActor`, which spec 3D.2
+    /// originally named. The actor loads and writes through the repository directly, behind the
+    /// store's back; a receipt written that way would leave `events` stale until the next full
+    /// reload, and the user would keep seeing an event marked pending after it had synced. The
+    /// property the actor exists to protect — that launch is not blocked on EventKit — is
+    /// supplied here by the seam itself being `async`, and by nothing calling this during
+    /// `load()`.
+    @discardableResult
+    func drainDeviceWrites(now: Date = .now) async -> Bool {
+        refreshDeviceCalendarAccess()
+        guard calendarAccessStatus.canCreateDeviceEvents else {
+            // Nothing is attempted, so nothing is claimed. The rows stay pending and the next
+            // pass with access will find them — spec 3D.1's rule, one level up.
+            return true
+        }
+
+        // Spec 3D.4: the patch set comes from the change journal, which is append-only storage
+        // rather than part of the in-memory database, so it is read before planning begins.
+        let journalEntryIDs = DeviceWritePlanner.journalEntryIDs(in: database, now: now)
+        let fieldDiffs = (try? repository.changeJournalFieldDiffs(forEntryIDs: journalEntryIDs)) ?? [:]
+        // Spec 3.22: and the state each edit was based on, which is what makes "did the device
+        // change a field I am also changing" answerable at all.
+        let baseSnapshots = (try? repository.eventVersionSnapshots(forJournalEntryIDs: journalEntryIDs)) ?? [:]
+        let planned = DeviceWritePlanner.plan(database: database, fieldDiffs: fieldDiffs, baseSnapshots: baseSnapshots, now: now)
+        guard !planned.isEmpty else { return true }
+
+        // Marked in flight *before* any device write is issued, so a crash mid-drain is
+        // distinguishable from a create that was never attempted (spec 3D.3).
+        let inFlight = DeviceWriteCommitter.markInFlight(planned, in: database, now: now)
+        if !inFlight.isEmpty, !withPersistedMutation(inFlight) {
+            return false
+        }
+
+        let outcomes = await DeviceMutationAdapter(store: eventKitStore).perform(planned)
+        let result = DeviceWriteCommitter.commit(planned, outcomes: outcomes, in: database, now: now)
+        lastWriteBackSummary = result.summary
+        guard !result.transaction.isEmpty else { return true }
+
+        return withPersistedMutation(result.transaction)
     }
 
     /// Spec 3C.8: mirrors the device's events for one bounded window into local rows, through
@@ -1512,6 +1564,33 @@ protocol LocalCalendarRepository {
     /// repository — the flat-file and stub repositories have no `change_journal`/
     /// `schema_metadata` tables and return `.unavailable`.
     func diagnostics() throws -> RepositoryDiagnostics
+
+    /// Spec 3D.4: the `FieldDiff` each of these journal entries recorded, keyed by entry id.
+    ///
+    /// The change journal is append-only storage, not part of `LocalCalendarDatabase` — the
+    /// in-memory database mirrors what the UI shows, not the durable history. So the write-back
+    /// planner, which needs to know *what the user's edit actually touched*, reads it through
+    /// here rather than through the snapshot.
+    ///
+    /// Defaulted to empty: a repository with no journal is not an error, it is a repository whose
+    /// callers fall back to writing every modelled field. That is the pre-journal behaviour and
+    /// it is still correct, just less surgical.
+    func changeJournalFieldDiffs(forEntryIDs entryIDs: Set<UUID>) throws -> [UUID: String]
+
+    /// Spec 2.9/3.22: the full snapshot of what each of these journal entries *superseded* —
+    /// the state the edit was based on, keyed by journal entry id.
+    ///
+    /// `EventVersion` has recorded this on every committed update since Phase 2 M2, and Phase 3D
+    /// is its first reader. It is what makes the concurrency check in spec 3.22 answerable: to
+    /// know whether the device changed a field this edit also changes, you have to know what that
+    /// field looked like when the edit was made — and the local row no longer says, because the
+    /// edit itself changed it.
+    func eventVersionSnapshots(forJournalEntryIDs entryIDs: Set<UUID>) throws -> [UUID: String]
+}
+
+extension LocalCalendarRepository {
+    func changeJournalFieldDiffs(forEntryIDs entryIDs: Set<UUID>) throws -> [UUID: String] { [:] }
+    func eventVersionSnapshots(forJournalEntryIDs entryIDs: Set<UUID>) throws -> [UUID: String] { [:] }
 }
 
 struct RepositoryDiagnostics: Equatable {

@@ -527,3 +527,149 @@ enum DeviceEventIdentity {
         ))
     }
 }
+
+// MARK: - The reverse mapping (spec 3.12, Phase 3D)
+
+extension DeviceEventMapper {
+    /// `CalendarEvent` → `DeviceEvent`, for a write.
+    ///
+    /// Spec 3C.2 promised this direction would be round-trip tested as a pure function "against
+    /// the value type rather than against `EKEvent`", because 3C had no writer. Phase 3D is the
+    /// writer, and this is the function.
+    ///
+    /// It describes the event as the device would — it does **not** decide what gets written.
+    /// That is `DeviceEventWrite.fields`, and the separation is the whole of spec 3.17: this
+    /// function may safely produce a value for a field the adapter will then never touch.
+    static func deviceEvent(for event: CalendarEvent, calendarIdentifier: String) -> DeviceEvent {
+        DeviceEvent(
+            identifier: event.providerMetadata.providerObjectID ?? "",
+            externalIdentifier: event.providerMetadata.providerExternalID,
+            calendarIdentifier: calendarIdentifier,
+            title: event.title,
+            notes: event.notes,
+            location: event.location,
+            urlString: event.urlString,
+            startDate: event.startDate,
+            endDate: event.endDate,
+            isAllDay: event.isAllDay,
+            // Spec 3C.4: a floating event has no zone on the device, and writing one back would
+            // pin it to whatever zone we happened to store it against — turning a floating event
+            // into a timed one without anyone asking.
+            timeZoneIdentifier: event.timeType == .timed ? event.timeZoneIdentifier : nil,
+            availability: event.availability == .free ? .free : .busy,
+            status: deviceStatus(for: event.providerMetadata.status),
+            alarms: event.reminders.compactMap(deviceAlarm(for:)),
+            recurrenceRules: DeviceRecurrenceTranslation.deviceRules(for: event.recurrence),
+            // Read-only on the device side, and never written. Carried so a round-trip test can
+            // assert the mapping is lossless for everything that *is* ours to write.
+            attendees: event.attendees.map(deviceAttendee(for:)),
+            lastModified: nil,
+            isDetached: event.recurrenceMasterID != nil,
+            occurrenceDate: event.recurrenceOriginalStart,
+            rawFields: [:]
+        )
+    }
+
+    static func deviceStatus(for status: EventStatus) -> DeviceEventStatus {
+        switch status {
+        case .none: .none
+        case .confirmed: .confirmed
+        case .tentative: .tentative
+        case .cancelled: .cancelled
+        }
+    }
+
+    /// The inverse of `reminderOffset(forRelativeOffset:)`. `.none` has no device counterpart —
+    /// it means "no reminder", which is expressed by the alarm's absence.
+    static func deviceAlarm(for reminder: EventReminder) -> DeviceEventAlarm? {
+        guard let offset = reminder.offset.notificationOffsetSeconds else { return nil }
+        return DeviceEventAlarm(relativeOffset: offset)
+    }
+
+    static func deviceAttendee(for attendee: EventAttendee) -> DeviceEventAttendee {
+        DeviceEventAttendee(
+            name: attendee.name,
+            email: attendee.email,
+            participationStatus: deviceParticipationStatus(for: attendee.participationStatus),
+            role: deviceRole(for: attendee.role),
+            isOrganizer: attendee.isOrganizer,
+            isCurrentUser: attendee.isCurrentUser
+        )
+    }
+
+    static func deviceParticipationStatus(for status: EventParticipationStatus) -> DeviceEventParticipationStatus {
+        switch status {
+        case .unknown: .unknown
+        case .pending: .pending
+        case .accepted: .accepted
+        case .declined: .declined
+        case .tentative: .tentative
+        case .delegated: .delegated
+        }
+    }
+
+    static func deviceRole(for role: EventAttendeeRole) -> DeviceEventAttendeeRole {
+        switch role {
+        case .unknown: .unknown
+        case .required: .required
+        case .optional: .optional
+        case .chair: .chair
+        case .nonParticipant: .nonParticipant
+        }
+    }
+}
+
+extension DeviceRecurrenceTranslation {
+    /// `RecurrenceRule` → the device's rules, for a write.
+    ///
+    /// Only ever produces **one** rule, because Better Calendar models one. An event whose device
+    /// rules could not be translated on the way in is marked `hasUnrepresentableRecurrence` and
+    /// refused by the mutation layer (spec 3C.3), so this is never asked to reconstruct a pattern
+    /// it does not hold — which is precisely what that gate buys.
+    static func deviceRules(for rule: RecurrenceRule?) -> [DeviceRecurrenceRule] {
+        guard let rule, rule.frequency != .never else { return [] }
+
+        let frequency: DeviceRecurrenceFrequency
+        switch rule.frequency {
+        case .never: return []
+        case .daily: frequency = .daily
+        case .weekly: frequency = .weekly
+        case .monthly: frequency = .monthly
+        case .yearly: frequency = .yearly
+        }
+
+        // The cross product `positionalRule` refuses to *read* is the one this writes: every
+        // combination of the rule's positions and weekdays, which is exactly what the engine's
+        // `nthWeekdayDates` generates.
+        var daysOfTheWeek: [DeviceRecurrenceDayOfWeek] = []
+        if !rule.setPositions.isEmpty, !rule.weekdays.isEmpty {
+            for position in rule.setPositions.sorted() {
+                for weekday in rule.weekdays.sorted() {
+                    daysOfTheWeek.append(DeviceRecurrenceDayOfWeek(weekday, weekNumber: position))
+                }
+            }
+        } else if rule.frequency == .weekly {
+            daysOfTheWeek = rule.weekdays.sorted().map { DeviceRecurrenceDayOfWeek($0) }
+        }
+
+        return [
+            DeviceRecurrenceRule(
+                frequency: frequency,
+                interval: max(rule.interval, 1),
+                daysOfTheWeek: daysOfTheWeek,
+                // Only meaningful without a positional rule — the engine picks one branch or the
+                // other, and so does the device.
+                daysOfTheMonth: rule.setPositions.isEmpty ? rule.daysOfMonth.sorted() : [],
+                end: deviceEnd(for: rule.end)
+            )
+        ]
+    }
+
+    static func deviceEnd(for end: RecurrenceEnd) -> DeviceRecurrenceEnd {
+        switch end {
+        case .never: .never
+        case .afterOccurrences(let count): .occurrenceCount(count)
+        case .onDate(let date): .endDate(date)
+        }
+    }
+}

@@ -95,6 +95,27 @@ protocol EventKitStore: CalendarAccessAuthorizing {
     /// calendar rather than by a handful of calendars, and spec 3.27 requires that rendering
     /// never block on it. `discoverCalendars` stays synchronous for exactly the opposite reason.
     func events(in range: DateInterval, calendarIdentifiers: Set<String>) async throws -> [DeviceEvent]
+
+    /// One device event by identifier, or `nil` if it is no longer there.
+    ///
+    /// Phase 3D's update path fetches through this immediately before writing, for two reasons
+    /// that are really one: spec 3.17 requires the patch be applied to a *fresh* event so the
+    /// fields we do not model survive, and spec 3.22 requires the concurrency check compare
+    /// against what the device holds *now*.
+    ///
+    /// For a recurring event this returns the series master, matching `events(in:)`.
+    func event(withIdentifier identifier: String) async throws -> DeviceEvent?
+
+    /// Spec 3.19: create or update, returning the receipt that names the event on the device.
+    ///
+    /// The adapter applies exactly `write.fields` onto a freshly fetched event and leaves
+    /// everything else alone. That is not a convention this protocol hopes callers follow — it
+    /// is the only shape this call has, which is what makes "a title-only edit must not strip a
+    /// video-call link" structurally true.
+    func save(_ write: DeviceEventWrite) async throws -> DeviceWriteReceipt
+
+    /// Spec 3.19: remove an event, with the span that says how much of a series goes with it.
+    func remove(identifier: String, span: DeviceEventSpan) async throws
 }
 
 /// What the device reports about its calendars at one moment.
@@ -183,5 +204,87 @@ final class FakeEventKitStore: FakeCalendarAuthorization, EventKitStore {
     /// Someone created, edited or deleted an event in Apple Calendar between passes.
     func simulateDeviceEventChange(to events: [DeviceEvent]) {
         deviceEvents = events
+    }
+
+    // MARK: - Phase 3D: writes
+
+    /// Spec 3.36: injectable failure **by class**, which is the whole point of the taxonomy —
+    /// a fake that could only fail one way could not prove that a permission failure and a
+    /// transient one are handled differently.
+    var saveFailure: DeviceWriteFailure?
+    var removeFailure: DeviceWriteFailure?
+    /// Every write this store was asked to perform, in order. A test asserts on *what was asked*
+    /// as much as on what came back — "the adapter patched only the title" is a claim about the
+    /// request, and nothing in the response could reveal it.
+    private(set) var writeLog: [DeviceEventWrite] = []
+    private(set) var removeLog: [(identifier: String, span: DeviceEventSpan)] = []
+    /// Runs immediately before a save is applied, so a test can simulate someone else editing
+    /// the event between our fetch and our write — the race spec 3.22 exists for.
+    var beforeSave: (() -> Void)?
+    private var nextIdentifierNumber = 0
+
+    func event(withIdentifier identifier: String) async throws -> DeviceEvent? {
+        deviceEvents.first { $0.identifier == identifier && !$0.isDetached }
+    }
+
+    /// Applies exactly `write.fields`, the same discipline the real adapter follows, so a test
+    /// that proves an unmodelled field survived is proving something about the contract rather
+    /// than about this fake's laziness.
+    func save(_ write: DeviceEventWrite) async throws -> DeviceWriteReceipt {
+        writeLog.append(write)
+        beforeSave?()
+        if let saveFailure {
+            throw saveFailure
+        }
+
+        guard let identifier = write.identifier else {
+            nextIdentifierNumber += 1
+            var created = write.event
+            created.identifier = "fake-event-\(nextIdentifierNumber)"
+            created.externalIdentifier = "fake-external-\(nextIdentifierNumber)"
+            created.lastModified = Date(timeIntervalSinceReferenceDate: Double(800_000_000 + nextIdentifierNumber))
+            deviceEvents.append(created)
+            return DeviceWriteReceipt(identifier: created.identifier, externalIdentifier: created.externalIdentifier, lastModified: created.lastModified)
+        }
+
+        guard let index = deviceEvents.firstIndex(where: { $0.identifier == identifier }) else {
+            throw DeviceWriteFailure.permanent
+        }
+
+        var updated = deviceEvents[index]
+        updated.apply(write.event, fields: write.fields)
+        updated.lastModified = (updated.lastModified ?? Date(timeIntervalSinceReferenceDate: 800_000_000)).addingTimeInterval(1)
+        deviceEvents[index] = updated
+        return DeviceWriteReceipt(identifier: updated.identifier, externalIdentifier: updated.externalIdentifier, lastModified: updated.lastModified)
+    }
+
+    func remove(identifier: String, span: DeviceEventSpan) async throws {
+        removeLog.append((identifier, span))
+        if let removeFailure {
+            throw removeFailure
+        }
+        deviceEvents.removeAll { $0.identifier == identifier }
+    }
+}
+
+extension DeviceEvent {
+    /// Copies exactly `fields` across from `other`, leaving every other field — including every
+    /// one Better Calendar does not model — untouched. Spec 3.17's rule, as one function.
+    mutating func apply(_ other: DeviceEvent, fields: Set<DeviceEventField>) {
+        for field in fields {
+            switch field {
+            case .title: title = other.title
+            case .notes: notes = other.notes
+            case .location: location = other.location
+            case .url: urlString = other.urlString
+            case .startDate: startDate = other.startDate
+            case .endDate: endDate = other.endDate
+            case .isAllDay: isAllDay = other.isAllDay
+            case .timeZone: timeZoneIdentifier = other.timeZoneIdentifier
+            case .availability: availability = other.availability
+            case .alarms: alarms = other.alarms
+            case .recurrence: recurrenceRules = other.recurrenceRules
+            }
+        }
     }
 }
